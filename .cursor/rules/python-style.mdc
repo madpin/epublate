@@ -1,0 +1,48 @@
+---
+description: Python coding style for epublate — typed, pydantic, ruff, mypy strict
+globs: **/*.py
+alwaysApply: false
+---
+
+# Python style
+
+- **Python 3.13+**, fully typed. `mypy --strict` is the contract on
+  the core (`src/epublate/core`, `formats`, `glossary`, `llm`, `db`).
+- **`src/`-layout.** Code lives under `src/epublate/`; no top-level
+  package alongside `tests/`.
+- **Lint/format:** `ruff` only (it covers both). Don't add `black` or
+  `isort`. Run via `uv run ruff …`.
+- **Typed I/O at boundaries:** use `pydantic` v2 models for configs,
+  LLM request/response shapes, glossary entries, and anything crossing
+  a module boundary. Use plain `dataclasses(slots=True, frozen=True)`
+  for internal value objects.
+- **DB:** SQLAlchemy Core (not ORM unless the win is obvious). Always
+  parameterize queries. Migrations via Alembic. SQLite is in WAL
+  mode; ePub exports are atomic write-temp-then-rename.
+- **Logging:** `logging` + `rich` handlers. **No `print`** in library
+  code. The TUI uses Textual's logging integration.
+- **Errors:** raise typed exceptions (`epublate.errors.*`). Never
+  swallow. LLM failures are retryable and recorded in `llm_call`.
+
+## Comments
+
+Explain **why**, not **what**. Skip narrating obvious code.
+
+```python
+# ❌ BAD
+i += 1  # increment i
+
+# ✅ GOOD
+# Inline tags can collapse if the model emits adjacent placeholders;
+# we widen the search by one character to catch that.
+match = re.search(rf"\[\[T{idx}\]\].?", target)
+```
+
+## Don't
+
+- No `from x import *`.
+- No catching bare `Exception` outside the top-level worker boundary.
+- No `Any` in public signatures of `core/`, `formats/`, `glossary/`,
+  `llm/`, `db/`. Internal helpers may use `Any` sparingly.
+- No commented-out code; delete it.
+- No `TODO` without an issue link.

@@ -1,0 +1,54 @@
+---
+description: SQLite/persistence rules — WAL, atomic writes, append-only events, migrations
+globs: src/epublate/db/**/*.py
+alwaysApply: false
+---
+
+# DB & persistence
+
+## Hard rules
+
+1. **One SQLite file per project**, lives in the project folder.
+   Always opened in **WAL mode**. The original ePub is kept immutable
+   alongside it.
+2. **State changes are transactional.** A pipeline phase (translate +
+   validate + persist) commits as one transaction. Crash mid-batch =
+   no half-written segments.
+3. **Append-only event log.** Every state-changing action writes a
+   row to `event` (PRD §6.4) for audit and "undo last batch".
+4. **Atomic exports.** ePub output is written to `*.tmp` then
+   `os.replace()`d. Never write the final file in place.
+5. **Migrations via Alembic.** No hand-written `ALTER TABLE` outside
+   `db/migrations/`. Every schema change ships with an upgrade and a
+   downgrade.
+6. **Parameterized queries only.** Never f-string SQL. SQLAlchemy
+   Core or `sqlalchemy.text()` with bound params.
+7. **No ORM unless the win is obvious.** Repository functions return
+   plain pydantic models / dataclasses, not Session-bound rows.
+
+## Cache table
+
+LLM cache is a regular table (not a separate KV store). Key is the
+deterministic hash from the LLM rules. Cache hits set
+`llm_call.cache_hit = 1` and don't bill cost.
+
+## Don't
+
+```python
+# ❌ BAD
+conn.execute(f"SELECT * FROM segment WHERE id = '{seg_id}'")
+
+# ✅ GOOD
+stmt = select(segment).where(segment.c.id == bindparam("id"))
+conn.execute(stmt, {"id": seg_id})
+```
+
+```python
+# ❌ BAD — non-atomic export
+book.save(out_path)  # readers can see a half-written file
+
+# ✅ GOOD
+tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+book.save(tmp)
+os.replace(tmp, out_path)
+```

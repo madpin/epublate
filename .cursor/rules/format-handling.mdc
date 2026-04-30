@@ -1,0 +1,61 @@
+---
+description: ePub/format adapter rules — placeholders for inline tags, reversible segmentation
+globs: src/epublate/formats/**/*.py
+alwaysApply: false
+---
+
+# Format handling (ePub now, PDF later)
+
+## Inline tags never reach the LLM
+
+Replace inline tags with **opaque placeholders** (`[[T0]]…[[T0]]`)
+before any LLM call and restore them after. The model never reasons
+about HTML.
+
+```python
+# Source XHTML
+# <p>The <em>old</em> man saw <a href="#fn1">Élise</a>.</p>
+
+# Sent to LLM
+# "The [[T0]]old[[/T0]] man saw [[T1]]Élise[[/T1]]."
+
+# After translation, splice tags back at the placeholder positions.
+```
+
+## Hard rules
+
+1. **Round-trip identity.** For any unmodified segment,
+   `assemble(segment(doc)) == doc` byte-equivalently. Property-tested
+   with `hypothesis`.
+2. **Tag count check.** Every placeholder issued in the source must
+   appear **exactly once** in the target. Mismatch → validator fails;
+   the segment is flagged, never spliced.
+3. **No segment crosses an inline tag pair.** Splits prefer paragraph
+   then sentence boundaries; never inside `<em>…</em>` etc.
+4. **Skip lists are config-driven.** Don't hardcode skipped CSS
+   classes or tags; they live in project settings.
+5. **Assets pass through verbatim.** Images, fonts, CSS are copied
+   byte-for-byte. Don't "optimize" them.
+
+## FormatAdapter interface
+
+All formats implement the same protocol (PRD §6.5). New formats slot
+in without changing the pipeline:
+
+```python
+class FormatAdapter(Protocol):
+    def load(self, path: Path) -> Book: ...
+    def iter_chapters(self, book: Book) -> Iterable[ChapterDoc]: ...
+    def segment(self, doc: ChapterDoc, max_tokens: int) -> list[Segment]: ...
+    def reassemble(self, doc: ChapterDoc, translated: list[Segment]) -> ChapterDoc: ...
+    def save(self, book: Book, out_path: Path) -> None: ...
+```
+
+## ePub specifics
+
+- Use `ebooklib` for container parsing, `lxml` for XHTML edits.
+- Update `<html lang>` and OPF `dc:language` on save.
+- Add provenance `<meta>` (translator, model, date) without breaking
+  validators.
+- Run `epubcheck` on export; warn-only by default, "strict export"
+  toggle blocks on errors.

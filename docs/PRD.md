@@ -328,7 +328,7 @@ UX requirements:
 
 ### 6.1 Tech stack (proposed)
 
-- **Language:** Python 3.11+ (pinned via `.python-version`; installed
+- **Language:** Python 3.13+ (pinned via `.python-version`; installed
   by `uv python install` on contributor machines).
 - **Project & env tooling:** [`uv`](https://docs.astral.sh/uv/) for
   everything: virtualenv creation, dependency resolution, lockfile

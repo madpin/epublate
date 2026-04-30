@@ -1,0 +1,55 @@
+---
+description: Glossary (lore bible) invariants — three-tier status, cascade re-translation
+globs: src/epublate/glossary/**/*.py
+alwaysApply: false
+---
+
+# Glossary (lore bible) invariants
+
+The glossary is the heart of consistency. Three statuses, in order of
+strictness:
+
+| Status      | LLM prompt           | Validator behavior                    |
+| ----------- | -------------------- | ------------------------------------- |
+| `locked`    | hard constraint      | **hard-fails** mismatched segments    |
+| `confirmed` | strong default       | warns, surfaces in Inbox              |
+| `proposed`  | not in prompt        | does not constrain anything           |
+
+## Hard rules
+
+1. **Locked is non-negotiable.** If the source contains a locked
+   source-term (matched exactly or via a registered alias) and the
+   target does not contain the canonical target-term, the segment is
+   marked `flagged` and never auto-approved.
+2. **Aliases are first-class.** Both source-side aliases ("Lise" for
+   "Élise") and target-side aliases must match. Aliases live in
+   `glossary_alias` keyed by `entry_id` and `side`.
+3. **Status promotion is auditable.** Every change to status,
+   `target_term`, or alias set creates a `glossary_revision` row with
+   a reason and timestamp.
+4. **Cascade on change.** When a `confirmed` or `locked` entry's
+   `target_term` changes, compute the affected segments (source
+   contains the source-term, **or** target contains the old
+   target-term) and offer bulk re-translation. Old translations are
+   preserved in history, never deleted.
+5. **No silent merges.** When the user merges two entries, both
+   histories are preserved; the losing entry becomes an alias of the
+   winning one.
+6. **Gender (if present)** is passed to the prompt as a constraint
+   for gendered target languages. Never inferred silently per call.
+
+## Don't
+
+```python
+# ❌ BAD — bypassing the validator
+if validator.is_locked_violation(segment):
+    segment.target = best_effort  # nope
+
+# ✅ GOOD — flag and surface
+if validator.is_locked_violation(segment):
+    segment.status = SegmentStatus.flagged
+    inbox.enqueue(segment, reason="locked-glossary-violation")
+```
+
+Never weaken a validator check to "make a test pass". If the test is
+wrong, fix the test. If the entry is wrong, change the entry.

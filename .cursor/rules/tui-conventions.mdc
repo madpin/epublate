@@ -1,0 +1,56 @@
+---
+description: Textual TUI conventions — non-blocking workers, keyboard-first, snapshot tests
+globs: src/epublate/app/**/*.py
+alwaysApply: false
+---
+
+# TUI conventions (Textual)
+
+## Hard rules
+
+1. **The UI thread never blocks.** All LLM calls, DB-heavy queries,
+   and ePub I/O run in Textual workers (`@work`). If a handler does
+   anything more expensive than a dict lookup, it spawns a worker.
+2. **Keyboard-first.** Every action has a key binding. Mouse is
+   optional. Discoverability via a help screen / footer bindings.
+3. **One screen, one concern.** Use the screen taxonomy in PRD §4.6:
+   Projects, Project Dashboard, Reader, Glossary, Inbox, Settings,
+   Logs. Don't cram cross-cutting widgets into one screen.
+4. **No business logic in widgets.** Widgets render and emit events;
+   pipelines/services live in `core/`. Widgets call `core` via a thin
+   service layer, never reach into the DB directly.
+5. **Snapshot tests** for every screen via `pytest-textual-snapshot`.
+   Snapshots are committed; PRs that change them must explain why.
+
+## Live updates
+
+Pipeline progress goes through Textual's reactive system or message
+posting — the Reader updates as workers finish segments. No polling.
+
+## Theming
+
+Light/dark plus a high-contrast variant. Never hardcode colors;
+always go through the theme.
+
+## Logging
+
+Use Textual's logging integration. The Logs screen tails the event
+stream and the LLM call log (collapsible per call).
+
+## Don't
+
+```python
+# ❌ BAD — blocks the UI
+def on_button_pressed(self) -> None:
+    result = translate_chapter(chapter)  # expensive, sync
+    self.refresh()
+
+# ✅ GOOD — worker + message
+@work(exclusive=True, group="translate")
+async def _translate(self, chapter: Chapter) -> None:
+    async for seg in pipeline.translate(chapter):
+        self.post_message(SegmentTranslated(seg))
+
+def on_button_pressed(self) -> None:
+    self._translate(self.current_chapter)
+```

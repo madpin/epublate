@@ -1,0 +1,57 @@
+---
+description: uv is the only project tool — never use pip, poetry, pipx, tox, etc.
+alwaysApply: true
+---
+
+# `uv` is the only tool
+
+`uv` manages Python, dependencies, the venv, test/lint runners,
+builds, and publishing. **Do not introduce** `pip`, `pipx`, `poetry`,
+`pyenv`, `tox`, `virtualenv`, `setup.py`, `setup.cfg`, or
+`requirements.txt`.
+
+## Canonical commands
+
+```bash
+uv python install                 # installs Python from .python-version
+uv sync --all-extras --dev        # creates venv + installs everything
+uv run pytest                     # tests
+uv run ruff check .               # lint
+uv run ruff format --check .      # format check
+uv run mypy src/epublate          # types
+uv run epublate --mock-llm ...    # run the app
+uv build                          # wheel + sdist
+```
+
+## Bootstrap contract
+
+On a freshly cloned repo:
+
+```bash
+uv sync --all-extras --dev && uv run pytest
+```
+
+must pass with **zero other prerequisites and zero network**. CI runs
+exactly the same commands via `astral-sh/setup-uv`.
+
+## Conventions
+
+- `pyproject.toml` (PEP 621) is the single source of truth.
+- `uv.lock` is **committed** for reproducible installs.
+- Two dep groups: runtime in `[project] dependencies`, dev in
+  `[dependency-groups] dev`. Optional extras for `embeddings` and
+  `ner` keep the base install lean.
+- Any `Makefile`/`justfile` is a thin shortcut; the `uv` invocations
+  remain canonical.
+
+## Don't
+
+```bash
+# ❌ BAD
+pip install -r requirements.txt
+python -m venv .venv && source .venv/bin/activate
+poetry install
+
+# ✅ GOOD
+uv sync --all-extras --dev
+```

@@ -1,0 +1,58 @@
+---
+description: LLM integration rules — OpenAI-compatible only, retry/cache/cost tracking
+globs: src/epublate/llm/**/*.py
+alwaysApply: false
+---
+
+# LLM integration
+
+## v1 contract
+
+- **OpenAI-compatible only.** All LLM access goes through the
+  chat-completions schema. User supplies `base_url`, `api_key`,
+  `model`. Works against OpenAI, Azure, OpenRouter, Together, Ollama,
+  vLLM, llama.cpp, etc.
+- **No provider-specific code paths** (no Anthropic-only, no
+  Gemini-only). Add them only if a future PRD update authorizes it.
+- **Two model slots per project:** `translator_model` (quality) and
+  `helper_model` (cheap, for entity extraction / book intake / reviewer).
+
+## Every call must
+
+1. Go through the `LLMProvider` interface (PRD §6.6). No direct
+   `openai.OpenAI()` from anywhere outside `llm/openai_compat.py`.
+2. Be **cacheable**. Cache key:
+   `(model, system_prompt_hash, user_prompt_hash, glossary_state_hash)`.
+   Cache hits never hit the network.
+3. Be **token-accounted** with `tiktoken` (or model-specific tokenizer).
+4. Respect **retry/backoff** on 429s and 5xxs (exponential, jittered).
+5. Be recorded in the `llm_call` table with prompt/completion tokens,
+   cost, cache flag, and full request/response JSON.
+6. Honor the per-project **budget cap** — when reached, batch mode
+   pauses and surfaces a confirmation prompt in the TUI.
+
+## Structured output
+
+Use JSON mode / tool calling when the endpoint supports it. The
+translator's response shape:
+
+```json
+{
+  "target": "...",
+  "used_entries": ["entry-id", "..."],
+  "new_entities": [{"type": "character", "source": "...", "evidence": "..."}],
+  "notes": "..."
+}
+```
+
+Fall back to robust JSON-recovery parsing for endpoints without
+structured outputs.
+
+## Don't
+
+- Don't put glossary constraints into the user prompt as a polite
+  suggestion. Locked entries go into the **system** prompt as hard
+  constraints, and the validator backs them up.
+- Don't retry indefinitely. Retry budget is configurable and finite;
+  past it, the segment is flagged.
+- Don't log full API keys; redact at the boundary.

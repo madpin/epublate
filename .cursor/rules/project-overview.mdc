@@ -1,0 +1,39 @@
+---
+description: epublate north star — what this project is and where the spec lives
+alwaysApply: true
+---
+
+# epublate — north star
+
+`epublate` is a **rich TUI** that translates ePub story books with an
+**LLM**, preserving format and keeping a per-project **lore bible** so
+proper-noun translations stay consistent across long books.
+
+## Source of truth
+
+- **Product spec:** `docs/PRD.md` — authoritative for scope,
+  requirements, architecture, schema, and roadmap. Read it before
+  designing anything new. When in doubt, the PRD wins.
+- **Agent guide:** `AGENTS.md` (and `CLAUDE.md` symlinked to it) —
+  invariants, conventions, banned actions.
+
+## Hard invariants (do not violate)
+
+1. **Format preservation.** Inline tags round-trip exactly via opaque
+   placeholders (`[[T0]]`). The model never sees raw HTML.
+2. **Glossary consistency.** `locked` glossary entries are
+   non-negotiable; the validator hard-fails violations.
+3. **Resumability.** All state lives in one SQLite file per project,
+   WAL mode, atomic writes. Crash-safe at all times.
+4. **Local-first & private.** Book contents leave the machine only
+   via the user's configured LLM/embedding endpoint.
+5. **OpenAI-compatible LLMs only** in v1. `base_url` + `api_key` +
+   `model`. No provider-specific code paths.
+
+## Scope guardrails (v1)
+
+- **In:** ePub 2/3, OpenAI-compatible LLMs, Textual TUI, SQLite,
+  optional embeddings.
+- **Out:** PDFs, GUIs, OCR, hosted services, multi-user/collab.
+
+When a change crosses a scope or invariant line, stop and ask the user.

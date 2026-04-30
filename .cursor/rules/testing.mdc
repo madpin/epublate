@@ -1,0 +1,54 @@
+---
+description: Test conventions — pytest, mock LLM, no network, hypothesis, snapshots
+globs: tests/**/*.py
+alwaysApply: false
+---
+
+# Testing
+
+- **Runner:** `pytest`. Always invoke via `uv run pytest`.
+- **No network in tests.** Use the deterministic mock LLM provider
+  (`epublate.llm.mock`). Tests must pass on a freshly cloned repo
+  with no API keys.
+- **No flaky tests.** Tests with timing/ordering hazards must use
+  `pytest-asyncio` or Textual's pilot, never `time.sleep`.
+
+## What to test where
+
+| Module                | Style                                         |
+| --------------------- | --------------------------------------------- |
+| `core/segmentation`   | `hypothesis`: `assemble(segment(doc)) == doc` |
+| `core/pipeline`       | unit tests with mock LLM + fixture project    |
+| `formats/epub`        | round-trip on tiny ePubs in `tests/fixtures/` |
+| `glossary/enforcer`   | unit tests, every status (proposed/conf/lock) |
+| `llm/openai_compat`   | unit tests with `httpx.MockTransport`         |
+| `app/` (Textual)      | `pytest-textual-snapshot`                     |
+
+## Coverage targets
+
+- 85% line coverage on `core/`, `formats/`, `glossary/`, `llm/`,
+  `db/`. UI lower bar but every screen has at least one snapshot.
+
+## Fixtures
+
+- ePub fixtures live in `tests/fixtures/` and must be **small** and
+  **CC0-licensed**. Don't commit copyrighted books.
+- Sample glossaries and prompts live in `tests/fixtures/glossary/`
+  and `tests/fixtures/prompts/`.
+
+## Don't
+
+```python
+# ❌ BAD
+def test_translate():
+    client = openai.OpenAI()         # real network call
+    out = translate("hello", client) # non-deterministic
+    assert "hola" in out.lower()
+
+# ✅ GOOD
+def test_translate(mock_llm):
+    mock_llm.set_response({"target": "hola", "used_entries": []})
+    out = translate_segment(seg, provider=mock_llm)
+    assert out.target == "hola"
+    assert mock_llm.call_count == 1
+```
