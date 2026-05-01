@@ -5,9 +5,16 @@
 > characters, places, and events stay **consistent** across the entire
 > book.
 
-**Status:** early development (pre-M0). The product spec is complete;
-implementation is just getting started. See
-[`docs/PRD.md`](docs/PRD.md) for the full plan and roadmap.
+**Status:** v1 release-ready (`0.1.0`). All milestones M0 through M6
+are landed: the project skeleton + CI, ePub round-trip, single-segment
+translation, glossary v1 with cascade, Project Dashboard + batch + cost
+meter / budget cap, helper-LLM extractor (book intake + pre-pass), and
+M6 (high-contrast theme + global cheat sheet on `?` / `f1`, Settings
+screen on `s`, snapshot baselines, opt-in `epubcheck` integration with
+a `--strict` toggle, packaging polish, and a tag-triggered release
+pipeline). See [`docs/PRD.md`](docs/PRD.md) for the full plan,
+[`docs/USAGE.md`](docs/USAGE.md) for the curator walkthrough, and
+[`CHANGELOG.md`](CHANGELOG.md) for what shipped when.
 
 ---
 
@@ -31,6 +38,20 @@ memory of prior decisions. `epublate` fixes all three:
 - ePub 2 and ePub 3 round-trip with structural preservation.
 - Per-project lore bible with three-tier status (`proposed` /
   `confirmed` / `locked`) and cascade re-translation on changes.
+- **Tone presets** so the LLM gets the audience and register right out
+  of the gate (literary fiction by default; presets for classic
+  literature, historical fiction, children's picture books, middle
+  grade, YA, fairytale / folklore, genre fiction, noir / hard-boiled
+  crime, horror / gothic, cozy romance, explicit adult, humor /
+  comedy, memoir / biography, poetry / verse, religious / spiritual,
+  technical manuals, academic prose, and journalism). Curator picks
+  one in the New Project modal or `epublate new --style-profile` and
+  can swap / edit it later from Settings (PRD F-STYLE-1/2). The
+  helper-LLM intake even *suggests* a preset based on its read of the
+  source (F-STYLE-3) — and the New Project modal **auto-detects the
+  right tone before you hit Create** by sniffing a few blocks of the
+  picked ePub through the helper LLM (F-STYLE-4; toggle in Settings
+  with `A`, env override `EPUBLATE_AUTO_TONE_SNIFF`).
 - Works with **any OpenAI-compatible** chat-completions endpoint
   (OpenAI, Azure, OpenRouter, Together, Ollama, vLLM, llama.cpp).
 - Rich Textual TUI: side-by-side reader, glossary editor, batch mode
@@ -57,16 +78,144 @@ uv sync --all-extras --dev        # creates the venv + installs deps
 uv run pytest                     # tests (no network, no LLM keys needed)
 uv run ruff check .               # lint
 uv run mypy src/epublate          # types
+```
 
-uv run epublate --mock-llm new tests/fixtures/sample.epub
+### Try it on the sample book
+
+The repo ships a real ePub at [`docs/Sample.epub`](docs/Sample.epub) so
+you can take the M2 single-segment translation flow for a spin without
+hunting for a book.
+
+#### The TUI is the home — start here
+
+```bash
+# Launch the TUI. The Projects screen lists recently-opened projects
+# (stored at ~/.config/epublate/recents.json) and lets you create or
+# open projects without leaving the terminal.
+uv run epublate --mock-llm
+
+# In-TUI keys on the Projects screen:
+#   n      → new project (modal: source ePub, target lang, out dir)
+#   o      → open project by path
+#   enter  → open the highlighted recent project
+#   delete → drop the highlighted entry from recents (files untouched)
+#   r      → refresh / prune missing entries
+#   T      → cycle theme (dark / light / high-contrast)
+#   ? / F1 → context-aware cheat sheet
+#   q      → quit
+```
+
+The Dashboard, Reader, Glossary, and Inbox are all reachable from the
+new-project / open-project flow above; pressing `q` on any inner
+screen pops back to the Projects landing page.
+
+#### Or skip the TUI for scripting / CI
+
+```bash
+# 1) Bootstrap a project from the sample (no LLM keys required).
+#    `--out` must point at a fresh / empty directory; the command refuses
+#    to overwrite an existing one. `rm -rf` first if you want to re-run.
+rm -rf /tmp/epublate-sample
+uv run epublate --mock-llm new docs/Sample.epub \
+    --source-lang en --target-lang pt --out /tmp/epublate-sample
+
+# 2) Open the Project Dashboard for a specific project.
+#    Bindings: o = Reader, g = Glossary, i = Inbox, b = Batch,
+#              B = Set/Clear budget cap, e = Intake (M5), s = Settings,
+#              r = Refresh, q = Back. Global: T = cycle theme
+#              (dark / light / high-contrast), ? or F1 = cheat sheet.
+#    Reader: t = translate, a = accept, e = edit, r = retry,
+#            j/k = next/prev segment, J/K = next/prev chapter, q = back.
+uv run epublate --mock-llm open /tmp/epublate-sample
+
+# 3) Headless: translate every pending segment via the worker pool.
+#    Failures land in the Inbox; the run pauses if the budget cap is hit.
+uv run epublate --mock-llm batch /tmp/epublate-sample \
+    --concurrency 2 --budget 1.00
+
+# 4) Triage: list flagged segments, proposed glossary entries, and alerts.
+uv run epublate inbox /tmp/epublate-sample
+
+# 5) Inspect spend / token / cache-hit stats for the project.
+uv run epublate stats /tmp/epublate-sample --json
+
+# 6) Manage the budget cap from the CLI (or via the Dashboard's `B` key).
+uv run epublate budget set /tmp/epublate-sample 5.00
+uv run epublate budget show /tmp/epublate-sample
+uv run epublate budget clear /tmp/epublate-sample
+
+# 7) Export the (possibly partial) translated ePub.
+uv run epublate export /tmp/epublate-sample --out /tmp/epublate-sample.epub
+
+# 7b) Validate the exported ePub against epubcheck (PRD F-IO-6, M6).
+#     --epubcheck = warn-only summary; --strict = fail with exit 3 on
+#     any error. Both require the optional [epubcheck] extra and Java.
+uv run epublate export /tmp/epublate-sample \
+    --out /tmp/epublate-sample.epub --strict
+```
+
+Swap `--mock-llm` for a real OpenAI-compatible endpoint by exporting
+`EPUBLATE_LLM_BASE_URL`, `EPUBLATE_LLM_API_KEY`, and
+`EPUBLATE_LLM_MODEL` (any combination of OpenAI, Azure, OpenRouter,
+Together, Ollama, vLLM, or llama.cpp works — see PRD §6.1).
+`EPUBLATE_LLM_HELPER_MODEL` (optional) selects a cheaper model for the
+M5 helper-LLM extractor; if unset, the helper falls back to
+`EPUBLATE_LLM_MODEL` (PRD F-LLM-2 — same endpoint, cheap model):
+
+```bash
+export EPUBLATE_LLM_BASE_URL=https://api.openai.com/v1
+export EPUBLATE_LLM_API_KEY=sk-...
+export EPUBLATE_LLM_MODEL=gpt-5-mini
+export EPUBLATE_LLM_HELPER_MODEL=gpt-5-mini  # optional, defaults to $EPUBLATE_LLM_MODEL
+
+uv run epublate open /tmp/epublate-sample
+uv run epublate batch /tmp/epublate-sample --concurrency 2 --budget 5.00
+```
+
+For local dev you can drop the same variables into a `.env` file
+instead of exporting them every shell session — see [`.env.example`](.env.example)
+for a template:
+
+```bash
+cp .env.example .env   # then fill in EPUBLATE_LLM_API_KEY etc.
+uv run epublate open /tmp/epublate-sample
+```
+
+The CLI auto-loads `./.env` first, then `<project_dir>/.env` for
+project-scoped subcommands. Real shell variables always win, pytest
+skips loading entirely so the test suite stays hermetic, and
+`EPUBLATE_DISABLE_DOTENV=1` short-circuits loading for sealed CI jobs.
+`.env` and `.envrc` are already in `.gitignore`, so secrets won't be
+committed by accident.
+
+```bash
+# M5: helper-LLM book intake on a fresh project (opt-in, costs tokens).
+uv run epublate new docs/Sample.epub \
+    --source-lang en --target-lang pt \
+    --out /tmp/epublate-sample --intake
+
+# M5: re-run intake on an existing project at any time.
+uv run epublate intake /tmp/epublate-sample --max-segments 30
+
+# M5: opt-in pre-pass on batch — surfaces fresh proper nouns before
+# each chapter so the translator's prompt sees them immediately.
+uv run epublate batch /tmp/epublate-sample --extract
 ```
 
 End users (after release) will install with:
 
 ```bash
-uv tool install epublate          # persistent install
-uvx epublate path/to/book.epub    # ephemeral run
+uv tool install epublate                    # persistent install
+uv tool install "epublate[epubcheck]"       # also wire post-export ePub validation
+uvx epublate path/to/book.epub              # ephemeral run
 ```
+
+The `[epubcheck]` extra installs the
+[`epubcheck`](https://pypi.org/project/epubcheck/) Python wrapper
+(which bundles the upstream Java JAR). It also requires a JRE on
+your system. Without it, `epublate export --strict` still works —
+it just prints a one-line "epubcheck skipped" summary instead of
+running validation.
 
 ## Project layout (planned)
 

@@ -1,0 +1,793 @@
+"""Glossary screen — lore-bible editor (PRD §4.6, §7.4 / M3).
+
+What lives here:
+
+* A filterable :class:`textual.widgets.DataTable` of glossary entries.
+* A detail pane showing aliases + revision history for the highlighted
+  entry (PRD F-LB-6).
+* Modal dialogs to create / edit / delete entries and to confirm a
+  cascade re-translation (PRD §7.5 / F-LB-7).
+* Status-toggling shortcuts so the curator can promote a candidate from
+  ``proposed`` → ``confirmed`` → ``locked`` with a single keystroke.
+
+All DB writes go through :mod:`epublate.db.repo` and the cascade flow
+runs in a Textual worker per the TUI rule (the UI never blocks).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import ClassVar, cast
+
+from textual import on, work
+from textual.app import ComposeResult
+from textual.binding import Binding, BindingType
+from textual.containers import Horizontal, Vertical
+from textual.message import Message
+from textual.reactive import reactive
+from textual.screen import ModalScreen, Screen
+from textual.widgets import (
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    Label,
+    Select,
+    Static,
+    TextArea,
+)
+
+from epublate.core.project import Project
+from epublate.db import repo
+from epublate.db.schema import GlossaryStatus
+from epublate.glossary import (
+    CascadeCandidate,
+    GlossaryEntryWithAliases,
+    cascade_retranslate,
+    compute_affected,
+)
+from epublate.glossary.models import (
+    EntityType,
+    GenderTag,
+    GlossaryStatusLiteral,
+)
+
+_ENTITY_TYPES: tuple[EntityType, ...] = (
+    "character",
+    "place",
+    "organization",
+    "event",
+    "item",
+    "date_or_time",
+    "phrase",
+    "term",
+    "other",
+)
+_GENDERS: tuple[GenderTag, ...] = (
+    "feminine",
+    "masculine",
+    "neuter",
+    "common",
+    "unspecified",
+)
+_STATUSES: tuple[GlossaryStatusLiteral, ...] = ("proposed", "confirmed", "locked")
+
+
+# ---------------------------------------------------------------------------
+# Edit modal
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class _EntryDraft:
+    source_term: str = ""
+    target_term: str = ""
+    type: EntityType = "term"
+    status: GlossaryStatusLiteral = "proposed"
+    gender: GenderTag | None = None
+    notes: str = ""
+    source_aliases: str = ""
+    target_aliases: str = ""
+
+    @classmethod
+    def from_entry(cls, entry: GlossaryEntryWithAliases) -> _EntryDraft:
+        return cls(
+            source_term=entry.source_term,
+            target_term=entry.target_term,
+            type=entry.entry.type,
+            status=entry.status,
+            gender=entry.entry.gender,
+            notes=entry.entry.notes or "",
+            source_aliases=", ".join(entry.source_aliases),
+            target_aliases=", ".join(entry.target_aliases),
+        )
+
+
+@dataclass(slots=True)
+class _EntryDraftResult:
+    draft: _EntryDraft
+
+
+def _split_aliases(raw: str) -> list[str]:
+    return [piece.strip() for piece in raw.split(",") if piece.strip()]
+
+
+class EntryEditScreen(ModalScreen[_EntryDraftResult | None]):
+    """Modal for create/edit of a glossary entry."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("ctrl+s", "save", "Save", show=True),
+        Binding("escape", "cancel", "Cancel", show=True),
+    ]
+
+    DEFAULT_CSS = """
+    EntryEditScreen {
+        align: center middle;
+    }
+    EntryEditScreen #entry-box {
+        width: 90%;
+        height: 90%;
+        border: round $primary;
+        padding: 1 2;
+        background: $surface;
+    }
+    EntryEditScreen .row {
+        height: auto;
+        padding: 0 0 1 0;
+    }
+    EntryEditScreen .row Label {
+        width: 18;
+    }
+    EntryEditScreen Input,
+    EntryEditScreen Select {
+        width: 1fr;
+    }
+    EntryEditScreen #entry-notes {
+        height: 5;
+    }
+    EntryEditScreen #entry-help {
+        height: 1;
+        color: $text-muted;
+    }
+    """
+
+    def __init__(self, draft: _EntryDraft, *, title: str) -> None:
+        super().__init__()
+        self._draft = draft
+        self._title = title
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="entry-box"):
+            yield Label(self._title)
+            with Horizontal(classes="row"):
+                yield Label("Source term:")
+                yield Input(value=self._draft.source_term, id="entry-source")
+            with Horizontal(classes="row"):
+                yield Label("Target term:")
+                yield Input(value=self._draft.target_term, id="entry-target")
+            with Horizontal(classes="row"):
+                yield Label("Type:")
+                yield Select(
+                    [(t, t) for t in _ENTITY_TYPES],
+                    value=self._draft.type,
+                    id="entry-type",
+                    allow_blank=False,
+                )
+            with Horizontal(classes="row"):
+                yield Label("Status:")
+                yield Select(
+                    [(s, s) for s in _STATUSES],
+                    value=self._draft.status,
+                    id="entry-status",
+                    allow_blank=False,
+                )
+            with Horizontal(classes="row"):
+                yield Label("Gender:")
+                yield Select(
+                    [(g, g) for g in _GENDERS],
+                    value=self._draft.gender or Select.BLANK,
+                    id="entry-gender",
+                    allow_blank=True,
+                )
+            with Horizontal(classes="row"):
+                yield Label("Source aliases:")
+                yield Input(
+                    value=self._draft.source_aliases,
+                    placeholder="comma-separated",
+                    id="entry-src-aliases",
+                )
+            with Horizontal(classes="row"):
+                yield Label("Target aliases:")
+                yield Input(
+                    value=self._draft.target_aliases,
+                    placeholder="comma-separated",
+                    id="entry-tgt-aliases",
+                )
+            yield Label("Notes:")
+            yield TextArea(self._draft.notes, id="entry-notes")
+            yield Static(
+                "Ctrl+S to save, Escape to cancel.",
+                id="entry-help",
+                markup=False,
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#entry-source", Input).focus()
+
+    def action_save(self) -> None:
+        source_term = self.query_one("#entry-source", Input).value.strip()
+        target_term = self.query_one("#entry-target", Input).value.strip()
+        if not source_term or not target_term:
+            self.app.bell()
+            return
+        type_value = self.query_one("#entry-type", Select).value
+        status_value = self.query_one("#entry-status", Select).value
+        gender_select = self.query_one("#entry-gender", Select).value
+        gender: GenderTag | None
+        if gender_select is Select.BLANK:
+            gender = None
+        else:
+            gender = cast(GenderTag, gender_select)
+        notes = self.query_one("#entry-notes", TextArea).text.strip() or ""
+        src_aliases = self.query_one("#entry-src-aliases", Input).value
+        tgt_aliases = self.query_one("#entry-tgt-aliases", Input).value
+        result = _EntryDraft(
+            source_term=source_term,
+            target_term=target_term,
+            type=cast(EntityType, type_value),
+            status=cast(GlossaryStatusLiteral, status_value),
+            gender=gender,
+            notes=notes,
+            source_aliases=src_aliases,
+            target_aliases=tgt_aliases,
+        )
+        self.dismiss(_EntryDraftResult(draft=result))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# ---------------------------------------------------------------------------
+# Cascade modal
+# ---------------------------------------------------------------------------
+
+
+class CascadeConfirmScreen(ModalScreen[bool]):
+    """Confirmation modal for the cascade re-translation flow (PRD §7.5)."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("y", "confirm", "Yes", show=True),
+        Binding("n", "cancel", "No", show=True),
+        Binding("escape", "cancel", "Cancel", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    CascadeConfirmScreen {
+        align: center middle;
+    }
+    CascadeConfirmScreen #cascade-box {
+        width: 70%;
+        max-height: 80%;
+        border: round $primary;
+        padding: 1 2;
+        background: $surface;
+    }
+    CascadeConfirmScreen #cascade-list {
+        height: 1fr;
+        margin: 1 0;
+    }
+    """
+
+    def __init__(
+        self,
+        *,
+        entry: GlossaryEntryWithAliases,
+        candidates: list[CascadeCandidate],
+    ) -> None:
+        super().__init__()
+        self._entry = entry
+        self._candidates = candidates
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="cascade-box"):
+            yield Label(
+                f"Cascade re-translation: {len(self._candidates)} segments "
+                f"affected by changes to {self._entry.source_term!r}."
+            )
+            preview = (
+                "\n".join(
+                    f"  • [{c.reason}] {c.source_text[:80]}…"
+                    for c in self._candidates[:10]
+                )
+                or "  (no segments)"
+            )
+            yield Static(preview, id="cascade-list", markup=False)
+            yield Static(
+                "Press [b]y[/b] to revert these segments to pending, "
+                "[b]n[/b] to keep current translations.",
+                markup=True,
+            )
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
+# ---------------------------------------------------------------------------
+# Delete confirm modal
+# ---------------------------------------------------------------------------
+
+
+class DeleteConfirmScreen(ModalScreen[bool]):
+    """Tiny confirm-or-cancel modal for destructive entry actions."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("y", "confirm", "Yes", show=True),
+        Binding("n", "cancel", "No", show=True),
+        Binding("escape", "cancel", "Cancel", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    DeleteConfirmScreen {
+        align: center middle;
+    }
+    DeleteConfirmScreen #delete-box {
+        width: 60%;
+        height: auto;
+        border: round $error;
+        padding: 1 2;
+        background: $surface;
+    }
+    """
+
+    def __init__(self, *, source_term: str) -> None:
+        super().__init__()
+        self._source_term = source_term
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="delete-box"):
+            yield Label(f"Delete entry {self._source_term!r}?")
+            yield Static("Press [b]y[/b] to delete, [b]n[/b] to cancel.")
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
+# ---------------------------------------------------------------------------
+# Glossary screen
+# ---------------------------------------------------------------------------
+
+
+class CascadeFinished(Message):
+    """Posted by the cascade worker when it's done."""
+
+    def __init__(self, count: int, source_term: str) -> None:
+        super().__init__()
+        self.count = count
+        self.source_term = source_term
+
+
+class CascadeFailed(Message):
+    def __init__(self, error: str) -> None:
+        super().__init__()
+        self.error = error
+
+
+class GlossaryScreen(Screen[None]):
+    """Glossary table + detail pane + edit/cascade flows."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("n", "new_entry", "New", show=True),
+        Binding("e", "edit_entry", "Edit", show=True),
+        Binding("d", "delete_entry", "Delete", show=True),
+        Binding("l", "set_status_locked", "Lock", show=True),
+        Binding("c", "set_status_confirmed", "Confirm", show=True),
+        Binding("p", "set_status_proposed", "Propose", show=True),
+        Binding("r", "cascade", "Cascade", show=True),
+        Binding("f", "cycle_filter", "Filter", show=True),
+        Binding("q", "app.pop_screen", "Back", show=True),
+        # ``escape`` mirrors ``q`` so curators can back out with the
+        # universal "cancel" key; hidden from the footer to keep the
+        # binding bar concise.
+        Binding("escape", "app.pop_screen", "Back", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    GlossaryScreen #glossary-body {
+        height: 1fr;
+    }
+    GlossaryScreen #glossary-table {
+        height: 1fr;
+        border: round $primary;
+    }
+    GlossaryScreen #glossary-detail {
+        width: 40%;
+        height: 1fr;
+        padding: 1 2;
+        border: round $primary;
+    }
+    GlossaryScreen #glossary-status {
+        dock: bottom;
+        height: 1;
+        padding: 0 1;
+        background: $boost;
+    }
+    """
+
+    filter_status: reactive[str] = reactive("all")
+
+    def __init__(self, project: Project) -> None:
+        super().__init__()
+        self._project = project
+        self._entries: list[GlossaryEntryWithAliases] = []
+        self._row_to_entry: dict[str, str] = {}
+
+    @property
+    def entries(self) -> list[GlossaryEntryWithAliases]:
+        return self._entries
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=False)
+        with Vertical():
+            with Horizontal(id="glossary-body"):
+                table: DataTable[str] = DataTable(
+                    id="glossary-table", zebra_stripes=True, cursor_type="row"
+                )
+                table.add_columns("Type", "Status", "Source", "Target", "Aliases")
+                yield table
+                yield Static("(select an entry)", id="glossary-detail", markup=True)
+            yield Static("Ready.", id="glossary-status")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._refresh_entries()
+
+    # ---------------- state helpers ----------------
+
+    def _refresh_entries(self) -> None:
+        self._entries = repo.list_glossary_entries(
+            self._project.engine, self._project.project_id
+        )
+        self._render_table()
+        self._render_detail()
+
+    def _render_table(self) -> None:
+        table = self.query_one("#glossary-table", DataTable)
+        table.clear()
+        self._row_to_entry.clear()
+        rows = [
+            e
+            for e in self._entries
+            if self.filter_status == "all" or e.status == self.filter_status
+        ]
+        for ent in rows:
+            aliases = ", ".join(ent.source_aliases) or "—"
+            row_key = table.add_row(
+                ent.entry.type,
+                ent.status,
+                ent.source_term,
+                ent.target_term,
+                aliases,
+                key=ent.id,
+            )
+            self._row_to_entry[str(row_key)] = ent.id
+        self._set_status(
+            f"{len(rows)}/{len(self._entries)} entries — filter: {self.filter_status}"
+        )
+
+    def _render_detail(self) -> None:
+        detail = self.query_one("#glossary-detail", Static)
+        ent = self._highlighted_entry()
+        if ent is None:
+            detail.update("(no entries — press [b]n[/b] to create one)")
+            return
+        revisions = repo.list_glossary_revisions(self._project.engine, ent.id)
+        history = (
+            "\n".join(
+                f"  - {r.prev_target_term!r} → {r.new_target_term!r}"
+                + (f" ({r.reason})" if r.reason else "")
+                for r in revisions
+            )
+            or "  (no revisions)"
+        )
+        mentions = repo.list_mentions(self._project.engine, entry_id=ent.id)
+        notes = ent.entry.notes or ""
+        body = "\n".join(
+            [
+                f"[b]{ent.source_term}[/b] → [b]{ent.target_term}[/b]",
+                f"  type: {ent.entry.type}    status: {ent.status}"
+                + (f"    gender: {ent.entry.gender}" if ent.entry.gender else ""),
+                "",
+                f"[b]Source aliases[/b]: {', '.join(ent.source_aliases) or '—'}",
+                f"[b]Target aliases[/b]: {', '.join(ent.target_aliases) or '—'}",
+                "",
+                f"[b]Mentions[/b]: {len(mentions)} segment(s)",
+                "",
+                "[b]Notes[/b]:",
+                f"  {notes or '—'}",
+                "",
+                "[b]Revisions[/b]:",
+                history,
+            ]
+        )
+        detail.update(body)
+
+    def _set_status(self, text: str) -> None:
+        self.query_one("#glossary-status", Static).update(text)
+
+    def _highlighted_entry(self) -> GlossaryEntryWithAliases | None:
+        table = self.query_one("#glossary-table", DataTable)
+        if table.row_count == 0:
+            return None
+        try:
+            row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
+        except Exception:
+            return None
+        entry_id = self._row_to_entry.get(str(row_key))
+        if entry_id is None:
+            return None
+        for ent in self._entries:
+            if ent.id == entry_id:
+                return ent
+        return None
+
+    # ---------------- actions ----------------
+
+    def action_cycle_filter(self) -> None:
+        order = ["all", *_STATUSES]
+        idx = order.index(self.filter_status) if self.filter_status in order else 0
+        self.filter_status = order[(idx + 1) % len(order)]
+        self._render_table()
+        self._render_detail()
+
+    def action_new_entry(self) -> None:
+        modal = EntryEditScreen(_EntryDraft(), title="New glossary entry")
+        self.app.push_screen(modal, self._on_entry_created)
+
+    def _on_entry_created(self, result: _EntryDraftResult | None) -> None:
+        if result is None:
+            self._set_status("Cancelled.")
+            return
+        draft = result.draft
+        repo.create_glossary_entry(
+            self._project.engine,
+            project_id=self._project.project_id,
+            source_term=draft.source_term,
+            target_term=draft.target_term,
+            type=draft.type,
+            status=draft.status,
+            gender=draft.gender,
+            notes=draft.notes or None,
+            source_aliases=_split_aliases(draft.source_aliases),
+            target_aliases=_split_aliases(draft.target_aliases),
+        )
+        repo.append_event(
+            self._project.engine,
+            project_id=self._project.project_id,
+            kind="glossary.created",
+            payload={"source_term": draft.source_term},
+        )
+        self._refresh_entries()
+        self._set_status(f"Created entry {draft.source_term!r}.")
+
+    def action_edit_entry(self) -> None:
+        ent = self._highlighted_entry()
+        if ent is None:
+            return
+        modal = EntryEditScreen(
+            _EntryDraft.from_entry(ent),
+            title=f"Edit {ent.source_term!r}",
+        )
+        self.app.push_screen(modal, _make_edit_callback(self, ent.id))
+
+    def apply_edit(self, entry_id: str, result: _EntryDraftResult | None) -> None:
+        if result is None:
+            self._set_status("Cancelled.")
+            return
+        draft = result.draft
+        repo.update_glossary_entry(
+            self._project.engine,
+            entry_id=entry_id,
+            target_term=draft.target_term,
+            status=draft.status,
+            type=draft.type,
+            gender=draft.gender,
+            notes=draft.notes or None,
+            reason="curator-edit",
+        )
+        repo.set_aliases(
+            self._project.engine,
+            entry_id=entry_id,
+            source_aliases=_split_aliases(draft.source_aliases),
+            target_aliases=_split_aliases(draft.target_aliases),
+        )
+        repo.append_event(
+            self._project.engine,
+            project_id=self._project.project_id,
+            kind="glossary.updated",
+            payload={
+                "entry_id": entry_id,
+                "source_term": draft.source_term,
+                "target_term": draft.target_term,
+                "status": draft.status,
+            },
+        )
+        self._refresh_entries()
+        self._set_status(f"Saved {draft.source_term!r}.")
+
+    def action_delete_entry(self) -> None:
+        ent = self._highlighted_entry()
+        if ent is None:
+            return
+        modal = DeleteConfirmScreen(source_term=ent.source_term)
+        self.app.push_screen(
+            modal, _make_delete_callback(self, ent.id, ent.source_term)
+        )
+
+    def apply_delete(self, entry_id: str, source_term: str, confirmed: bool) -> None:
+        if not confirmed:
+            self._set_status("Delete cancelled.")
+            return
+        repo.delete_glossary_entry(self._project.engine, entry_id)
+        repo.append_event(
+            self._project.engine,
+            project_id=self._project.project_id,
+            kind="glossary.deleted",
+            payload={"entry_id": entry_id, "source_term": source_term},
+        )
+        self._refresh_entries()
+        self._set_status(f"Deleted entry {source_term!r}.")
+
+    def action_set_status_locked(self) -> None:
+        self._set_entry_status(GlossaryStatus.LOCKED)
+
+    def action_set_status_confirmed(self) -> None:
+        self._set_entry_status(GlossaryStatus.CONFIRMED)
+
+    def action_set_status_proposed(self) -> None:
+        self._set_entry_status(GlossaryStatus.PROPOSED)
+
+    def _set_entry_status(self, status: str) -> None:
+        ent = self._highlighted_entry()
+        if ent is None:
+            return
+        if ent.status == status:
+            self._set_status(f"{ent.source_term!r} already {status}.")
+            return
+        repo.update_glossary_entry(
+            self._project.engine,
+            entry_id=ent.id,
+            status=cast(GlossaryStatusLiteral, status),
+            reason=f"status->{status}",
+        )
+        repo.append_event(
+            self._project.engine,
+            project_id=self._project.project_id,
+            kind="glossary.status_changed",
+            payload={
+                "entry_id": ent.id,
+                "source_term": ent.source_term,
+                "from": ent.status,
+                "to": status,
+            },
+        )
+        self._refresh_entries()
+        self._set_status(f"{ent.source_term!r} → {status}.")
+
+    def action_cascade(self) -> None:
+        ent = self._highlighted_entry()
+        if ent is None:
+            return
+        candidates = compute_affected(
+            self._project.engine,
+            project_id=self._project.project_id,
+            entry=ent,
+            prev_target_term=ent.target_term,
+        )
+        if not candidates:
+            self._set_status(
+                f"No segments need re-translation for {ent.source_term!r}."
+            )
+            return
+        modal = CascadeConfirmScreen(entry=ent, candidates=candidates)
+        self.app.push_screen(modal, _make_cascade_callback(self, ent, candidates))
+
+    def cascade_now(
+        self,
+        entry: GlossaryEntryWithAliases,
+        candidates: list[CascadeCandidate],
+        confirmed: bool,
+    ) -> None:
+        if not confirmed:
+            self._set_status("Cascade cancelled.")
+            return
+        self._set_status(f"Re-running cascade on {len(candidates)} segments…")
+        self._cascade_worker(entry=entry, candidates=candidates)
+
+    @work(exclusive=True, group="cascade", thread=True)
+    def _cascade_worker(
+        self,
+        *,
+        entry: GlossaryEntryWithAliases,
+        candidates: list[CascadeCandidate],
+    ) -> None:
+        try:
+            count = cascade_retranslate(
+                self._project.engine,
+                project_id=self._project.project_id,
+                entry=entry,
+                prev_target_term=entry.target_term,
+                new_target_term=entry.target_term,
+                candidates=candidates,
+                reason="curator-triggered",
+            )
+        except Exception as exc:
+            self.post_message(CascadeFailed(str(exc)))
+            return
+        self.post_message(CascadeFinished(count=count, source_term=entry.source_term))
+
+    @on(CascadeFinished)
+    def _handle_cascade_finished(self, message: CascadeFinished) -> None:
+        self._refresh_entries()
+        self._set_status(
+            f"Cascade complete: {message.count} segments reverted to pending "
+            f"for {message.source_term!r}."
+        )
+
+    @on(CascadeFailed)
+    def _handle_cascade_failed(self, message: CascadeFailed) -> None:
+        self._set_status(f"Cascade failed: {message.error}")
+
+    @on(DataTable.RowHighlighted)
+    def _handle_row_highlighted(self, _message: DataTable.RowHighlighted) -> None:
+        self._render_detail()
+
+
+# ---------------------------------------------------------------------------
+# Modal dismiss helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_edit_callback(
+    screen: GlossaryScreen, entry_id: str
+) -> Callable[[_EntryDraftResult | None], None]:
+    def _cb(result: _EntryDraftResult | None) -> None:
+        screen.apply_edit(entry_id, result)
+
+    return _cb
+
+
+def _make_delete_callback(
+    screen: GlossaryScreen, entry_id: str, source_term: str
+) -> Callable[[bool | None], None]:
+    def _cb(result: bool | None) -> None:
+        screen.apply_delete(entry_id, source_term, bool(result))
+
+    return _cb
+
+
+def _make_cascade_callback(
+    screen: GlossaryScreen,
+    entry: GlossaryEntryWithAliases,
+    candidates: list[CascadeCandidate],
+) -> Callable[[bool | None], None]:
+    def _cb(result: bool | None) -> None:
+        screen.cascade_now(entry, candidates, bool(result))
+
+    return _cb
+
+
+__all__ = [
+    "CascadeConfirmScreen",
+    "CascadeFailed",
+    "CascadeFinished",
+    "DeleteConfirmScreen",
+    "EntryEditScreen",
+    "GlossaryScreen",
+]

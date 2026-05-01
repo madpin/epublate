@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# epublate scratch projects
+/sample-project/
+*.epublate
+*.epublate-shm
+*.epublate-wal
+
+# pytest-textual-snapshot diff report (artifacts only — baselines are committed)
+/snapshot_report.html
+.DS_Store

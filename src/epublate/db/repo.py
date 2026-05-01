@@ -1,0 +1,1312 @@
+"""Repository helpers for the project DB (PRD §6.4).
+
+M0 covered ``project`` + ``event``; M1 adds ``chapter`` + ``segment`` so the
+project lifecycle can persist the segmented ePub. Helpers return plain
+pydantic models so the TUI / pipeline never holds a Session-bound row
+(db-and-persistence rule).
+"""
+
+from __future__ import annotations
+
+import json
+import time
+import uuid
+from collections.abc import Iterable
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import delete, insert, select, update
+from sqlalchemy.engine import Connection, Engine
+
+from epublate.db import schema
+from epublate.formats.base import InlineToken, Segment
+from epublate.glossary.models import (
+    EntityMention,
+    EntityType,
+    GenderTag,
+    GlossaryAlias,
+    GlossaryEntry,
+    GlossaryEntryWithAliases,
+    GlossaryRevision,
+    GlossaryStatusLiteral,
+)
+
+
+class ProjectRow(BaseModel):
+    """Plain projection of a row in the ``project`` table."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    name: str
+    source_lang: str
+    target_lang: str
+    source_path: str
+    style_guide: str | None = None
+    style_profile: str | None = None
+    budget_usd: float | None = None
+    created_at: int
+
+
+class EventRow(BaseModel):
+    """Plain projection of a row in the append-only ``event`` table."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int | None = None
+    project_id: str
+    ts: int
+    kind: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class ChapterRow(BaseModel):
+    """Plain projection of a row in the ``chapter`` table."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    project_id: str
+    spine_idx: int
+    href: str
+    title: str | None = None
+    status: str = schema.ChapterStatus.PENDING
+
+
+class SegmentRow(BaseModel):
+    """Plain projection of a row in the ``segment`` table.
+
+    ``inline_skeleton`` mirrors :attr:`Segment.inline_skeleton` (a list of
+    :class:`InlineToken`); on disk it is JSON-serialized into the BLOB column.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    chapter_id: str
+    idx: int
+    source_text: str
+    source_hash: str
+    target_text: str | None = None
+    status: str = schema.SegmentStatus.PENDING
+    inline_skeleton: list[InlineToken] = Field(default_factory=list)
+    host_path: str = ""
+    host_part: int = 0
+    host_total_parts: int = 1
+
+
+class LLMCallRow(BaseModel):
+    """Plain projection of a row in the ``llm_call`` table (PRD §6.4).
+
+    Captures the per-call audit trail required by the LLM-integration
+    rule: tokens, cost, cache flag, full request/response JSON, and the
+    deterministic cache key used to short-circuit future identical calls.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    project_id: str
+    segment_id: str | None = None
+    purpose: str
+    model: str
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    cost_usd: float | None = None
+    cache_hit: bool = False
+    cache_key: str | None = None
+    request_json: str | None = None
+    response_json: str | None = None
+    created_at: int = 0
+
+
+def _now_unix() -> int:
+    return int(time.time())
+
+
+def _new_id() -> str:
+    return uuid.uuid4().hex
+
+
+def _encode_inline_skeleton(seg: SegmentRow) -> bytes:
+    """Pack skeleton + host metadata into the ``segment.inline_skeleton`` BLOB.
+
+    The PRD's segment schema only declares ``inline_skeleton`` as opaque
+    bytes; we pack the host XPath and split metadata in the same envelope so
+    the format-agnostic reassembler can locate the correct DOM node without a
+    schema migration.
+    """
+
+    envelope = {
+        "skeleton": [t.model_dump() for t in seg.inline_skeleton],
+        "host_path": seg.host_path,
+        "host_part": seg.host_part,
+        "host_total_parts": seg.host_total_parts,
+    }
+    return json.dumps(envelope, ensure_ascii=False).encode("utf-8")
+
+
+def _decode_inline_skeleton(
+    blob: bytes | memoryview | None,
+) -> tuple[list[InlineToken], str, int, int]:
+    if not blob:
+        return [], "", 0, 1
+    payload = bytes(blob).decode("utf-8")
+    if not payload:
+        return [], "", 0, 1
+    envelope = json.loads(payload)
+    if isinstance(envelope, list):
+        # Pre-M1 / external imports might persist just the skeleton list.
+        return [InlineToken(**t) for t in envelope], "", 0, 1
+    skel = [InlineToken(**t) for t in envelope.get("skeleton", [])]
+    return (
+        skel,
+        str(envelope.get("host_path", "")),
+        int(envelope.get("host_part", 0)),
+        int(envelope.get("host_total_parts", 1)),
+    )
+
+
+def create_project(
+    engine_or_conn: Engine | Connection,
+    *,
+    name: str,
+    source_lang: str,
+    target_lang: str,
+    source_path: str,
+    style_guide: str | None = None,
+    style_profile: str | None = None,
+    budget_usd: float | None = None,
+    project_id: str | None = None,
+    created_at: int | None = None,
+) -> ProjectRow:
+    row = ProjectRow(
+        id=project_id or _new_id(),
+        name=name,
+        source_lang=source_lang,
+        target_lang=target_lang,
+        source_path=source_path,
+        style_guide=style_guide,
+        style_profile=style_profile,
+        budget_usd=budget_usd,
+        created_at=created_at or _now_unix(),
+    )
+    stmt = insert(schema.project).values(**row.model_dump())
+    with _begin(engine_or_conn) as conn:
+        conn.execute(stmt)
+    return row
+
+
+def get_project(
+    engine_or_conn: Engine | Connection, project_id: str
+) -> ProjectRow | None:
+    stmt = select(schema.project).where(schema.project.c.id == project_id)
+    with _begin(engine_or_conn) as conn:
+        result = conn.execute(stmt).mappings().first()
+    return ProjectRow(**dict(result)) if result is not None else None
+
+
+def list_projects(engine_or_conn: Engine | Connection) -> list[ProjectRow]:
+    stmt = select(schema.project).order_by(schema.project.c.created_at.desc())
+    with _begin(engine_or_conn) as conn:
+        rows = conn.execute(stmt).mappings().all()
+    return [ProjectRow(**dict(r)) for r in rows]
+
+
+def update_project_style(
+    engine_or_conn: Engine | Connection,
+    *,
+    project_id: str,
+    style_profile: str | None,
+    style_guide: str | None,
+) -> ProjectRow:
+    """Set or clear the project's tone preset + resolved prompt block.
+
+    Records a ``project.style_changed`` event in the same transaction so
+    the Inbox / activity feed can surface the change. ``style_guide`` is
+    what actually lands in the translator's system prompt; ``style_profile``
+    is just the slug we show in the UI ("Custom" when ``None``).
+
+    Cache impact: the prompt-block change automatically invalidates
+    cached translations because the system prompt hash is part of every
+    cache key (PRD F-LLM-6). The caller doesn't need to bypass the
+    cache; future translate calls will simply miss until they're warmed.
+    """
+
+    with _begin(engine_or_conn) as conn:
+        existing = (
+            conn.execute(
+                select(schema.project).where(schema.project.c.id == project_id)
+            )
+            .mappings()
+            .first()
+        )
+        if existing is None:
+            raise ValueError(f"project not found: {project_id}")
+        prev_profile = existing["style_profile"]
+        prev_guide = existing["style_guide"]
+        conn.execute(
+            update(schema.project)
+            .where(schema.project.c.id == project_id)
+            .values(style_profile=style_profile, style_guide=style_guide)
+        )
+        append_event(
+            conn,
+            project_id=project_id,
+            kind="project.style_changed",
+            payload={
+                "prev_profile": (str(prev_profile) if prev_profile else None),
+                "new_profile": style_profile,
+                "prev_guide_set": prev_guide is not None,
+                "new_guide_set": style_guide is not None,
+            },
+        )
+        refreshed = (
+            conn.execute(
+                select(schema.project).where(schema.project.c.id == project_id)
+            )
+            .mappings()
+            .first()
+        )
+    assert refreshed is not None
+    return ProjectRow(**dict(refreshed))
+
+
+def update_project_budget(
+    engine_or_conn: Engine | Connection,
+    *,
+    project_id: str,
+    budget_usd: float | None,
+) -> ProjectRow:
+    """Set or clear the per-project USD budget cap (PRD F-LLM-8 / M4).
+
+    Records a ``project.budget_changed`` event in the same transaction
+    so the Inbox can surface the change in its alerts feed
+    (``glossary-invariants.mdc``-style audit; M4 reuses the same
+    pattern). Raises :class:`ValueError` when the project does not exist.
+    """
+
+    if budget_usd is not None and budget_usd < 0:
+        raise ValueError("budget_usd must be non-negative or None")
+
+    with _begin(engine_or_conn) as conn:
+        existing = (
+            conn.execute(
+                select(schema.project).where(schema.project.c.id == project_id)
+            )
+            .mappings()
+            .first()
+        )
+        if existing is None:
+            raise ValueError(f"project not found: {project_id}")
+        prev = existing["budget_usd"]
+        conn.execute(
+            update(schema.project)
+            .where(schema.project.c.id == project_id)
+            .values(budget_usd=budget_usd)
+        )
+        append_event(
+            conn,
+            project_id=project_id,
+            kind="project.budget_changed",
+            payload={
+                "prev_budget_usd": float(prev) if prev is not None else None,
+                "new_budget_usd": (
+                    float(budget_usd) if budget_usd is not None else None
+                ),
+            },
+        )
+        refreshed = (
+            conn.execute(
+                select(schema.project).where(schema.project.c.id == project_id)
+            )
+            .mappings()
+            .first()
+        )
+    assert refreshed is not None
+    return ProjectRow(**dict(refreshed))
+
+
+def append_event(
+    engine_or_conn: Engine | Connection,
+    *,
+    project_id: str,
+    kind: str,
+    payload: dict[str, Any] | None = None,
+    ts: int | None = None,
+) -> EventRow:
+    """Append-only write to the ``event`` table (PRD §4.7 / F-P-2)."""
+
+    row = EventRow(
+        project_id=project_id,
+        ts=ts or _now_unix(),
+        kind=kind,
+        payload=payload or {},
+    )
+    stmt = insert(schema.event).values(
+        project_id=row.project_id,
+        ts=row.ts,
+        kind=row.kind,
+        payload_json=json.dumps(row.payload, sort_keys=True),
+    )
+    with _begin(engine_or_conn) as conn:
+        result = conn.execute(stmt)
+    inserted_pk = result.inserted_primary_key
+    return row.model_copy(
+        update={"id": int(inserted_pk[0]) if inserted_pk is not None else None}
+    )
+
+
+def bulk_insert_chapters(
+    engine_or_conn: Engine | Connection, rows: list[ChapterRow]
+) -> None:
+    """Insert chapter rows in a single transaction (resumability rule)."""
+
+    if not rows:
+        return
+    payload = [r.model_dump() for r in rows]
+    stmt = insert(schema.chapter)
+    with _begin(engine_or_conn) as conn:
+        conn.execute(stmt, payload)
+
+
+def list_chapters(
+    engine_or_conn: Engine | Connection, project_id: str
+) -> list[ChapterRow]:
+    stmt = (
+        select(schema.chapter)
+        .where(schema.chapter.c.project_id == project_id)
+        .order_by(schema.chapter.c.spine_idx.asc())
+    )
+    with _begin(engine_or_conn) as conn:
+        rows = conn.execute(stmt).mappings().all()
+    return [ChapterRow(**dict(r)) for r in rows]
+
+
+def bulk_insert_segments(
+    engine_or_conn: Engine | Connection, rows: list[SegmentRow]
+) -> None:
+    if not rows:
+        return
+    payload = [
+        {
+            "id": r.id,
+            "chapter_id": r.chapter_id,
+            "idx": r.idx,
+            "source_text": r.source_text,
+            "source_hash": r.source_hash,
+            "target_text": r.target_text,
+            "status": r.status,
+            "inline_skeleton": _encode_inline_skeleton(r),
+        }
+        for r in rows
+    ]
+    stmt = insert(schema.segment)
+    with _begin(engine_or_conn) as conn:
+        conn.execute(stmt, payload)
+
+
+def list_segments(
+    engine_or_conn: Engine | Connection, chapter_id: str
+) -> list[SegmentRow]:
+    stmt = (
+        select(schema.segment)
+        .where(schema.segment.c.chapter_id == chapter_id)
+        .order_by(schema.segment.c.idx.asc())
+    )
+    with _begin(engine_or_conn) as conn:
+        rows = conn.execute(stmt).mappings().all()
+    out: list[SegmentRow] = []
+    for r in rows:
+        skel, host_path, host_part, host_total = _decode_inline_skeleton(
+            r["inline_skeleton"]
+        )
+        out.append(
+            SegmentRow(
+                id=str(r["id"]),
+                chapter_id=str(r["chapter_id"]),
+                idx=int(r["idx"]),
+                source_text=str(r["source_text"]),
+                source_hash=str(r["source_hash"]),
+                target_text=(
+                    str(r["target_text"]) if r["target_text"] is not None else None
+                ),
+                status=str(r["status"]),
+                inline_skeleton=skel,
+                host_path=host_path,
+                host_part=host_part,
+                host_total_parts=host_total,
+            )
+        )
+    return out
+
+
+def segment_row_from(seg: Segment) -> SegmentRow:
+    """Lift a runtime :class:`Segment` (from the format adapter) into a row."""
+
+    return SegmentRow(
+        id=seg.id,
+        chapter_id=seg.chapter_id,
+        idx=seg.idx,
+        source_text=seg.source_text,
+        source_hash=seg.source_hash,
+        target_text=seg.target_text,
+        status=schema.SegmentStatus.PENDING,
+        inline_skeleton=list(seg.inline_skeleton),
+        host_path=seg.host_path,
+        host_part=seg.host_part,
+        host_total_parts=seg.host_total_parts,
+    )
+
+
+def segment_row_to(row: SegmentRow) -> Segment:
+    """Inverse of :func:`segment_row_from`."""
+
+    return Segment(
+        id=row.id,
+        chapter_id=row.chapter_id,
+        idx=row.idx,
+        source_text=row.source_text,
+        source_hash=row.source_hash,
+        target_text=row.target_text,
+        inline_skeleton=list(row.inline_skeleton),
+        host_path=row.host_path,
+        host_part=row.host_part,
+        host_total_parts=row.host_total_parts,
+    )
+
+
+def update_segment_translation(
+    engine_or_conn: Engine | Connection,
+    *,
+    segment_id: str,
+    target_text: str | None,
+    status: str,
+) -> None:
+    """Update ``segment.target_text`` + ``segment.status`` in one statement."""
+
+    stmt = (
+        update(schema.segment)
+        .where(schema.segment.c.id == segment_id)
+        .values(target_text=target_text, status=status)
+    )
+    with _begin(engine_or_conn) as conn:
+        conn.execute(stmt)
+
+
+def update_segment_status(
+    engine_or_conn: Engine | Connection,
+    *,
+    segment_id: str,
+    status: str,
+) -> None:
+    """Flip ``segment.status`` without touching ``target_text``.
+
+    Used by the cascade flow (M3): when a confirmed/locked entry's target
+    term changes, affected segments revert to ``pending`` while their old
+    translation is preserved in the ``event`` log for history.
+    """
+
+    stmt = (
+        update(schema.segment)
+        .where(schema.segment.c.id == segment_id)
+        .values(status=status)
+    )
+    with _begin(engine_or_conn) as conn:
+        conn.execute(stmt)
+
+
+def get_segment(
+    engine_or_conn: Engine | Connection, segment_id: str
+) -> SegmentRow | None:
+    stmt = select(schema.segment).where(schema.segment.c.id == segment_id)
+    with _begin(engine_or_conn) as conn:
+        row = conn.execute(stmt).mappings().first()
+    if row is None:
+        return None
+    skel, host_path, host_part, host_total = _decode_inline_skeleton(
+        row["inline_skeleton"]
+    )
+    return SegmentRow(
+        id=str(row["id"]),
+        chapter_id=str(row["chapter_id"]),
+        idx=int(row["idx"]),
+        source_text=str(row["source_text"]),
+        source_hash=str(row["source_hash"]),
+        target_text=(
+            str(row["target_text"]) if row["target_text"] is not None else None
+        ),
+        status=str(row["status"]),
+        inline_skeleton=skel,
+        host_path=host_path,
+        host_part=host_part,
+        host_total_parts=host_total,
+    )
+
+
+def insert_llm_call(
+    engine_or_conn: Engine | Connection,
+    row: LLMCallRow,
+) -> LLMCallRow:
+    """Append one ``llm_call`` row (PRD §6.4 / F-LLM-7).
+
+    Returns the row exactly as inserted (with ``created_at`` filled in if
+    the caller passed ``0``).
+    """
+
+    final = row
+    if row.created_at == 0:
+        final = row.model_copy(update={"created_at": _now_unix()})
+    stmt = insert(schema.llm_call).values(
+        id=final.id,
+        project_id=final.project_id,
+        segment_id=final.segment_id,
+        purpose=final.purpose,
+        model=final.model,
+        prompt_tokens=final.prompt_tokens,
+        completion_tokens=final.completion_tokens,
+        cost_usd=final.cost_usd,
+        cache_hit=1 if final.cache_hit else 0,
+        cache_key=final.cache_key,
+        request_json=final.request_json,
+        response_json=final.response_json,
+        created_at=final.created_at,
+    )
+    with _begin(engine_or_conn) as conn:
+        conn.execute(stmt)
+    return final
+
+
+def find_llm_call_by_cache_key(
+    engine_or_conn: Engine | Connection,
+    *,
+    project_id: str,
+    cache_key: str,
+) -> LLMCallRow | None:
+    """Most-recent ``llm_call`` row for ``(project_id, cache_key)`` or ``None``.
+
+    Cache hits are oldest-first irrelevant; the most recent successful row
+    is the canonical one because re-translation cascades (M3) update the
+    cache by appending newer rows.
+    """
+
+    stmt = (
+        select(schema.llm_call)
+        .where(schema.llm_call.c.project_id == project_id)
+        .where(schema.llm_call.c.cache_key == cache_key)
+        .order_by(schema.llm_call.c.created_at.desc())
+        .limit(1)
+    )
+    with _begin(engine_or_conn) as conn:
+        row = conn.execute(stmt).mappings().first()
+    if row is None:
+        return None
+    return LLMCallRow(
+        id=str(row["id"]),
+        project_id=str(row["project_id"]),
+        segment_id=(str(row["segment_id"]) if row["segment_id"] is not None else None),
+        purpose=str(row["purpose"]),
+        model=str(row["model"]),
+        prompt_tokens=(
+            int(row["prompt_tokens"]) if row["prompt_tokens"] is not None else None
+        ),
+        completion_tokens=(
+            int(row["completion_tokens"])
+            if row["completion_tokens"] is not None
+            else None
+        ),
+        cost_usd=(float(row["cost_usd"]) if row["cost_usd"] is not None else None),
+        cache_hit=bool(int(row["cache_hit"] or 0)),
+        cache_key=(str(row["cache_key"]) if row["cache_key"] is not None else None),
+        request_json=(
+            str(row["request_json"]) if row["request_json"] is not None else None
+        ),
+        response_json=(
+            str(row["response_json"]) if row["response_json"] is not None else None
+        ),
+        created_at=int(row["created_at"]),
+    )
+
+
+def list_llm_calls(
+    engine_or_conn: Engine | Connection,
+    project_id: str,
+) -> list[LLMCallRow]:
+    stmt = (
+        select(schema.llm_call)
+        .where(schema.llm_call.c.project_id == project_id)
+        .order_by(schema.llm_call.c.created_at.asc())
+    )
+    with _begin(engine_or_conn) as conn:
+        rows = conn.execute(stmt).mappings().all()
+    return [
+        LLMCallRow(
+            id=str(r["id"]),
+            project_id=str(r["project_id"]),
+            segment_id=(str(r["segment_id"]) if r["segment_id"] is not None else None),
+            purpose=str(r["purpose"]),
+            model=str(r["model"]),
+            prompt_tokens=(
+                int(r["prompt_tokens"]) if r["prompt_tokens"] is not None else None
+            ),
+            completion_tokens=(
+                int(r["completion_tokens"])
+                if r["completion_tokens"] is not None
+                else None
+            ),
+            cost_usd=(float(r["cost_usd"]) if r["cost_usd"] is not None else None),
+            cache_hit=bool(int(r["cache_hit"] or 0)),
+            cache_key=(str(r["cache_key"]) if r["cache_key"] is not None else None),
+            request_json=(
+                str(r["request_json"]) if r["request_json"] is not None else None
+            ),
+            response_json=(
+                str(r["response_json"]) if r["response_json"] is not None else None
+            ),
+            created_at=int(r["created_at"]),
+        )
+        for r in rows
+    ]
+
+
+def list_events(engine_or_conn: Engine | Connection, project_id: str) -> list[EventRow]:
+    stmt = (
+        select(schema.event)
+        .where(schema.event.c.project_id == project_id)
+        .order_by(schema.event.c.id.asc())
+    )
+    with _begin(engine_or_conn) as conn:
+        rows = conn.execute(stmt).mappings().all()
+    return [
+        EventRow(
+            id=int(r["id"]),
+            project_id=str(r["project_id"]),
+            ts=int(r["ts"]),
+            kind=str(r["kind"]),
+            payload=json.loads(r["payload_json"]) if r["payload_json"] else {},
+        )
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Glossary (lore bible) — PRD §4.3 / M3
+# ---------------------------------------------------------------------------
+
+
+def _glossary_entry_from_row(row: dict[str, Any]) -> GlossaryEntry:
+    return GlossaryEntry(
+        id=str(row["id"]),
+        project_id=str(row["project_id"]),
+        type=str(row["type"]),  # type: ignore[arg-type]
+        source_term=str(row["source_term"]),
+        target_term=str(row["target_term"]),
+        gender=(str(row["gender"]) if row["gender"] is not None else None),  # type: ignore[arg-type]
+        status=str(row["status"]),  # type: ignore[arg-type]
+        notes=(str(row["notes"]) if row["notes"] is not None else None),
+        first_seen_segment_id=(
+            str(row["first_seen_segment_id"])
+            if row["first_seen_segment_id"] is not None
+            else None
+        ),
+        created_at=int(row["created_at"]),
+        updated_at=int(row["updated_at"]),
+    )
+
+
+def create_glossary_entry(
+    engine_or_conn: Engine | Connection,
+    *,
+    project_id: str,
+    source_term: str,
+    target_term: str,
+    type: EntityType = "term",
+    status: GlossaryStatusLiteral = "proposed",
+    gender: GenderTag | None = None,
+    notes: str | None = None,
+    first_seen_segment_id: str | None = None,
+    source_aliases: Iterable[str] = (),
+    target_aliases: Iterable[str] = (),
+    entry_id: str | None = None,
+    created_at: int | None = None,
+    updated_at: int | None = None,
+) -> GlossaryEntry:
+    """Insert one glossary entry plus its aliases in a single transaction.
+
+    The aliases are de-duplicated against the canonical term (a source
+    alias equal to ``source_term`` is dropped — the matcher already checks
+    the canonical term separately) and within their own side.
+    """
+
+    now = _now_unix()
+    entry = GlossaryEntry(
+        id=entry_id or _new_id(),
+        project_id=project_id,
+        type=type,
+        source_term=source_term,
+        target_term=target_term,
+        gender=gender,
+        status=status,
+        notes=notes,
+        first_seen_segment_id=first_seen_segment_id,
+        created_at=created_at or now,
+        updated_at=updated_at or created_at or now,
+    )
+    insert_entry = insert(schema.glossary_entry).values(**entry.model_dump())
+
+    src_set: list[str] = []
+    seen_src: set[str] = {source_term}
+    for alias in source_aliases:
+        if alias and alias not in seen_src:
+            seen_src.add(alias)
+            src_set.append(alias)
+    tgt_set: list[str] = []
+    seen_tgt: set[str] = {target_term}
+    for alias in target_aliases:
+        if alias and alias not in seen_tgt:
+            seen_tgt.add(alias)
+            tgt_set.append(alias)
+    alias_payload = [
+        {"id": _new_id(), "entry_id": entry.id, "side": "source", "text": text}
+        for text in src_set
+    ] + [
+        {"id": _new_id(), "entry_id": entry.id, "side": "target", "text": text}
+        for text in tgt_set
+    ]
+
+    with _begin(engine_or_conn) as conn:
+        conn.execute(insert_entry)
+        if alias_payload:
+            conn.execute(insert(schema.glossary_alias), alias_payload)
+    return entry
+
+
+def get_glossary_entry(
+    engine_or_conn: Engine | Connection, entry_id: str
+) -> GlossaryEntryWithAliases | None:
+    stmt = select(schema.glossary_entry).where(schema.glossary_entry.c.id == entry_id)
+    with _begin(engine_or_conn) as conn:
+        row = conn.execute(stmt).mappings().first()
+        if row is None:
+            return None
+        entry = _glossary_entry_from_row(dict(row))
+        aliases = (
+            conn.execute(
+                select(schema.glossary_alias).where(
+                    schema.glossary_alias.c.entry_id == entry_id
+                )
+            )
+            .mappings()
+            .all()
+        )
+    src = [str(r["text"]) for r in aliases if r["side"] == "source"]
+    tgt = [str(r["text"]) for r in aliases if r["side"] == "target"]
+    return GlossaryEntryWithAliases(
+        entry=entry,
+        source_aliases=sorted(src),
+        target_aliases=sorted(tgt),
+    )
+
+
+def list_glossary_entries(
+    engine_or_conn: Engine | Connection,
+    project_id: str,
+    *,
+    status: GlossaryStatusLiteral | None = None,
+) -> list[GlossaryEntryWithAliases]:
+    """Return every glossary entry for ``project_id`` with aliases attached.
+
+    Sorted by ``source_term`` for stable hashing in
+    :func:`epublate.glossary.enforcer.glossary_hash`.
+    """
+
+    entry_stmt = select(schema.glossary_entry).where(
+        schema.glossary_entry.c.project_id == project_id
+    )
+    if status is not None:
+        entry_stmt = entry_stmt.where(schema.glossary_entry.c.status == status)
+    entry_stmt = entry_stmt.order_by(
+        schema.glossary_entry.c.source_term.asc(),
+        schema.glossary_entry.c.id.asc(),
+    )
+
+    with _begin(engine_or_conn) as conn:
+        entry_rows = conn.execute(entry_stmt).mappings().all()
+        if not entry_rows:
+            return []
+        ids = [str(r["id"]) for r in entry_rows]
+        alias_rows = (
+            conn.execute(
+                select(schema.glossary_alias).where(
+                    schema.glossary_alias.c.entry_id.in_(ids)
+                )
+            )
+            .mappings()
+            .all()
+        )
+
+    aliases_by_entry: dict[str, tuple[list[str], list[str]]] = {
+        eid: ([], []) for eid in ids
+    }
+    for r in alias_rows:
+        bucket = aliases_by_entry[str(r["entry_id"])]
+        if r["side"] == "source":
+            bucket[0].append(str(r["text"]))
+        else:
+            bucket[1].append(str(r["text"]))
+
+    out: list[GlossaryEntryWithAliases] = []
+    for r in entry_rows:
+        entry = _glossary_entry_from_row(dict(r))
+        src, tgt = aliases_by_entry[entry.id]
+        out.append(
+            GlossaryEntryWithAliases(
+                entry=entry,
+                source_aliases=sorted(src),
+                target_aliases=sorted(tgt),
+            )
+        )
+    return out
+
+
+def find_glossary_entry_by_source_term(
+    engine_or_conn: Engine | Connection,
+    *,
+    project_id: str,
+    source_term: str,
+    type: EntityType | None = None,
+) -> GlossaryEntry | None:
+    """Lookup helper used by the auto-proposer to dedupe candidates."""
+
+    stmt = (
+        select(schema.glossary_entry)
+        .where(schema.glossary_entry.c.project_id == project_id)
+        .where(schema.glossary_entry.c.source_term == source_term)
+    )
+    if type is not None:
+        stmt = stmt.where(schema.glossary_entry.c.type == type)
+    stmt = stmt.limit(1)
+    with _begin(engine_or_conn) as conn:
+        row = conn.execute(stmt).mappings().first()
+    if row is None:
+        return None
+    return _glossary_entry_from_row(dict(row))
+
+
+def update_glossary_entry(
+    engine_or_conn: Engine | Connection,
+    *,
+    entry_id: str,
+    target_term: str | None = None,
+    status: GlossaryStatusLiteral | None = None,
+    type: EntityType | None = None,
+    gender: GenderTag | None = None,
+    notes: str | None = None,
+    reason: str | None = None,
+) -> GlossaryEntry:
+    """Update fields on an existing entry and record a revision when needed.
+
+    A revision row is appended whenever ``target_term`` or ``status``
+    actually change (PRD F-LB-6; ``glossary-invariants.mdc`` §3). The
+    write commits in a single transaction so revisions can never lag the
+    entry's current state.
+    """
+
+    with _begin(engine_or_conn) as conn:
+        existing_row = (
+            conn.execute(
+                select(schema.glossary_entry).where(
+                    schema.glossary_entry.c.id == entry_id
+                )
+            )
+            .mappings()
+            .first()
+        )
+        if existing_row is None:
+            raise ValueError(f"glossary entry not found: {entry_id}")
+        existing = _glossary_entry_from_row(dict(existing_row))
+
+        new_values: dict[str, Any] = {"updated_at": _now_unix()}
+        target_changed = target_term is not None and target_term != existing.target_term
+        status_changed = status is not None and status != existing.status
+        if target_changed:
+            new_values["target_term"] = target_term
+        if status_changed:
+            new_values["status"] = status
+        if type is not None and type != existing.type:
+            new_values["type"] = type
+        if gender is not None and gender != existing.gender:
+            new_values["gender"] = gender
+        if notes is not None and notes != existing.notes:
+            new_values["notes"] = notes
+
+        if len(new_values) == 1:
+            return existing
+
+        conn.execute(
+            update(schema.glossary_entry)
+            .where(schema.glossary_entry.c.id == entry_id)
+            .values(**new_values)
+        )
+
+        if target_changed or status_changed:
+            conn.execute(
+                insert(schema.glossary_revision).values(
+                    id=_new_id(),
+                    entry_id=entry_id,
+                    prev_target_term=existing.target_term,
+                    new_target_term=(
+                        target_term if target_changed else existing.target_term
+                    ),
+                    reason=reason
+                    or (
+                        f"status: {existing.status} -> {status}"
+                        if status_changed and not target_changed
+                        else None
+                    ),
+                    created_at=_now_unix(),
+                )
+            )
+
+    refreshed = get_glossary_entry(engine_or_conn, entry_id)
+    assert refreshed is not None  # we just updated it
+    return refreshed.entry
+
+
+def delete_glossary_entry(engine_or_conn: Engine | Connection, entry_id: str) -> None:
+    """Remove an entry; cascade FKs handle aliases/revisions/mentions."""
+
+    with _begin(engine_or_conn) as conn:
+        conn.execute(
+            delete(schema.glossary_entry).where(schema.glossary_entry.c.id == entry_id)
+        )
+
+
+def set_aliases(
+    engine_or_conn: Engine | Connection,
+    *,
+    entry_id: str,
+    source_aliases: Iterable[str] = (),
+    target_aliases: Iterable[str] = (),
+) -> None:
+    """Replace all aliases for ``entry_id`` with the given sets.
+
+    De-duplicates within each side. The canonical term is *not* added
+    here — the matcher already includes it explicitly.
+    """
+
+    src_clean: list[str] = []
+    seen_src: set[str] = set()
+    for alias in source_aliases:
+        if alias and alias not in seen_src:
+            seen_src.add(alias)
+            src_clean.append(alias)
+    tgt_clean: list[str] = []
+    seen_tgt: set[str] = set()
+    for alias in target_aliases:
+        if alias and alias not in seen_tgt:
+            seen_tgt.add(alias)
+            tgt_clean.append(alias)
+
+    payload = [
+        {"id": _new_id(), "entry_id": entry_id, "side": "source", "text": text}
+        for text in src_clean
+    ] + [
+        {"id": _new_id(), "entry_id": entry_id, "side": "target", "text": text}
+        for text in tgt_clean
+    ]
+
+    with _begin(engine_or_conn) as conn:
+        conn.execute(
+            delete(schema.glossary_alias).where(
+                schema.glossary_alias.c.entry_id == entry_id
+            )
+        )
+        if payload:
+            conn.execute(insert(schema.glossary_alias), payload)
+
+
+def list_aliases(
+    engine_or_conn: Engine | Connection, entry_id: str
+) -> list[GlossaryAlias]:
+    stmt = (
+        select(schema.glossary_alias)
+        .where(schema.glossary_alias.c.entry_id == entry_id)
+        .order_by(
+            schema.glossary_alias.c.side.asc(),
+            schema.glossary_alias.c.text.asc(),
+        )
+    )
+    with _begin(engine_or_conn) as conn:
+        rows = conn.execute(stmt).mappings().all()
+    return [
+        GlossaryAlias(
+            id=str(r["id"]),
+            entry_id=str(r["entry_id"]),
+            side=str(r["side"]),  # type: ignore[arg-type]
+            text=str(r["text"]),
+        )
+        for r in rows
+    ]
+
+
+def list_glossary_revisions(
+    engine_or_conn: Engine | Connection, entry_id: str
+) -> list[GlossaryRevision]:
+    stmt = (
+        select(schema.glossary_revision)
+        .where(schema.glossary_revision.c.entry_id == entry_id)
+        .order_by(schema.glossary_revision.c.created_at.asc())
+    )
+    with _begin(engine_or_conn) as conn:
+        rows = conn.execute(stmt).mappings().all()
+    return [
+        GlossaryRevision(
+            id=str(r["id"]),
+            entry_id=str(r["entry_id"]),
+            prev_target_term=(
+                str(r["prev_target_term"])
+                if r["prev_target_term"] is not None
+                else None
+            ),
+            new_target_term=(
+                str(r["new_target_term"]) if r["new_target_term"] is not None else None
+            ),
+            reason=(str(r["reason"]) if r["reason"] is not None else None),
+            created_at=int(r["created_at"]),
+        )
+        for r in rows
+    ]
+
+
+def record_mentions(
+    engine_or_conn: Engine | Connection,
+    *,
+    segment_id: str,
+    mentions: Iterable[tuple[str, int | None, int | None]],
+) -> None:
+    """Replace ``entity_mention`` rows for ``segment_id``.
+
+    ``mentions`` is an iterable of ``(entry_id, span_start, span_end)``;
+    we de-duplicate by ``(entry_id, span_start, span_end)`` so a noisy
+    matcher doesn't bloat the table.
+    """
+
+    seen: set[tuple[str, int | None, int | None]] = set()
+    payload: list[dict[str, Any]] = []
+    for entry_id, start, end in mentions:
+        key = (entry_id, start, end)
+        if key in seen:
+            continue
+        seen.add(key)
+        payload.append(
+            {
+                "id": _new_id(),
+                "segment_id": segment_id,
+                "entry_id": entry_id,
+                "source_span_start": start,
+                "source_span_end": end,
+            }
+        )
+
+    with _begin(engine_or_conn) as conn:
+        conn.execute(
+            delete(schema.entity_mention).where(
+                schema.entity_mention.c.segment_id == segment_id
+            )
+        )
+        if payload:
+            conn.execute(insert(schema.entity_mention), payload)
+
+
+def list_mentions(
+    engine_or_conn: Engine | Connection,
+    *,
+    segment_id: str | None = None,
+    entry_id: str | None = None,
+) -> list[EntityMention]:
+    stmt = select(schema.entity_mention)
+    if segment_id is not None:
+        stmt = stmt.where(schema.entity_mention.c.segment_id == segment_id)
+    if entry_id is not None:
+        stmt = stmt.where(schema.entity_mention.c.entry_id == entry_id)
+    with _begin(engine_or_conn) as conn:
+        rows = conn.execute(stmt).mappings().all()
+    return [
+        EntityMention(
+            id=str(r["id"]),
+            segment_id=str(r["segment_id"]),
+            entry_id=str(r["entry_id"]),
+            source_span_start=(
+                int(r["source_span_start"])
+                if r["source_span_start"] is not None
+                else None
+            ),
+            source_span_end=(
+                int(r["source_span_end"]) if r["source_span_end"] is not None else None
+            ),
+        )
+        for r in rows
+    ]
+
+
+def list_segments_by_status(
+    engine_or_conn: Engine | Connection,
+    *,
+    project_id: str,
+    status: str,
+    chapter_ids: tuple[str, ...] | None = None,
+) -> list[SegmentRow]:
+    """Project-wide segments filtered by ``status`` (and optionally chapters).
+
+    Used by the M4 Inbox to list ``flagged`` segments and by the batch
+    runner to enumerate ``pending`` work. Sorted by spine_idx then idx
+    so the curator sees them in book order.
+    """
+
+    stmt = (
+        select(schema.segment)
+        .join(schema.chapter, schema.chapter.c.id == schema.segment.c.chapter_id)
+        .where(schema.chapter.c.project_id == project_id)
+        .where(schema.segment.c.status == status)
+    )
+    if chapter_ids is not None:
+        if not chapter_ids:
+            return []
+        stmt = stmt.where(schema.segment.c.chapter_id.in_(chapter_ids))
+    stmt = stmt.order_by(schema.chapter.c.spine_idx.asc(), schema.segment.c.idx.asc())
+
+    with _begin(engine_or_conn) as conn:
+        rows = conn.execute(stmt).mappings().all()
+    return [_segment_row_from_mapping(r) for r in rows]
+
+
+def _segment_row_from_mapping(r: Any) -> SegmentRow:
+    """Decode one ``segment`` row mapping into a :class:`SegmentRow`."""
+
+    skel, host_path, host_part, host_total = _decode_inline_skeleton(
+        r["inline_skeleton"]
+    )
+    return SegmentRow(
+        id=str(r["id"]),
+        chapter_id=str(r["chapter_id"]),
+        idx=int(r["idx"]),
+        source_text=str(r["source_text"]),
+        source_hash=str(r["source_hash"]),
+        target_text=(str(r["target_text"]) if r["target_text"] is not None else None),
+        status=str(r["status"]),
+        inline_skeleton=skel,
+        host_path=host_path,
+        host_part=host_part,
+        host_total_parts=host_total,
+    )
+
+
+def list_segments_for_project(
+    engine_or_conn: Engine | Connection, project_id: str
+) -> list[SegmentRow]:
+    """Cascade helper: every segment in a project, regardless of chapter.
+
+    Used by :mod:`epublate.glossary.cascade` to scan all source/target
+    text for affected matches without N+1ing across chapters.
+    """
+
+    stmt = (
+        select(schema.segment)
+        .join(schema.chapter, schema.chapter.c.id == schema.segment.c.chapter_id)
+        .where(schema.chapter.c.project_id == project_id)
+        .order_by(schema.chapter.c.spine_idx.asc(), schema.segment.c.idx.asc())
+    )
+    with _begin(engine_or_conn) as conn:
+        rows = conn.execute(stmt).mappings().all()
+    out: list[SegmentRow] = []
+    for r in rows:
+        skel, host_path, host_part, host_total = _decode_inline_skeleton(
+            r["inline_skeleton"]
+        )
+        out.append(
+            SegmentRow(
+                id=str(r["id"]),
+                chapter_id=str(r["chapter_id"]),
+                idx=int(r["idx"]),
+                source_text=str(r["source_text"]),
+                source_hash=str(r["source_hash"]),
+                target_text=(
+                    str(r["target_text"]) if r["target_text"] is not None else None
+                ),
+                status=str(r["status"]),
+                inline_skeleton=skel,
+                host_path=host_path,
+                host_part=host_part,
+                host_total_parts=host_total,
+            )
+        )
+    return out
+
+
+class _Begin:
+    """Context manager that yields a connection with an active transaction.
+
+    Accepts either an ``Engine`` (begins/commits/rolls back automatically) or
+    an existing ``Connection`` (caller owns the transaction lifecycle).
+    """
+
+    def __init__(self, engine_or_conn: Engine | Connection) -> None:
+        self._engine_or_conn = engine_or_conn
+        self._owned: Any = None
+
+    def __enter__(self) -> Connection:
+        target = self._engine_or_conn
+        if isinstance(target, Engine):
+            self._owned = target.begin()
+            return self._owned.__enter__()  # type: ignore[no-any-return]
+        return target
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if self._owned is not None:
+            self._owned.__exit__(exc_type, exc, tb)
+
+
+def _begin(engine_or_conn: Engine | Connection) -> _Begin:
+    return _Begin(engine_or_conn)
+
+
+__all__ = [
+    "ChapterRow",
+    "EventRow",
+    "LLMCallRow",
+    "ProjectRow",
+    "SegmentRow",
+    "append_event",
+    "bulk_insert_chapters",
+    "bulk_insert_segments",
+    "create_glossary_entry",
+    "create_project",
+    "delete_glossary_entry",
+    "find_glossary_entry_by_source_term",
+    "find_llm_call_by_cache_key",
+    "get_glossary_entry",
+    "get_project",
+    "get_segment",
+    "insert_llm_call",
+    "list_aliases",
+    "list_chapters",
+    "list_events",
+    "list_glossary_entries",
+    "list_glossary_revisions",
+    "list_llm_calls",
+    "list_mentions",
+    "list_projects",
+    "list_segments",
+    "list_segments_by_status",
+    "list_segments_for_project",
+    "record_mentions",
+    "segment_row_from",
+    "segment_row_to",
+    "set_aliases",
+    "update_glossary_entry",
+    "update_project_budget",
+    "update_project_style",
+    "update_segment_status",
+    "update_segment_translation",
+]

@@ -1,0 +1,136 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "epublate"
+version = "0.1.0"
+description = "A rich TUI that translates ePub story books with an LLM, preserving format and a per-project lore bible."
+readme = "README.md"
+requires-python = ">=3.13"
+license = { file = "LICENSE" }
+authors = [{ name = "epublate contributors" }]
+keywords = ["epub", "translation", "llm", "tui", "textual"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Text Processing :: Linguistic",
+]
+dependencies = [
+    "textual>=0.85",
+    "rich>=13.7",
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "pydantic>=2.7",
+    "click>=8.1",
+    "ebooklib>=0.18",
+    "lxml>=5.2",
+    "openai>=1.50",
+    "tiktoken>=0.7",
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+embeddings = []
+ner = []
+epubcheck = ["epubcheck>=5.1.0"]
+
+[project.scripts]
+epublate = "epublate.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/madpin/epublate"
+Issues = "https://github.com/madpin/epublate/issues"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "pytest-textual-snapshot>=1.0",
+    "hypothesis>=6.100",
+    "ruff>=0.6",
+    "mypy>=1.10",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/epublate"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/epublate", "README.md", "LICENSE", "docs/PRD.md"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+src = ["src", "tests"]
+extend-exclude = ["src/epublate/db/migrations/versions"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific rules
+    "TID", # tidy imports
+]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B011"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+show_error_codes = true
+exclude = ["src/epublate/db/migrations/versions"]
+
+[[tool.mypy.overrides]]
+module = ["alembic.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["ebooklib.*", "lxml"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["tiktoken.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+asyncio_mode = "auto"
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning:textual.*",
+    "ignore::DeprecationWarning:pytest_textual_snapshot.*",
+    # Textual / pytest-textual-snapshot leak event-loop sockets and
+    # asyncio loops on teardown when an async test ran earlier in the
+    # session; these warnings come from asyncio internals that we don't
+    # control. They surface only after the snapshot test has already
+    # passed, so dropping them keeps the suite green without masking
+    # real bugs in our code.
+    "ignore::ResourceWarning",
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+]

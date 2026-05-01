@@ -1,0 +1,1199 @@
+"""Translation pipeline (PRD §4.2).
+
+Phases live here so persistence rules are enforced in a single place
+(db-and-persistence rule §2: state changes are transactional). The
+Reader screen and (later) the batch worker pool are both supposed to
+go through :func:`translate_segment`.
+
+M3 wires the lore bible into every translate call:
+
+* Phase 2 (resolve entities) — :func:`epublate.glossary.enforcer.build_constraints`
+  filters the project's locked + confirmed entries into the system
+  prompt, and the source-side matcher records every mention in
+  ``entity_mention``.
+* Phase 5 (validate) — the structural placeholder validator still runs,
+  and :func:`epublate.glossary.enforcer.validate_target` checks that
+  every locked entry hit in the source is honored in the target.
+* Cache key — the glossary state is folded into the cache key
+  (PRD F-LLM-6) so a glossary edit invalidates stale translations.
+* Phase 3 (auto-propose) — every ``new_entities`` candidate the
+  translator returns is upserted as a ``proposed`` glossary entry so the
+  curator can promote/reject it from the Glossary screen later.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import uuid
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from typing import Any, cast
+
+from epublate.core.cache import cache_key_for_messages
+from epublate.core.validators import validate_segment_placeholders
+from epublate.db import repo, schema
+from epublate.errors import EpublateError
+from epublate.formats.base import Segment
+from epublate.glossary import io as glossary_io
+from epublate.glossary.enforcer import (
+    Violation,
+    build_constraints,
+    find_mentions,
+    glossary_hash,
+    has_locked_violation,
+    validate_target,
+)
+from epublate.glossary.models import EntityType, GlossaryEntryWithAliases
+from epublate.llm.base import LLMProvider, ResponseFormat
+from epublate.llm.pricing import estimate_cost
+from epublate.llm.prompts.translator import (
+    GlossaryConstraint,
+    GroupTranslatorItem,
+    TranslatorTrace,
+    build_group_translator_messages,
+    build_translator_messages,
+    parse_group_translator_response,
+    parse_translator_response,
+)
+from epublate.llm.tokens import count_tokens
+
+_logger = logging.getLogger(__name__)
+
+PURPOSE_TRANSLATE = "translate"
+
+# Default grouping parameters — see ``translate_segments_grouped``.
+GROUP_DEFAULT_MAX_ITEMS = 50
+GROUP_DEFAULT_MAX_SOURCE_CHARS = 240
+GROUP_PLACEHOLDER_PREFIX = "[[T"
+
+# When the translator's trace returns a candidate ``type`` we don't
+# recognize, we collapse to ``term`` so the auto-proposer can still
+# record the source string for the curator.
+_VALID_ENTITY_TYPES: frozenset[str] = frozenset(
+    [
+        "character",
+        "place",
+        "organization",
+        "event",
+        "item",
+        "date_or_time",
+        "phrase",
+        "term",
+        "other",
+    ]
+)
+
+
+@dataclass(slots=True, frozen=True)
+class TranslateOptions:
+    """Per-call knobs that don't live on the project row.
+
+    Defaults pin ``temperature=0.0`` and ``seed=7`` so tests with a real
+    OpenAI-compatible endpoint stay reproducible (NFR-5). ``bypass_cache``
+    is used by the Reader's "retry" action.
+
+    ``glossary`` is an explicit override used by tests and CLI tools
+    that want to bypass the DB-loaded set; when ``None``, the pipeline
+    loads the project's glossary from the DB (the normal path).
+    ``auto_propose`` controls whether ``trace.new_entities`` candidates
+    are upserted as ``proposed`` entries (M3 default: on).
+    """
+
+    model: str
+    temperature: float | None = 0.0
+    seed: int | None = 7
+    glossary: tuple[GlossaryConstraint, ...] | None = None
+    bypass_cache: bool = False
+    response_format: ResponseFormat | None = None
+    auto_propose: bool = True
+
+
+@dataclass(slots=True)
+class TranslateOutcome:
+    """Result of one ``translate_segment`` call.
+
+    ``violations`` lists every glossary violation surfaced by the
+    enforcer; if any of them is locked-severity, ``flagged`` is true and
+    the segment's persisted status is ``flagged`` instead of
+    ``translated`` (PRD §4.3 / glossary-invariants rule §1).
+    ``proposed_entry_ids`` are auto-created glossary rows from
+    ``trace.new_entities``; the Glossary screen surfaces them in the
+    "proposed" filter.
+    """
+
+    segment_id: str
+    target_text: str
+    trace: TranslatorTrace
+    cache_hit: bool
+    prompt_tokens: int
+    completion_tokens: int
+    cost_usd: float
+    llm_call_id: str
+    cache_key: str
+    violations: tuple[Violation, ...] = ()
+    flagged: bool = False
+    mention_entry_ids: tuple[str, ...] = ()
+    proposed_entry_ids: tuple[str, ...] = ()
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+class PipelineError(EpublateError):
+    """Pipeline failed past the configured retry budget."""
+
+
+def translate_segment(
+    *,
+    engine: Any,
+    project_id: str,
+    source_lang: str,
+    target_lang: str,
+    style_guide: str | None,
+    segment: repo.SegmentRow,
+    provider: LLMProvider,
+    options: TranslateOptions,
+) -> TranslateOutcome:
+    """Translate one segment and persist the result in a single transaction.
+
+    Caller responsibilities:
+
+    * The segment must already exist in the DB (i.e. ``Project.create``
+      has imported the source ePub). The pipeline does not create rows.
+    * On success the segment's ``status`` flips to
+      :data:`SegmentStatus.TRANSLATED` (or ``FLAGGED`` if a locked
+      glossary violation was detected). The Reader / Inbox screen is
+      responsible for promoting it to ``approved``.
+
+    Pipeline guarantees:
+
+    * Cache hits never call the provider; the cache key folds in the
+      glossary state hash so a glossary edit invalidates stale entries.
+    * Misses validate inline-tag round-trip before writing the target;
+      a malformed translation never lands in the DB (format-handling
+      rule §2).
+    * Locked glossary violations flip the segment to ``flagged`` and
+      record the violation list on a ``segment.translation_flagged``
+      event so the curator can find it in the Inbox (M4).
+    * The segment update, the ``llm_call`` audit row, mentions, the
+      auto-proposed entries, and every event commit together — one
+      transaction, crash safe.
+    """
+
+    project_entries = _load_glossary(engine, project_id=project_id)
+    constraints = (
+        list(options.glossary)
+        if options.glossary is not None
+        else build_constraints(project_entries)
+    )
+    g_hash = glossary_hash(project_entries)
+
+    messages = build_translator_messages(
+        source_lang=source_lang,
+        target_lang=target_lang,
+        source_text=segment.source_text,
+        style_guide=style_guide,
+        glossary=constraints,
+    )
+    key = cache_key_for_messages(
+        model=options.model, messages=messages, glossary_hash=g_hash
+    )
+    if options.bypass_cache:
+        # Salt the key so retries on the same segment never pick up the
+        # earlier (presumably bad) translation, while still being
+        # deterministic for the same retry chain.
+        key = f"{key}:retry"
+
+    request_payload = {
+        "model": options.model,
+        "messages": [m.model_dump() for m in messages],
+        "temperature": options.temperature,
+        "seed": options.seed,
+        "glossary_hash": g_hash,
+    }
+    request_json = json.dumps(request_payload, ensure_ascii=False, sort_keys=True)
+
+    if not options.bypass_cache:
+        hit = repo.find_llm_call_by_cache_key(
+            engine, project_id=project_id, cache_key=key
+        )
+        if hit is not None and hit.response_json:
+            outcome = _replay_from_cache(
+                engine,
+                project_id=project_id,
+                segment=segment,
+                key=key,
+                hit=hit,
+                request_json=request_json,
+                options=options,
+                entries=project_entries,
+            )
+            return outcome
+
+    chat_result = provider.chat(
+        messages,
+        model=options.model,
+        response_format=options.response_format,
+        temperature=options.temperature,
+        seed=options.seed,
+    )
+
+    try:
+        trace = parse_translator_response(chat_result.content)
+    except EpublateError:
+        # Re-raise — the LLM-integration rule says past the retry budget
+        # we surface a typed error. Persist the failed call for audit.
+        _record_failed_call(
+            engine,
+            project_id=project_id,
+            segment_id=segment.id,
+            model=chat_result.model,
+            request_json=request_json,
+            response_json=json.dumps(
+                chat_result.raw, ensure_ascii=False, sort_keys=True
+            ),
+            key=key,
+            prompt_tokens=chat_result.prompt_tokens,
+            completion_tokens=chat_result.completion_tokens,
+        )
+        raise
+
+    spliced = _splice_target(segment, target=trace.target)
+    validate_segment_placeholders(spliced)
+
+    violations = validate_target(
+        source_text=segment.source_text,
+        target_text=trace.target,
+        entries=project_entries,
+    )
+    flagged = has_locked_violation(violations)
+    final_status = (
+        schema.SegmentStatus.FLAGGED if flagged else schema.SegmentStatus.TRANSLATED
+    )
+
+    mentions = find_mentions(segment.source_text, project_entries)
+    mention_entry_ids = tuple(dict.fromkeys(m.entry_id for m in mentions))
+    mention_payload: list[tuple[str, int | None, int | None]] = [
+        (m.entry_id, m.start, m.end) for m in mentions
+    ]
+
+    cost = estimate_cost(
+        chat_result.model,
+        chat_result.prompt_tokens,
+        chat_result.completion_tokens,
+    )
+    response_payload = {
+        "content": chat_result.content,
+        "trace": trace.model_dump(),
+        "raw": chat_result.raw,
+    }
+    response_json = json.dumps(response_payload, ensure_ascii=False, sort_keys=True)
+
+    llm_call_id = uuid.uuid4().hex
+    proposed_ids: list[str] = []
+    with engine.begin() as conn:
+        repo.update_segment_translation(
+            conn,
+            segment_id=segment.id,
+            target_text=trace.target,
+            status=final_status,
+        )
+        repo.record_mentions(conn, segment_id=segment.id, mentions=mention_payload)
+        repo.insert_llm_call(
+            conn,
+            repo.LLMCallRow(
+                id=llm_call_id,
+                project_id=project_id,
+                segment_id=segment.id,
+                purpose=PURPOSE_TRANSLATE,
+                model=chat_result.model,
+                prompt_tokens=chat_result.prompt_tokens,
+                completion_tokens=chat_result.completion_tokens,
+                cost_usd=cost,
+                cache_hit=False,
+                cache_key=key,
+                request_json=request_json,
+                response_json=response_json,
+            ),
+        )
+        repo.append_event(
+            conn,
+            project_id=project_id,
+            kind="segment.translated",
+            payload={
+                "segment_id": segment.id,
+                "model": chat_result.model,
+                "prompt_tokens": chat_result.prompt_tokens,
+                "completion_tokens": chat_result.completion_tokens,
+                "cost_usd": cost,
+                "cache_hit": False,
+                "llm_call_id": llm_call_id,
+                "mention_entry_ids": list(mention_entry_ids),
+                "flagged": flagged,
+            },
+        )
+        if flagged:
+            repo.append_event(
+                conn,
+                project_id=project_id,
+                kind="segment.translation_flagged",
+                payload={
+                    "segment_id": segment.id,
+                    "violations": [_violation_to_payload(v) for v in violations],
+                },
+            )
+        if options.auto_propose:
+            proposed_ids.extend(
+                _auto_propose_entities(
+                    conn,
+                    project_id=project_id,
+                    segment_id=segment.id,
+                    trace=trace,
+                )
+            )
+
+    _logger.info(
+        "translated segment %s (%d→%d tokens, $%.6f) via %s%s",
+        segment.id,
+        chat_result.prompt_tokens,
+        chat_result.completion_tokens,
+        cost,
+        chat_result.model,
+        " [flagged]" if flagged else "",
+    )
+    return TranslateOutcome(
+        segment_id=segment.id,
+        target_text=trace.target,
+        trace=trace,
+        cache_hit=False,
+        prompt_tokens=chat_result.prompt_tokens,
+        completion_tokens=chat_result.completion_tokens,
+        cost_usd=cost,
+        llm_call_id=llm_call_id,
+        cache_key=key,
+        violations=tuple(violations),
+        flagged=flagged,
+        mention_entry_ids=mention_entry_ids,
+        proposed_entry_ids=tuple(proposed_ids),
+    )
+
+
+def _replay_from_cache(
+    engine: Any,
+    *,
+    project_id: str,
+    segment: repo.SegmentRow,
+    key: str,
+    hit: repo.LLMCallRow,
+    request_json: str,
+    options: TranslateOptions,
+    entries: Sequence[GlossaryEntryWithAliases],
+) -> TranslateOutcome:
+    """Hydrate a translation from a cached ``llm_call`` row.
+
+    A second cache hit still gets a fresh ``llm_call`` insertion so it's
+    distinguishable from the original miss (LLM-integration rule §5).
+    The cache key already incorporates the glossary state hash, so a
+    hit means *the same glossary produced the same prompt*; we re-run
+    the validator anyway as defensive belt-and-braces.
+    """
+
+    payload = json.loads(hit.response_json or "{}")
+    trace_data = payload.get("trace") if isinstance(payload, dict) else None
+    if not isinstance(trace_data, dict):
+        # Older / external rows might only persist ``content``; recover.
+        content = payload.get("content") if isinstance(payload, dict) else None
+        if not isinstance(content, str):
+            raise PipelineError(
+                f"cached llm_call {hit.id} has no usable response payload"
+            )
+        trace = parse_translator_response(content)
+    else:
+        trace = TranslatorTrace.model_validate(trace_data)
+
+    spliced = _splice_target(segment, target=trace.target)
+    validate_segment_placeholders(spliced)
+
+    violations = validate_target(
+        source_text=segment.source_text,
+        target_text=trace.target,
+        entries=entries,
+    )
+    flagged = has_locked_violation(violations)
+    final_status = (
+        schema.SegmentStatus.FLAGGED if flagged else schema.SegmentStatus.TRANSLATED
+    )
+
+    mentions = find_mentions(segment.source_text, entries)
+    mention_entry_ids = tuple(dict.fromkeys(m.entry_id for m in mentions))
+    mention_payload: list[tuple[str, int | None, int | None]] = [
+        (m.entry_id, m.start, m.end) for m in mentions
+    ]
+
+    response_json = hit.response_json or json.dumps(
+        {"content": trace.target, "trace": trace.model_dump()},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    new_id = uuid.uuid4().hex
+    proposed_ids: list[str] = []
+    with engine.begin() as conn:
+        repo.update_segment_translation(
+            conn,
+            segment_id=segment.id,
+            target_text=trace.target,
+            status=final_status,
+        )
+        repo.record_mentions(conn, segment_id=segment.id, mentions=mention_payload)
+        repo.insert_llm_call(
+            conn,
+            repo.LLMCallRow(
+                id=new_id,
+                project_id=project_id,
+                segment_id=segment.id,
+                purpose=PURPOSE_TRANSLATE,
+                model=hit.model,
+                prompt_tokens=hit.prompt_tokens,
+                completion_tokens=hit.completion_tokens,
+                cost_usd=0.0,
+                cache_hit=True,
+                cache_key=key,
+                request_json=request_json,
+                response_json=response_json,
+            ),
+        )
+        repo.append_event(
+            conn,
+            project_id=project_id,
+            kind="segment.translated",
+            payload={
+                "segment_id": segment.id,
+                "model": hit.model,
+                "cache_hit": True,
+                "llm_call_id": new_id,
+                "mention_entry_ids": list(mention_entry_ids),
+                "flagged": flagged,
+            },
+        )
+        if flagged:
+            repo.append_event(
+                conn,
+                project_id=project_id,
+                kind="segment.translation_flagged",
+                payload={
+                    "segment_id": segment.id,
+                    "violations": [_violation_to_payload(v) for v in violations],
+                },
+            )
+        if options.auto_propose:
+            proposed_ids.extend(
+                _auto_propose_entities(
+                    conn,
+                    project_id=project_id,
+                    segment_id=segment.id,
+                    trace=trace,
+                )
+            )
+
+    return TranslateOutcome(
+        segment_id=segment.id,
+        target_text=trace.target,
+        trace=trace,
+        cache_hit=True,
+        prompt_tokens=hit.prompt_tokens or 0,
+        completion_tokens=hit.completion_tokens or 0,
+        cost_usd=0.0,
+        llm_call_id=new_id,
+        cache_key=key,
+        violations=tuple(violations),
+        flagged=flagged,
+        mention_entry_ids=mention_entry_ids,
+        proposed_entry_ids=tuple(proposed_ids),
+    )
+
+
+def _splice_target(segment: repo.SegmentRow, *, target: str) -> Segment:
+    """Reconstruct a runtime :class:`Segment` with the LLM target attached.
+
+    The pipeline never mutates the stored ``SegmentRow`` directly — the
+    DB write goes through :func:`repo.update_segment_translation` — but
+    we need a :class:`Segment` value object to feed the structural
+    validator (it already knows the ``inline_skeleton`` shape).
+    """
+
+    return Segment(
+        id=segment.id,
+        chapter_id=segment.chapter_id,
+        idx=segment.idx,
+        source_text=segment.source_text,
+        source_hash=segment.source_hash,
+        target_text=target,
+        inline_skeleton=list(segment.inline_skeleton),
+        host_path=segment.host_path,
+        host_part=segment.host_part,
+        host_total_parts=segment.host_total_parts,
+    )
+
+
+def _record_failed_call(
+    engine: Any,
+    *,
+    project_id: str,
+    segment_id: str,
+    model: str,
+    request_json: str,
+    response_json: str,
+    key: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+) -> None:
+    """Persist a failed parse for audit (LLM-integration rule §5)."""
+
+    cost = estimate_cost(model, prompt_tokens, completion_tokens)
+    with engine.begin() as conn:
+        repo.insert_llm_call(
+            conn,
+            repo.LLMCallRow(
+                id=uuid.uuid4().hex,
+                project_id=project_id,
+                segment_id=segment_id,
+                purpose=PURPOSE_TRANSLATE,
+                model=model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cost_usd=cost,
+                cache_hit=False,
+                cache_key=key,
+                request_json=request_json,
+                response_json=response_json,
+            ),
+        )
+        repo.append_event(
+            conn,
+            project_id=project_id,
+            kind="segment.translation_failed",
+            payload={"segment_id": segment_id, "model": model},
+        )
+
+
+def estimate_segment_tokens(
+    *,
+    source_lang: str,
+    target_lang: str,
+    source_text: str,
+    style_guide: str | None,
+    glossary: Sequence[GlossaryConstraint] = (),
+    model: str | None = None,
+) -> int:
+    """Coarse upper-bound on prompt tokens for one segment (PRD F-LLM-4)."""
+
+    messages = build_translator_messages(
+        source_lang=source_lang,
+        target_lang=target_lang,
+        source_text=source_text,
+        style_guide=style_guide,
+        glossary=glossary,
+    )
+    return sum(count_tokens(m.content, model=model) for m in messages)
+
+
+def _load_glossary(engine: Any, *, project_id: str) -> list[GlossaryEntryWithAliases]:
+    """Read every glossary entry for ``project_id`` (proposed included).
+
+    The matcher needs proposed entries too — they don't constrain the
+    prompt or the validator, but they should still record mentions so
+    the curator can see how often a candidate name appears. The hash
+    (``glossary_hash``) likewise covers the proposed set so cache keys
+    invalidate when the curator promotes or merges entries.
+    """
+
+    return list(repo.list_glossary_entries(engine, project_id))
+
+
+def _violation_to_payload(violation: Violation) -> dict[str, Any]:
+    return {
+        "entry_id": violation.entry_id,
+        "source_term": violation.source_term,
+        "target_term": violation.target_term,
+        "matched_source": violation.matched_source,
+        "severity": violation.severity,
+        "message": violation.message,
+    }
+
+
+def _auto_propose_entities(
+    conn: Any,
+    *,
+    project_id: str,
+    segment_id: str,
+    trace: TranslatorTrace,
+) -> list[str]:
+    """Upsert ``trace.new_entities`` candidates as ``proposed`` glossary rows.
+
+    Runs inside the caller's transaction (``conn`` is a Connection) so
+    the auto-proposal commits atomically with the segment write. We
+    de-dup against existing rows by ``(source_term, type)``; an
+    ``entity.proposed`` event is appended for each *new* row so a
+    future Inbox screen can surface the curator's worklist.
+    """
+
+    created_ids: list[str] = []
+    for raw in trace.new_entities:
+        candidate = _normalize_new_entity(raw)
+        if candidate is None:
+            continue
+        source_term, type_ = candidate
+        entry_id, created = glossary_io.upsert_proposed(
+            conn,
+            project_id=project_id,
+            source_term=source_term,
+            type=type_,
+            first_seen_segment_id=segment_id,
+            notes=None,
+        )
+        if not created:
+            continue
+        created_ids.append(entry_id)
+        repo.append_event(
+            conn,
+            project_id=project_id,
+            kind="entity.proposed",
+            payload={
+                "entry_id": entry_id,
+                "segment_id": segment_id,
+                "source_term": source_term,
+                "type": type_,
+            },
+        )
+    return created_ids
+
+
+def _normalize_new_entity(raw: dict[str, Any]) -> tuple[str, EntityType] | None:
+    """Coerce one ``new_entities`` item to ``(source_term, type)`` or ``None``.
+
+    The translator prompt asks for ``{"type": ..., "source": ..., "evidence": ...}``
+    but we accept ``"source_term"`` too in case the model uses the
+    English variant. Anything missing or empty is dropped silently —
+    auto-proposal is best-effort, not a hard contract.
+    """
+
+    if not isinstance(raw, dict):
+        return None
+    source_term = raw.get("source") or raw.get("source_term")
+    if not isinstance(source_term, str):
+        return None
+    source_term = source_term.strip()
+    if not source_term:
+        return None
+    type_str = str(raw.get("type", "term")).strip().lower() or "term"
+    if type_str not in _VALID_ENTITY_TYPES:
+        type_str = "term"
+    return source_term, cast(EntityType, type_str)
+
+
+def is_group_eligible(
+    segment: repo.SegmentRow,
+    *,
+    max_source_chars: int = GROUP_DEFAULT_MAX_SOURCE_CHARS,
+) -> bool:
+    """Cheap check: is ``segment`` safe to translate in a batched call?
+
+    The grouped call path trades one round-trip per N items for a
+    slightly less context-rich prompt. It's only a win for segments
+    that are (a) short enough to fit N of them in a single prompt,
+    (b) free of inline-tag placeholders so a parse failure doesn't
+    risk format corruption across many segments, and (c) still
+    ``pending`` (grouping already-translated content wastes tokens).
+    """
+
+    if segment.status != schema.SegmentStatus.PENDING:
+        return False
+    text = segment.source_text or ""
+    if not text.strip():
+        return False
+    if len(text) > max_source_chars:
+        return False
+    return GROUP_PLACEHOLDER_PREFIX not in text
+
+
+def translate_segments_grouped(
+    *,
+    engine: Any,
+    project_id: str,
+    source_lang: str,
+    target_lang: str,
+    style_guide: str | None,
+    segments: Sequence[repo.SegmentRow],
+    provider: LLMProvider,
+    options: TranslateOptions,
+) -> list[TranslateOutcome]:
+    """Translate a batch of short, placeholder-free segments in ONE LLM call.
+
+    Intended for dense list-like content (table of contents, index
+    entries, glossary labels) where per-segment round-trips dominate
+    cost and latency. The caller guarantees every input segment has
+    already been filtered through :func:`is_group_eligible`; passing a
+    segment with placeholders or long text is a programmer error and
+    the function falls back to per-segment translation for those rows.
+
+    Persistence invariants:
+
+    * Each input segment still ends up with its own ``llm_call`` row
+      and its own ``segment.translated`` event. Tokens and cost are
+      allocated proportional to completion text length so a future
+      audit query can re-derive spend per segment.
+    * Cache keys are computed per segment exactly like
+      :func:`translate_segment` would — so a second run with the same
+      glossary finds the cached rows and skips the group call entirely.
+    * Locked glossary violations flag the segment individually (one
+      bad item doesn't taint the whole batch).
+
+    Failure modes:
+
+    * If the LLM response fails to parse, or is missing any of the
+      requested ids, or one item fails the placeholder validator
+      (should not happen by construction — defensive), that item is
+      re-translated through the per-segment path. The rest of the
+      batch still commits.
+    """
+
+    project_entries = _load_glossary(engine, project_id=project_id)
+    constraints = (
+        list(options.glossary)
+        if options.glossary is not None
+        else build_constraints(project_entries)
+    )
+    g_hash = glossary_hash(project_entries)
+
+    outcomes: list[TranslateOutcome | None] = [None] * len(segments)
+    group_indices: list[int] = []
+    group_segments: list[repo.SegmentRow] = []
+    group_keys: list[str] = []
+
+    # Pass 1 — try the cache per segment (exactly like translate_segment
+    # would) so any previously translated item short-circuits without
+    # paying for the whole group call.
+    for idx, seg in enumerate(segments):
+        if not is_group_eligible(seg):
+            outcomes[idx] = translate_segment(
+                engine=engine,
+                project_id=project_id,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                style_guide=style_guide,
+                segment=seg,
+                provider=provider,
+                options=options,
+            )
+            continue
+
+        messages = build_translator_messages(
+            source_lang=source_lang,
+            target_lang=target_lang,
+            source_text=seg.source_text,
+            style_guide=style_guide,
+            glossary=constraints,
+        )
+        key = cache_key_for_messages(
+            model=options.model, messages=messages, glossary_hash=g_hash
+        )
+        if options.bypass_cache:
+            key = f"{key}:retry"
+
+        if not options.bypass_cache:
+            hit = repo.find_llm_call_by_cache_key(
+                engine, project_id=project_id, cache_key=key
+            )
+            if hit is not None and hit.response_json:
+                request_payload = {
+                    "model": options.model,
+                    "messages": [m.model_dump() for m in messages],
+                    "temperature": options.temperature,
+                    "seed": options.seed,
+                    "glossary_hash": g_hash,
+                }
+                request_json = json.dumps(
+                    request_payload, ensure_ascii=False, sort_keys=True
+                )
+                outcomes[idx] = _replay_from_cache(
+                    engine,
+                    project_id=project_id,
+                    segment=seg,
+                    key=key,
+                    hit=hit,
+                    request_json=request_json,
+                    options=options,
+                    entries=project_entries,
+                )
+                continue
+
+        group_indices.append(idx)
+        group_segments.append(seg)
+        group_keys.append(key)
+
+    if not group_segments:
+        # Every segment was a cache hit or ineligible — nothing to do.
+        return [o for o in outcomes if o is not None]
+
+    # Pass 2 — one LLM call for the surviving misses.
+    source_items: list[tuple[int, str]] = [
+        (idx, seg.source_text) for idx, seg in enumerate(group_segments)
+    ]
+    group_messages = build_group_translator_messages(
+        source_lang=source_lang,
+        target_lang=target_lang,
+        source_items=source_items,
+        style_guide=style_guide,
+        glossary=constraints,
+    )
+    request_payload = {
+        "model": options.model,
+        "messages": [m.model_dump() for m in group_messages],
+        "temperature": options.temperature,
+        "seed": options.seed,
+        "glossary_hash": g_hash,
+        "group_size": len(group_segments),
+    }
+    group_request_json = json.dumps(request_payload, ensure_ascii=False, sort_keys=True)
+
+    try:
+        chat_result = provider.chat(
+            group_messages,
+            model=options.model,
+            response_format=options.response_format,
+            temperature=options.temperature,
+            seed=options.seed,
+        )
+    except Exception as exc:
+        _logger.warning(
+            "group translate call failed (%d items): %s — falling back per-segment",
+            len(group_segments),
+            exc,
+        )
+        return _fill_fallback(
+            engine=engine,
+            project_id=project_id,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            style_guide=style_guide,
+            segments=segments,
+            outcomes=outcomes,
+            group_indices=group_indices,
+            provider=provider,
+            options=options,
+        )
+
+    expected_ids = [idx for idx, _ in source_items]
+    try:
+        parsed = parse_group_translator_response(
+            chat_result.content, expected_ids=expected_ids
+        )
+    except EpublateError as exc:
+        _logger.warning(
+            "group translate parse failed — falling back per-segment (%s)", exc
+        )
+        return _fill_fallback(
+            engine=engine,
+            project_id=project_id,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            style_guide=style_guide,
+            segments=segments,
+            outcomes=outcomes,
+            group_indices=group_indices,
+            provider=provider,
+            options=options,
+        )
+
+    items_by_id: dict[int, GroupTranslatorItem] = {
+        item.id: item for item in parsed.translations
+    }
+
+    def _target_len(item_id: int) -> int:
+        item = items_by_id.get(item_id)
+        return len(item.target) if item is not None else 0
+
+    token_weights = [max(1, _target_len(i)) for i in expected_ids]
+    total_weight = sum(token_weights)
+    per_prompt = [
+        _split_tokens(chat_result.prompt_tokens, w, total_weight) for w in token_weights
+    ]
+    per_completion = [
+        _split_tokens(chat_result.completion_tokens, w, total_weight)
+        for w in token_weights
+    ]
+
+    per_idx_cost = [
+        estimate_cost(chat_result.model, p, c)
+        for p, c in zip(per_prompt, per_completion, strict=True)
+    ]
+
+    # Per-item commit: each surviving (non-cache-hit) segment lands
+    # its own ``llm_call`` row so future queries still get per-segment
+    # tokens / cost. The response_json is the full batch payload so
+    # replay semantics are unchanged; the cache_key is the per-segment
+    # key computed during pass 1.
+    for local_idx, (global_idx, seg) in enumerate(
+        zip(group_indices, group_segments, strict=True)
+    ):
+        target_item = items_by_id.get(local_idx)
+        if target_item is None:
+            # Ask for a re-translation individually; the LLM response
+            # for this id was invalid even though the overall batch
+            # parsed. Shouldn't happen given ``expected_ids`` is
+            # validated, but belt-and-braces.
+            outcomes[global_idx] = translate_segment(
+                engine=engine,
+                project_id=project_id,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                style_guide=style_guide,
+                segment=seg,
+                provider=provider,
+                options=options,
+            )
+            continue
+
+        trace = TranslatorTrace(
+            target=target_item.target,
+            used_entries=target_item.used_entries,
+            new_entities=target_item.new_entities,
+            notes=target_item.notes,
+        )
+        try:
+            spliced = _splice_target(seg, target=trace.target)
+            validate_segment_placeholders(spliced)
+        except EpublateError as exc:
+            _logger.warning(
+                "group item %d failed placeholder validation (%s); "
+                "falling back per-segment",
+                local_idx,
+                exc,
+            )
+            outcomes[global_idx] = translate_segment(
+                engine=engine,
+                project_id=project_id,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                style_guide=style_guide,
+                segment=seg,
+                provider=provider,
+                options=options,
+            )
+            continue
+
+        # Persist a ``TranslatorTrace``-shaped payload (no ``id`` field)
+        # so :func:`_replay_from_cache` can rehydrate the entry on a
+        # subsequent run without special-casing the grouped shape.
+        per_item_response_json = json.dumps(
+            {
+                "content": chat_result.content,
+                "trace": trace.model_dump(),
+                "raw": chat_result.raw,
+                "batch_size": len(group_segments),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        outcomes[global_idx] = _commit_group_item(
+            engine=engine,
+            project_id=project_id,
+            segment=seg,
+            key=group_keys[local_idx],
+            trace=trace,
+            prompt_tokens=per_prompt[local_idx],
+            completion_tokens=per_completion[local_idx],
+            cost=per_idx_cost[local_idx],
+            model=chat_result.model,
+            request_json=group_request_json,
+            batch_response_json=per_item_response_json,
+            entries=project_entries,
+            options=options,
+        )
+
+    assert all(o is not None for o in outcomes), "group fill left a hole"
+    return [cast(TranslateOutcome, o) for o in outcomes]
+
+
+def _fill_fallback(
+    *,
+    engine: Any,
+    project_id: str,
+    source_lang: str,
+    target_lang: str,
+    style_guide: str | None,
+    segments: Sequence[repo.SegmentRow],
+    outcomes: list[TranslateOutcome | None],
+    group_indices: Sequence[int],
+    provider: LLMProvider,
+    options: TranslateOptions,
+) -> list[TranslateOutcome]:
+    """Complete ``outcomes`` by running ``translate_segment`` for every miss.
+
+    Called when a group LLM call / parse fails. The cache-hit entries
+    already sit in ``outcomes``; this just fills the remaining slots.
+    """
+
+    for idx in group_indices:
+        if outcomes[idx] is not None:
+            continue
+        outcomes[idx] = translate_segment(
+            engine=engine,
+            project_id=project_id,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            style_guide=style_guide,
+            segment=segments[idx],
+            provider=provider,
+            options=options,
+        )
+    assert all(o is not None for o in outcomes), "fallback left a hole"
+    return [cast(TranslateOutcome, o) for o in outcomes]
+
+
+def _commit_group_item(
+    *,
+    engine: Any,
+    project_id: str,
+    segment: repo.SegmentRow,
+    key: str,
+    trace: TranslatorTrace,
+    prompt_tokens: int,
+    completion_tokens: int,
+    cost: float,
+    model: str,
+    request_json: str,
+    batch_response_json: str,
+    entries: Sequence[GlossaryEntryWithAliases],
+    options: TranslateOptions,
+) -> TranslateOutcome:
+    """Persist one item from a successful group call.
+
+    Mirrors the non-cache branch of :func:`translate_segment`: runs
+    glossary validation + auto-propose, writes the segment update +
+    ``llm_call`` audit row + events in a single transaction.
+    """
+
+    violations = validate_target(
+        source_text=segment.source_text,
+        target_text=trace.target,
+        entries=entries,
+    )
+    flagged = has_locked_violation(violations)
+    final_status = (
+        schema.SegmentStatus.FLAGGED if flagged else schema.SegmentStatus.TRANSLATED
+    )
+
+    mentions = find_mentions(segment.source_text, entries)
+    mention_entry_ids = tuple(dict.fromkeys(m.entry_id for m in mentions))
+    mention_payload: list[tuple[str, int | None, int | None]] = [
+        (m.entry_id, m.start, m.end) for m in mentions
+    ]
+
+    llm_call_id = uuid.uuid4().hex
+    proposed_ids: list[str] = []
+    with engine.begin() as conn:
+        repo.update_segment_translation(
+            conn,
+            segment_id=segment.id,
+            target_text=trace.target,
+            status=final_status,
+        )
+        repo.record_mentions(conn, segment_id=segment.id, mentions=mention_payload)
+        repo.insert_llm_call(
+            conn,
+            repo.LLMCallRow(
+                id=llm_call_id,
+                project_id=project_id,
+                segment_id=segment.id,
+                purpose=PURPOSE_TRANSLATE,
+                model=model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cost_usd=cost,
+                cache_hit=False,
+                cache_key=key,
+                request_json=request_json,
+                response_json=batch_response_json,
+            ),
+        )
+        repo.append_event(
+            conn,
+            project_id=project_id,
+            kind="segment.translated",
+            payload={
+                "segment_id": segment.id,
+                "model": model,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "cost_usd": cost,
+                "cache_hit": False,
+                "llm_call_id": llm_call_id,
+                "mention_entry_ids": list(mention_entry_ids),
+                "flagged": flagged,
+                "grouped": True,
+            },
+        )
+        if flagged:
+            repo.append_event(
+                conn,
+                project_id=project_id,
+                kind="segment.translation_flagged",
+                payload={
+                    "segment_id": segment.id,
+                    "violations": [_violation_to_payload(v) for v in violations],
+                },
+            )
+        if options.auto_propose:
+            proposed_ids.extend(
+                _auto_propose_entities(
+                    conn,
+                    project_id=project_id,
+                    segment_id=segment.id,
+                    trace=trace,
+                )
+            )
+    _logger.info(
+        "translated segment %s (grouped, %d→%d tokens, $%.6f) via %s%s",
+        segment.id,
+        prompt_tokens,
+        completion_tokens,
+        cost,
+        model,
+        " [flagged]" if flagged else "",
+    )
+    return TranslateOutcome(
+        segment_id=segment.id,
+        target_text=trace.target,
+        trace=trace,
+        cache_hit=False,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        cost_usd=cost,
+        llm_call_id=llm_call_id,
+        cache_key=key,
+        violations=tuple(violations),
+        flagged=flagged,
+        mention_entry_ids=mention_entry_ids,
+        proposed_entry_ids=tuple(proposed_ids),
+        extra={"grouped": True},
+    )
+
+
+def _split_tokens(total: int, weight: int, total_weight: int) -> int:
+    if total_weight <= 0 or weight <= 0:
+        return 0
+    return max(0, (total * weight) // total_weight)
+
+
+__all__ = [
+    "GROUP_DEFAULT_MAX_ITEMS",
+    "GROUP_DEFAULT_MAX_SOURCE_CHARS",
+    "PURPOSE_TRANSLATE",
+    "PipelineError",
+    "TranslateOptions",
+    "TranslateOutcome",
+    "estimate_segment_tokens",
+    "is_group_eligible",
+    "translate_segment",
+    "translate_segments_grouped",
+]

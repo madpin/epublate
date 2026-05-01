@@ -70,8 +70,11 @@ glossary.
   call. Pluggable; off by default.
 - **S2.** Multiple LLM "roles" in the pipeline (extractor, translator,
   reviewer/critic, fixer) — a small agentic loop.
-- **S3.** Style guide per project (formal/informal, honorifics policy,
-  gendered-language rules, profanity policy).
+- **S3.** Style guide DSL — fine-grained, machine-readable rules
+  (formal/informal, honorifics policy, gendered-language rules,
+  profanity policy). Goal-oriented **tone presets** for v1 are now
+  in-scope (see F-STYLE-1/2/3); S3 covers a richer, post-v1 DSL on
+  top of the same `project.style_guide` slot.
 - **S4.** Diff-based re-translation: when the user edits a glossary
   entry, automatically re-translate only the affected segments.
 
@@ -140,15 +143,25 @@ glossary.
 - **F-IO-4.** **Segmentation.** Split text into translation units no
   larger than a configured token budget (default 800 source tokens),
   preferring sentence and paragraph boundaries. Never split inside an
-  inline tag pair.
+  inline tag pair. **Resolved (M1):** the default unit is the
+  paragraph-level block host (`<p>`, `<h1>`-`<h6>`, `<li>`, `<td>`,
+  `<th>`, `<figcaption>`, `<blockquote>`, `<dt>`, `<dd>`, `<caption>`).
+  Splitting falls back to sentence boundaries (`[.!?]\s+`) only when a
+  block exceeds `max_tokens`; the curator can later override the budget
+  per project (open question #1 closed).
 - **F-IO-5.** **Reassembly.** After translation, splice translated text
   back into the original DOM, preserving inline tags by index. Update
   `<html lang>` and OPF `dc:language` to the target language. Update
   `dc:title` if the title was translated. Add `<meta>` provenance
   (translator, model, date) without breaking validators.
 - **F-IO-6.** Write a new ePub with original images, fonts, and CSS
-  copied verbatim. Validate with `epubcheck` (warning-only; we do not
-  block on errors but surface them).
+  copied verbatim. The optional `[epubcheck]` extra wires the
+  upstream Python wrapper around the official Java JAR; when
+  installed, `epublate export --epubcheck` prints a one-line summary
+  and `--strict` exits non-zero (3) on any error. When the extra
+  isn't installed, both flags emit a "skipped" summary instead of
+  crashing — validation is opt-in by design (resolves open
+  question #4).
 - **F-IO-7.** **Partial output.** At any point the user can export a
   "preview" ePub where untranslated segments fall back to source text
   (clearly tagged in metadata, optionally visually marked).
@@ -233,6 +246,18 @@ For each segment, the pipeline runs these phases:
   every call records prompt/completion tokens and cost.
 - **F-LLM-8.** **Budget cap.** Optional per-project hard cap (USD); when
   hit, batch mode pauses and the TUI surfaces a confirmation prompt.
+- **F-LLM-9.** **Small-segment grouping.** Dense list-like content
+  (table of contents, indices, glossaries) is translated in batched
+  LLM calls instead of one round-trip per segment. The pipeline only
+  groups segments that are ``pending``, short (default ≤240 chars),
+  and free of inline-tag placeholders; grouping never crosses a
+  chapter boundary. Each segment still gets its own ``llm_call``
+  audit row (tokens and cost allocated proportionally to completion
+  length) and its own cache key, so a second run finds cache hits
+  individually. On group-parse failure the pipeline falls back to
+  per-segment translation so a bad batch can never corrupt a segment.
+  Default group size is 50 items; user-configurable via the batch
+  modal and the CLI (`--group-small` / `--group-max-items`).
 
 ### 4.5 Embeddings (Optional, S1)
 
@@ -291,6 +316,82 @@ UX requirements:
   to the LLM/embedding endpoints the user configured.
 - **F-T-2.** Local stats: tokens by model, cost by chapter, cache hit
   rate, average segment latency, validation failure rate.
+
+### 4.9 Tone & Style Presets
+
+Translation quality collapses when the LLM has no signal about the
+register the curator wants — children's stories come out solemn,
+explicit fiction comes out sanitized, technical manuals come out
+flowery. The translator's system prompt has always carried a free-form
+``style_guide`` string (see §8.1); these requirements give curators a
+two-second way to populate it well.
+
+- **F-STYLE-1.** **Tone preset registry.** Ship a small catalog of
+  named **style profiles** (literary fiction, children's picture
+  book, middle grade, young adult, genre fiction, cozy romance,
+  explicit adult, technical manual, academic, journalistic). Each
+  profile expands to a pre-written paragraph the translator's system
+  prompt embeds verbatim (`epublate.core.style.StyleProfile`).
+  Resolution rules:
+  - The New Project flow (modal + `epublate new --style-profile`) lets
+    the curator pick a preset (default: ``literary_fiction``), pick
+    "None" to opt out, or author free-form prose that overrides the
+    preset's text.
+  - The chosen preset slug lands in `project.style_profile`; the
+    resolved prompt prose lands in `project.style_guide` (see §6.4).
+    Both columns ride through the existing translator system-prompt
+    hash, so a preset switch correctly invalidates cached
+    translations (F-LLM-6).
+  - The `explicit_adult` preset is shipped because the app is
+    local-first (NFR-3): book contents only leave the machine via the
+    user-configured endpoint. The dashboard and Settings screen
+    surface the active preset so the choice is always visible.
+- **F-STYLE-2.** **Edit later.** The Settings screen (§4.6) renders a
+  Style guide panel (active preset + a short prompt-prose preview)
+  and binds `E` to open a modal that re-uses the New Project tone
+  field (preset Select + editable TextArea). Save persists via
+  `Project.update_style` and records a `project.style_changed` event
+  on the audit log; the next batch picks up the new system prompt
+  automatically.
+- **F-STYLE-3.** **Helper-LLM co-proposal.** The intake / pre-pass
+  helper (§7.1 step 5, §4.2 step 3) is asked to surface two
+  best-effort style observations alongside its glossary candidates:
+  ``register`` (literary / genre / romance / explicit / technical /
+  academic / journalistic / neutral) and ``audience`` (children /
+  middle_grade / young_adult / adult / general). The intake summary
+  carries them through and resolves a `suggested_style_profile` via
+  `epublate.core.style.suggest_style_profile`; the CLI prints the
+  suggestion (and the dashboard surfaces "Helper suggests: …" when
+  it differs from the active preset). The suggestion is never
+  applied automatically — the curator owns the choice.
+- **F-STYLE-4.** **Pre-create tone sniff.** The New Project modal
+  (§4.6) auto-detects the right preset *before* the curator hits
+  Create. When the source ePub settles (Browse pick or Enter on the
+  source field), a background worker calls
+  `epublate.core.style_sniff.sniff_tone` — it reads a head/middle/tail
+  spread of translatable blocks (default 5/3/2, capped at 12k chars),
+  asks the helper LLM the same `(register, audience)` question §8.2
+  uses, and runs the answer through `suggest_style_profile`. The Tone
+  Select pre-populates with the suggestion (or stays put if the
+  curator manually picked first); the status row always names the
+  helper's verdict and per-call cost. Hard rules:
+  - **Toggle** — `UIConfig.auto_tone_sniff` defaults `True`. The
+    Settings screen binds `A` to flip + persist it. The
+    `EPUBLATE_AUTO_TONE_SNIFF` env var (1/true/yes/on or 0/false/no/off)
+    overrides the persisted bool at runtime so curators can pin
+    behavior in CI / scripted runs.
+  - **Privacy / cost** — the sniff runs the *user-configured* helper
+    endpoint (NFR-3); we never reach a third party. Failures (no API
+    key, parse error, malformed ePub) reduce to a one-line italic
+    status — the modal stays usable. No persistence: nothing about
+    the sniff lands in the project DB.
+  - **Caching** — none in v1. Re-picking the same source path
+    short-circuits via in-modal debounce; relaunching the modal is
+    a fresh call. (Caching by ePub-content hash is a future PR if
+    cost becomes an issue.)
+  - **Override** — the helper never overwrites a manual tone pick.
+    The status row still names the suggestion so the curator can
+    apply it from the Tone Select.
 
 ---
 
@@ -455,7 +556,8 @@ CREATE TABLE project (
   source_lang TEXT NOT NULL,
   target_lang TEXT NOT NULL,
   source_path TEXT NOT NULL,
-  style_guide TEXT,
+  style_guide TEXT,                     -- resolved tone-preset prose (F-STYLE-1)
+  style_profile TEXT,                   -- preset slug, NULL ⇒ "None" / custom (F-STYLE-1)
   budget_usd REAL,
   created_at INTEGER NOT NULL
 );
@@ -675,6 +777,13 @@ terms with type, evidence span, and confidence. Used for the book
 intake pass and as a pre-pass in batch mode when entity-detection is
 enabled.
 
+The helper is also asked for two best-effort style tags (F-STYLE-3):
+``register`` (literary / genre / romance / explicit / technical /
+academic / journalistic / neutral) and ``audience`` (children /
+middle_grade / young_adult / adult / general). Both are nullable;
+``epublate.core.style.suggest_style_profile`` maps the resulting pair
+to a tone-preset id surfaced on the dashboard / CLI.
+
 ### 8.3 Reviewer prompt (optional, S2)
 
 Given source, target, and the glossary slice that should apply, return
@@ -720,77 +829,152 @@ explicitly and given a short failure-handling instruction.
 - Mock LLM provider for tests (deterministic, no network).
 - `CONTRIBUTING.md` with the canonical `uv` commands.
 
-### M1 — ePub round-trip (week 2)
+### M1 — ePub round-trip (week 2) ✅
 
-- ePub adapter: load, iterate chapters, segment, reassemble, save.
-- Property-based tests: segment+reassemble == identity on untranslated
-  segments.
-- CLI: `epublate new`, `epublate export`.
+- [x] ePub adapter: load, iterate chapters, segment, reassemble, save.
+- [x] Property-based tests: segment+reassemble == identity on
+  untranslated segments.
+- [x] CLI: `epublate new`, `epublate export`.
 
-### M2 — Single-segment translation (week 3)
+### M2 — Single-segment translation (week 3) ✅
 
-- OpenAI-compatible provider with retry/backoff/cost tracking.
-- Translator prompt + JSON response parsing.
-- Reader screen with side-by-side view, accept/edit/retry.
-- Per-call caching.
+- [x] OpenAI-compatible provider with retry/backoff/cost tracking.
+- [x] Translator prompt + JSON response parsing.
+- [x] Reader screen with side-by-side view, accept/edit/retry.
+- [x] Per-call caching.
 
-### M3 — Glossary v1 (week 4)
+### M3 — Glossary v1 (week 4) ✅
 
-- Entity schema, exact + alias matching.
-- Glossary screen (table, detail, create/edit/lock).
-- Validator: locked-term enforcement, inline-tag count check.
-- Cascade re-translation flow.
+- [x] Entity schema, exact + alias matching.
+- [x] Glossary screen (table, detail, create/edit/lock).
+- [x] Validator: locked-term enforcement, inline-tag count check.
+- [x] Cascade re-translation flow.
+- [x] JSON import/export (`epublate glossary export|import`,
+  `epublate new --starter-glossary FILE`).
+- [x] Auto-propose `proposed` entries from the translator's
+  `trace.new_entities`.
 
-### M4 — Batch mode + Inbox (week 5)
+### M4 — Batch mode + Inbox (week 5) ✅
 
-- Worker pool with concurrency cap.
-- Inbox screen for validation failures and proposed entries.
-- Cost meter + budget cap.
+- [x] Worker pool with concurrency cap (`core.batch.run_batch`,
+  `ThreadPoolExecutor`-driven, per-segment failures recorded as
+  `batch.segment_failed` events without aborting the run).
+- [x] Inbox screen for validation failures, proposed glossary entries,
+  and curator alerts (`InboxScreen` + `epublate inbox`).
+- [x] Cost meter + budget cap (`CostMeter` widget, `core.stats`,
+  `BudgetModal`, `epublate budget set|clear|show`); cumulative spend
+  trips `BatchPaused` and emits `batch.paused` for the Inbox.
+- [x] Project Dashboard becomes the new landing screen for
+  `epublate open`, with bindings to Reader (`o`), Glossary (`g`),
+  Inbox (`i`), Batch (`b`), Budget (`B`), and Refresh (`r`).
 
-### M5 — Book intake & extractor (week 6)
+### M5 — Book intake & extractor (week 6) — landed
 
-- Helper-LLM extractor prompt.
-- "First-pass" intake on project creation.
-- Pre-pass entity detection in batch mode.
+- [x] Helper-LLM extractor prompt (`llm/prompts/extractor.py` —
+  `ExtractedEntity` / `ExtractorTrace`, `build_extractor_messages`,
+  `parse_extractor_response`).
+- [x] "First-pass" intake on project creation (`core/extractor.py` —
+  `run_book_intake`, opt-in via `epublate new --intake` and
+  `epublate intake`; emits `intake.started` / `intake.completed`
+  events and seeds `proposed` glossary entries).
+- [x] Pre-pass entity detection in batch mode (`core/batch.py` —
+  `BatchOptions.pre_pass`, opt-in via `epublate batch --extract`;
+  per-chapter helper call before translator futures fire, emits
+  `batch.pre_pass_started` / `batch.pre_pass_completed`).
+- [x] Helper model resolution (`llm/factory.py` —
+  `EPUBLATE_LLM_HELPER_MODEL`, `resolve_helper_model`, plus
+  `--helper-model` flags on `new`, `intake`, and `batch`).
+- [x] Dashboard `e` binding + `IntakeModal` + worker
+  (`app/screens/dashboard.py`); intake / pre-pass alerts surface
+  through `core.stats.ALERT_KINDS` and the Inbox.
 
-### M6 — Polish & v1 release (week 7)
+### M6 — Polish & v1 release (week 7) ✅
 
-- Theming, keybinding cheat sheet, snapshot tests.
-- Documentation, demo book, packaging on PyPI.
-- `epubcheck` integration on export.
+- [x] Theming (high-contrast variant + `T` cycler, persisted to
+  `~/.config/epublate/ui.toml`), global cheat-sheet modal on
+  `?` / `f1`, first wave of `pytest-textual-snapshot` baselines for
+  the Dashboard / Reader / Glossary / Inbox / Help / Settings.
+- [x] Read-only Settings screen (`s` from the Dashboard) surfacing
+  the LLM env-var-driven config with a redacted API key, the
+  active / saved theme, and the project's budget cap.
+- [x] Documentation refresh: `README.md`, walkthrough at
+  `docs/USAGE.md`, maintainer runbook at `docs/RELEASE.md`,
+  `CHANGELOG.md`, packaging metadata bumped to `0.1.0` /
+  `Development Status :: 4 - Beta`.
+- [x] Optional `epubcheck` integration via the `[epubcheck]` extra
+  (`uv sync --extra epubcheck`); `epublate export --epubcheck`
+  prints a warn-only summary, `--strict` exits non-zero on errors
+  (resolves open question #4 — see F-IO-6).
+- [x] Tag-triggered release pipeline (`.github/workflows/release.yml`)
+  gated on `PYPI_API_TOKEN`; `build` job in CI ensures `uv build`
+  stays green on every PR.
+
+### M7 — Tone presets & style co-proposal — landed
+
+- [x] `epublate.core.style` — preset registry (10 shipped profiles),
+  `resolve_style_guide` / `suggest_style_profile` helpers, and
+  `DEFAULT_STYLE_PROFILE = literary_fiction` (F-STYLE-1).
+- [x] `project.style_profile` column (Alembic migration
+  ``0003_project_style_profile``); `Project.create` /
+  `Project.update_style` / `epublate new --style-profile|--style-text`
+  thread the preset through the schema, repo, and pipeline.
+- [x] New Project modal + CLI gain a Tone field; the preset's prose
+  is editable inline so the curator sees what the LLM will get.
+- [x] Settings screen renders a Style guide panel + `E` →
+  `StyleEditModal` that re-uses the same field; `Project.update_style`
+  records a `project.style_changed` audit event (F-STYLE-2).
+- [x] Helper-LLM extractor prompt + parser surface ``register`` and
+  ``audience``; `IntakeSummary.suggested_style_profile` carries the
+  suggester's verdict; `epublate intake` and `epublate new --intake`
+  print the suggestion (F-STYLE-3).
+- [x] **Pre-create tone sniff** in the New Project modal:
+  `epublate.core.style_sniff.sniff_tone` reads a head/middle/tail
+  spread of the picked ePub and pre-selects the right preset before
+  the curator hits Create. Toggle persists in `UIConfig.auto_tone_sniff`
+  (default on); `EPUBLATE_AUTO_TONE_SNIFF` overrides at runtime;
+  Settings screen binds `A` to flip + persist the toggle (F-STYLE-4).
 
 ### Post-v1
 
 - Embeddings (S1).
 - Reviewer/critic loop (S2).
-- Style guide DSL (S3).
+- Style guide DSL (S3) — fine-grained, machine-readable rules on
+  top of the v1 tone-preset prose (post-v1; F-STYLE-1/2/3 ship the
+  goal-oriented presets in v1).
 - PDF adapter.
 
 ---
 
 ## 11. Open Questions
 
-1. **Segmentation granularity.** Sentence-level gives best
-   consistency control but increases call count and latency. Paragraph
-   default with a hard token cap is the proposed compromise — does the
-   curator want a per-project knob?
-2. **Locked terms in dialogue.** If a character calls another by a
+1. **Locked terms in dialogue.** If a character calls another by a
    nickname, do we lock the nickname separately or as an alias of the
    canonical entry? Proposal: alias by default, promotable to its own
    entry.
-3. **Gendered/pronoun policy** in target languages with grammatical
+2. **Gendered/pronoun policy** in target languages with grammatical
    gender. Proposal: store `gender` on character entries and pass it as
    a constraint; surface a curator prompt the first time a character
    appears.
-4. **Title / front-matter / TOC translation.** Translate by default but
+3. **Title / front-matter / TOC translation.** Translate by default but
    make it opt-out per item.
-5. **`epubcheck` strictness.** Block export on errors, warn on warnings,
-   or just log? Proposal: warn-only, with a "strict export" toggle.
-6. **Multi-book projects** (a series sharing a glossary). Out of scope
+4. **Multi-book projects** (a series sharing a glossary). Out of scope
    for v1, but the schema is ready: `project` could become `book` under
    a parent `series`.
-7. **License and distribution model.** Already MIT per repo; confirm
+5. **License and distribution model.** Already MIT per repo; confirm
    we're happy distributing on PyPI as MIT.
+
+### Resolved
+
+- ~~**`epubcheck` strictness** (M6).~~ Resolved: opt-in via the
+  `[epubcheck]` PyPI extra, warn-only by default, `epublate export
+  --strict` toggles hard-fail mode (PRD F-IO-6).
+- ~~**Style guide shape** (originally Stretch S3).~~ Resolved (M7):
+  v1 ships **goal-oriented tone presets** (F-STYLE-1) — short,
+  curator-pickable named profiles that expand to a paragraph in
+  the translator's system prompt, plus an editable TextArea for
+  curators who want full control. The richer machine-readable DSL
+  framing of S3 stays post-v1 and will sit on top of the same
+  `project.style_guide` column.
 
 ---
 
