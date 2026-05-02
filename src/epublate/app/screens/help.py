@@ -1,32 +1,39 @@
-"""Help / cheat-sheet modal (PRD §4.6 / M6).
+"""Help modal — tabbed cheat sheet + concept guide (PRD §4.6 / M6).
 
-The :class:`HelpScreen` introspects the *currently active* screen's
-``BINDINGS`` and renders them as a one-page cheat sheet. We deliberately
-introspect at render time (instead of hardcoding a static table) so the
-help stays in sync as bindings evolve in later milestones.
+The modal opens from any screen via the global ``?`` / F1 binding. We
+introspect the *currently active* screen's ``BINDINGS`` for the
+**Keys** tab so the cheat sheet stays in sync as bindings evolve;
+the **Concepts**, **Workflows**, and **Troubleshooting** tabs are
+backed by Markdown files in :mod:`epublate.app.help` so contributors
+can extend the documentation without touching Python.
 
-Bound globally on :class:`epublate.app.main.EpublateApp` to ``?`` and
-``f1``; pressing either key opens this modal regardless of which screen
-the curator is on.
+Markdown is rendered via :class:`textual.widgets.Markdown`. We
+intentionally avoid :class:`MarkdownViewer` (which adds a TOC sidebar)
+because the modal is already constrained to ~80% of the terminal and
+the in-pane TOC eats too much horizontal space.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import ClassVar
 
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Footer, Label, Static
+from textual.widgets import Footer, Label, Markdown, Static, TabbedContent, TabPane
 
+from epublate.app.help import help_text
 from epublate.app.themes import EPUBLATE_THEME_ORDER
+
+_logger = logging.getLogger(__name__)
 
 GLOBAL_HELP_HINT = "[b]Global[/b]: ? / F1 = this help, T = cycle theme, Ctrl+C = quit."
 
 
 class HelpScreen(ModalScreen[None]):
-    """Per-screen keybinding cheat sheet (PRD §4.6)."""
+    """Per-screen keybinding cheat sheet + concept reference (PRD §4.6)."""
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "dismiss", "Close", show=True),
@@ -39,9 +46,9 @@ class HelpScreen(ModalScreen[None]):
         align: center middle;
     }
     HelpScreen #help-box {
-        width: 80%;
-        height: 80%;
-        max-width: 100;
+        width: 90%;
+        height: 90%;
+        max-width: 120;
         border: round $primary;
         padding: 1 2;
         background: $surface;
@@ -50,9 +57,18 @@ class HelpScreen(ModalScreen[None]):
         text-style: bold;
         padding: 0 0 1 0;
     }
+    HelpScreen TabbedContent {
+        height: 1fr;
+    }
+    HelpScreen TabPane {
+        padding: 1 1;
+    }
     HelpScreen #help-bindings {
         height: 1fr;
         padding: 0 0 1 0;
+    }
+    HelpScreen #help-body {
+        height: auto;
     }
     HelpScreen #help-global {
         height: auto;
@@ -63,7 +79,18 @@ class HelpScreen(ModalScreen[None]):
         height: auto;
         color: $text-muted;
     }
+    HelpScreen .help-md {
+        height: 1fr;
+    }
     """
+
+    TAB_SLUGS: ClassVar[tuple[tuple[str, str, str], ...]] = (
+        # (tab id, label, markdown slug)
+        ("help-tab-concepts", "Concepts", "concepts"),
+        ("help-tab-workflows", "Workflows", "workflows"),
+        ("help-tab-troubleshoot", "Troubleshooting", "troubleshooting"),
+        ("help-tab-keys-md", "Keys (reference)", "keys"),
+    )
 
     def __init__(self, *, target_screen: Screen[object] | None = None) -> None:
         super().__init__()
@@ -72,8 +99,29 @@ class HelpScreen(ModalScreen[None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="help-box"):
             yield Label(self._title_text(), id="help-title")
-            with VerticalScroll(id="help-bindings"):
-                yield Static(self._bindings_text(), id="help-body", markup=True)
+            with TabbedContent(id="help-tabs", initial="help-tab-keys"):
+                with (
+                    TabPane("Keys (this screen)", id="help-tab-keys"),
+                    VerticalScroll(id="help-bindings"),
+                ):
+                    yield Static(
+                        self._bindings_text(),
+                        id="help-body",
+                        markup=True,
+                    )
+                for tab_id, label, slug in self.TAB_SLUGS:
+                    with TabPane(label, id=tab_id):
+                        try:
+                            md = help_text(slug)
+                        except FileNotFoundError:
+                            _logger.warning("missing help markdown: %s.md", slug)
+                            md = (
+                                f"# Help section missing\n\n"
+                                f"Could not load `{slug}.md` from the help "
+                                "package. Please file an issue.\n"
+                            )
+                        with VerticalScroll(classes="help-md"):
+                            yield Markdown(md, id=f"help-md-{slug}")
             yield Static(GLOBAL_HELP_HINT, id="help-global", markup=True)
             yield Static(self._themes_text(), id="help-themes", markup=True)
         yield Footer()

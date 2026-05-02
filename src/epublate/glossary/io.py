@@ -12,8 +12,10 @@ Three entry points:
   drop ``trace.new_entities`` candidates into the lore bible without
   duplicating already-known terms.
 
-The on-disk shape is versioned (``"version": 1``) so future schema
-changes can be migrated without surprises.
+The on-disk shape is versioned (``"version": 2`` as of the Lore Books
+rollout) so future schema changes can be migrated without surprises.
+A v1 reader stays as a compat shim — it defaults ``source_known`` to
+``True`` on every entry, matching the pre-Lore-Books behaviour.
 """
 
 from __future__ import annotations
@@ -35,7 +37,10 @@ from epublate.glossary.models import (
     GlossaryStatusLiteral,
 )
 
-GLOSSARY_FORMAT_VERSION = 1
+GLOSSARY_FORMAT_VERSION = 2
+"""Current on-disk format. v1 stays readable via a compat shim."""
+
+_SUPPORTED_FORMAT_VERSIONS: frozenset[int] = frozenset({1, 2})
 ConflictStrategy = Literal["skip", "overwrite"]
 
 _VALID_TYPES: frozenset[str] = frozenset(
@@ -114,12 +119,20 @@ def import_json(
 
     for raw_entry in payload.get("entries", []):
         normalized = _normalize_entry_payload(raw_entry)
-        existing = repo.find_glossary_entry_by_source_term(
-            engine,
-            project_id=project_id,
-            source_term=normalized["source_term"],
-            type=normalized["type"],
-        )
+        # Target-only entries have no source_term to dedupe by, so we
+        # always insert them. The Lore Book curator can still merge by
+        # target_term manually if needed; doing it automatically is
+        # error-prone (different lore books may pin the same proper
+        # noun for unrelated entities).
+        if normalized["source_term"] is None:
+            existing = None
+        else:
+            existing = repo.find_glossary_entry_by_source_term(
+                engine,
+                project_id=project_id,
+                source_term=normalized["source_term"],
+                type=normalized["type"],
+            )
         if existing is None:
             repo.create_glossary_entry(
                 engine,
@@ -132,6 +145,7 @@ def import_json(
                 notes=normalized["notes"],
                 source_aliases=normalized["source_aliases"],
                 target_aliases=normalized["target_aliases"],
+                source_known=normalized["source_known"],
             )
             created += 1
             continue
@@ -189,12 +203,15 @@ def import_starter(
     skipped = 0
     for raw_entry in payload.get("entries", []):
         normalized = _normalize_entry_payload(raw_entry)
-        existing = repo.find_glossary_entry_by_source_term(
-            engine,
-            project_id=project_id,
-            source_term=normalized["source_term"],
-            type=normalized["type"],
-        )
+        if normalized["source_term"] is None:
+            existing = None
+        else:
+            existing = repo.find_glossary_entry_by_source_term(
+                engine,
+                project_id=project_id,
+                source_term=normalized["source_term"],
+                type=normalized["type"],
+            )
         if existing is not None:
             skipped += 1
             continue
@@ -209,6 +226,7 @@ def import_starter(
             notes=normalized["notes"],
             source_aliases=normalized["source_aliases"],
             target_aliases=normalized["target_aliases"],
+            source_known=normalized["source_known"],
         )
         created += 1
 
@@ -266,6 +284,7 @@ def _entry_to_payload(entry: GlossaryEntryWithAliases) -> dict[str, Any]:
         "status": entry.status,
         "gender": entry.entry.gender,
         "notes": entry.entry.notes,
+        "source_known": entry.source_known,
         "source_aliases": list(entry.source_aliases),
         "target_aliases": list(entry.target_aliases),
     }
@@ -275,10 +294,10 @@ def _validate_payload_shape(payload: dict[str, Any]) -> None:
     if not isinstance(payload, dict):
         raise ConfigurationError("glossary payload must be a JSON object")
     version = payload.get("version")
-    if version != GLOSSARY_FORMAT_VERSION:
+    if version not in _SUPPORTED_FORMAT_VERSIONS:
         raise ConfigurationError(
             f"unsupported glossary file version: {version!r} "
-            f"(expected {GLOSSARY_FORMAT_VERSION})"
+            f"(supported: {sorted(_SUPPORTED_FORMAT_VERSIONS)})"
         )
     entries = payload.get("entries")
     if not isinstance(entries, list):
@@ -288,25 +307,49 @@ def _validate_payload_shape(payload: dict[str, Any]) -> None:
 def _normalize_entry_payload(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ConfigurationError("each glossary entry must be a JSON object")
-    source_term = raw.get("source_term")
     target_term = raw.get("target_term")
-    if not isinstance(source_term, str) or not source_term.strip():
-        raise ConfigurationError("entry missing non-empty 'source_term'")
     if not isinstance(target_term, str) or not target_term.strip():
-        raise ConfigurationError(
-            f"entry {source_term!r} missing non-empty 'target_term'"
-        )
+        raise ConfigurationError("entry missing non-empty 'target_term'")
+
+    raw_known = raw.get("source_known")
+    # ``source_known`` defaults to True so v1 payloads behave exactly
+    # as they used to. A v2 payload with ``source_term=None`` and
+    # ``source_known=True`` is rejected: that combination is incoherent.
+    if raw_known is None:
+        source_known = True
+    elif isinstance(raw_known, bool):
+        source_known = raw_known
+    elif isinstance(raw_known, int):
+        source_known = bool(raw_known)
+    else:
+        raise ConfigurationError("entry 'source_known' must be a boolean if set")
+
+    raw_source = raw.get("source_term")
+    source_term: str | None
+    if raw_source is None:
+        if source_known:
+            raise ConfigurationError(
+                "entry missing non-empty 'source_term'; "
+                "set 'source_known': false to author a target-only entry"
+            )
+        source_term = None
+    else:
+        if not isinstance(raw_source, str) or not raw_source.strip():
+            raise ConfigurationError("entry 'source_term' must be a non-empty string")
+        source_term = raw_source
+
+    label = source_term or target_term
 
     type_str = str(raw.get("type", "term"))
     if type_str not in _VALID_TYPES:
         raise ConfigurationError(
-            f"entry {source_term!r} has invalid type {type_str!r}; "
+            f"entry {label!r} has invalid type {type_str!r}; "
             f"expected one of {sorted(_VALID_TYPES)}"
         )
     status_str = str(raw.get("status", "proposed"))
     if status_str not in _VALID_STATUSES:
         raise ConfigurationError(
-            f"entry {source_term!r} has invalid status {status_str!r}; "
+            f"entry {label!r} has invalid status {status_str!r}; "
             f"expected one of {sorted(_VALID_STATUSES)}"
         )
     gender_raw = raw.get("gender")
@@ -317,18 +360,16 @@ def _normalize_entry_payload(raw: Any) -> dict[str, Any]:
         gender_str = str(gender_raw)
         if gender_str not in _VALID_GENDERS:
             raise ConfigurationError(
-                f"entry {source_term!r} has invalid gender {gender_str!r}; "
+                f"entry {label!r} has invalid gender {gender_str!r}; "
                 f"expected one of {[*sorted(_VALID_GENDERS), None]}"
             )
         gender = cast(GenderTag, gender_str)
 
     notes = raw.get("notes")
     if notes is not None and not isinstance(notes, str):
-        raise ConfigurationError(
-            f"entry {source_term!r} 'notes' must be a string if set"
-        )
-    src_aliases = _coerce_alias_list(raw.get("source_aliases", []), source_term)
-    tgt_aliases = _coerce_alias_list(raw.get("target_aliases", []), source_term)
+        raise ConfigurationError(f"entry {label!r} 'notes' must be a string if set")
+    src_aliases = _coerce_alias_list(raw.get("source_aliases", []), label)
+    tgt_aliases = _coerce_alias_list(raw.get("target_aliases", []), label)
 
     return {
         "source_term": source_term,
@@ -337,6 +378,7 @@ def _normalize_entry_payload(raw: Any) -> dict[str, Any]:
         "status": cast(GlossaryStatusLiteral, status_str),
         "gender": gender,
         "notes": notes,
+        "source_known": source_known,
         "source_aliases": src_aliases,
         "target_aliases": tgt_aliases,
     }

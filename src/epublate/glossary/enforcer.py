@@ -38,7 +38,7 @@ from epublate.glossary.models import (
     GlossaryEntryWithAliases,
     GlossaryStatusLiteral,
 )
-from epublate.llm.prompts.translator import GlossaryConstraint
+from epublate.llm.prompts.translator import GlossaryConstraint, TargetOnlyConstraint
 
 ViolationSeverity = Literal["error", "warning"]
 
@@ -75,6 +75,13 @@ def build_constraints(
     curator promotes them). The output is sorted ``locked`` before
     ``confirmed``, then alphabetically by source term, so identical
     glossaries always produce identical prompts (cache-stability).
+
+    Target-only entries (``source_known=False`` / ``source_term`` is
+    ``None``) are excluded too — they need a different prompt block
+    that lives in :func:`build_target_only_constraints` /
+    :func:`epublate.llm.prompts.translator._format_target_only_block`
+    (introduced in Phase 3 of the Lore Books rollout). Skipping them
+    here keeps the existing source-keyed constraint format intact.
     """
 
     by_status: dict[GlossaryStatusLiteral, list[GlossaryEntryWithAliases]] = {
@@ -83,12 +90,18 @@ def build_constraints(
     for ent in entries:
         if ent.status not in by_status:
             continue
+        if ent.source_term is None:
+            continue
         by_status[ent.status].append(ent)
 
     out: list[GlossaryConstraint] = []
     for status in _PROMPT_STATUSES:
-        bucket = sorted(by_status[status], key=lambda e: (e.source_term, e.id))
+        bucket = sorted(
+            by_status[status],
+            key=lambda e: (e.source_term or "", e.id),
+        )
         for ent in bucket:
+            assert ent.source_term is not None  # filtered above
             out.append(
                 GlossaryConstraint(
                     source_term=ent.source_term,
@@ -96,6 +109,48 @@ def build_constraints(
                     type=ent.entry.type,
                     status=status,
                     notes=ent.entry.notes,
+                )
+            )
+    return out
+
+
+def build_target_only_constraints(
+    entries: Iterable[GlossaryEntryWithAliases],
+) -> list[TargetOnlyConstraint]:
+    """Project target-only entries to ``TargetOnlyConstraint`` rows.
+
+    Filters in only entries whose ``source_term`` is ``None`` and
+    ``status`` is ``locked`` or ``confirmed`` (proposed entries never
+    constrain anything per ``glossary-invariants.mdc``). Output is
+    sorted ``locked`` before ``confirmed``, then alphabetically by
+    target term so identical glossaries hash identically (PRD F-LLM-6).
+    """
+
+    by_status: dict[GlossaryStatusLiteral, list[GlossaryEntryWithAliases]] = {
+        s: [] for s in _PROMPT_STATUSES
+    }
+    for ent in entries:
+        if ent.status not in by_status:
+            continue
+        if ent.source_term is not None:
+            continue
+        by_status[ent.status].append(ent)
+
+    out: list[TargetOnlyConstraint] = []
+    for status in _PROMPT_STATUSES:
+        bucket = sorted(
+            by_status[status],
+            key=lambda e: (e.target_term, e.id),
+        )
+        for ent in bucket:
+            target_aliases = tuple(sorted(set(ent.target_aliases)))
+            out.append(
+                TargetOnlyConstraint(
+                    target_term=ent.target_term,
+                    type=ent.entry.type,
+                    status=status,
+                    notes=ent.entry.notes,
+                    target_aliases=target_aliases,
                 )
             )
     return out
@@ -131,17 +186,25 @@ def validate_target(
             continue
         if target_uses(target_text, ent):
             continue
-        severity: ViolationSeverity = "error" if ent.status == "locked" else "warning"
+        # Target-only locked entries (PRD F-LB-9) downgrade to a
+        # warning: the curator pinned the canonical target form but
+        # never authored a source spelling, so a missed match is more
+        # likely a cross-language ambiguity than a translator bug.
+        if ent.status == "locked" and not ent.source_known:
+            severity: ViolationSeverity = "warning"
+        else:
+            severity = "error" if ent.status == "locked" else "warning"
+        source_label = ent.source_term or hit.term
         violations.append(
             Violation(
                 entry_id=ent.id,
-                source_term=ent.source_term,
+                source_term=source_label,
                 target_term=ent.target_term,
                 matched_source=hit.term,
                 severity=severity,
                 message=(
                     f"{severity}: {ent.status} entry "
-                    f"{ent.source_term!r} → {ent.target_term!r} "
+                    f"{source_label!r} → {ent.target_term!r} "
                     f"missing from target (matched source as {hit.term!r})"
                 ),
             )
@@ -174,7 +237,8 @@ def glossary_hash(entries: Iterable[GlossaryEntryWithAliases]) -> str:
 
     canonical = []
     sorted_entries = sorted(
-        entries, key=lambda e: (e.source_term, e.entry.target_term, e.id)
+        entries,
+        key=lambda e: (e.source_term or "", e.entry.target_term, e.id),
     )
     for ent in sorted_entries:
         canonical.append(
@@ -185,6 +249,7 @@ def glossary_hash(entries: Iterable[GlossaryEntryWithAliases]) -> str:
                 "status": ent.status,
                 "gender": ent.entry.gender,
                 "notes": ent.entry.notes,
+                "source_known": ent.source_known,
                 "source_aliases": sorted(ent.source_aliases),
                 "target_aliases": sorted(ent.target_aliases),
             }
@@ -221,6 +286,7 @@ __all__ = [
     "Violation",
     "ViolationSeverity",
     "build_constraints",
+    "build_target_only_constraints",
     "find_mentions",
     "glossary_hash",
     "has_locked_violation",

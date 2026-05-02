@@ -356,16 +356,25 @@ def open_cmd(ctx: click.Context, project_dir: Path, model: str | None) -> None:
     Reader, ``g`` for Glossary, ``i`` for Inbox.
     """
 
+    from epublate.app.config import UIConfig
     from epublate.app.main import run as run_app
     from epublate.app.screens.dashboard import DashboardScreen
     from epublate.app.screens.reader import DEFAULT_MODEL
     from epublate.core.project import Project
+    from epublate.db import repo
     from epublate.llm.factory import ENV_MODEL, build_provider
 
     project = Project.open(project_dir)
     _record_recent(project)
-    chosen_model = model or os.environ.get(ENV_MODEL) or DEFAULT_MODEL
+    overrides = repo.get_llm_overrides(project.engine, project.project_id)
+    chosen_model = (
+        model
+        or str(overrides.get("translator_model") or "").strip()
+        or os.environ.get(ENV_MODEL)
+        or DEFAULT_MODEL
+    )
     use_mock = bool(ctx.obj.get("mock_llm"))
+    ui_config = UIConfig.load()
 
     if os.environ.get("EPUBLATE_NO_TUI") == "1":
         try:
@@ -377,12 +386,16 @@ def open_cmd(ctx: click.Context, project_dir: Path, model: str | None) -> None:
         return
 
     def _provider_factory() -> object:
-        return build_provider(mock=use_mock)
+        # Reread overrides on every build so a Settings edit during
+        # the session affects the next worker without a restart.
+        live_overrides = repo.get_llm_overrides(project.engine, project.project_id)
+        return build_provider(mock=use_mock, overrides=live_overrides)
 
     screen = DashboardScreen(
         project,
         provider_factory=_provider_factory,  # type: ignore[arg-type]
         default_model=chosen_model,
+        ui_config=ui_config,
     )
     try:
         run_app(initial_screen=screen)
@@ -1063,6 +1076,452 @@ def _record_recent(project: object) -> None:
     except Exception:
         # Recents are a UX nicety, never a hard CLI dependency.
         pass
+
+
+# ---------------------------------------------------------------------------
+# Lore Book commands (PRD §4.3 / F-LB-10)
+# ---------------------------------------------------------------------------
+
+
+_LORE_DIR_TYPE = click.Path(
+    exists=True, file_okay=False, path_type=Path, resolve_path=True
+)
+
+
+@main.group(name="lore")
+def lore_cmd() -> None:
+    """Manage portable Lore Books (PRD §4.3 / F-LB-10).
+
+    Lore Books are stand-alone lore bibles kept on disk so they can be
+    attached to multiple translation projects (e.g. every book in a
+    series). Each Lore Book lives in its own ``<name>.epublate-lore/``
+    folder with a single SQLite DB.
+    """
+
+
+@lore_cmd.command(name="new")
+@click.option("--name", "name", required=True, help="Display name for the Lore Book.")
+@click.option(
+    "--source-lang",
+    "source_lang",
+    required=True,
+    help="Source language code (BCP-47).",
+)
+@click.option(
+    "--target-lang",
+    "target_lang",
+    required=True,
+    help="Target language code (BCP-47).",
+)
+@click.option(
+    "--out",
+    "out_dir",
+    type=click.Path(file_okay=False, path_type=Path, resolve_path=True),
+    default=None,
+    help=(
+        "Folder to create. Defaults to <library>/<slug>.epublate-lore "
+        "where library is $EPUBLATE_LORE_LIBRARY or "
+        "~/.config/epublate/lore."
+    ),
+)
+@click.option(
+    "--description",
+    "description",
+    default=None,
+    help="Short note describing the Lore Book's scope.",
+)
+@click.option(
+    "--from-project",
+    "from_project",
+    type=click.Path(exists=True, file_okay=False, path_type=Path, resolve_path=True),
+    default=None,
+    help=(
+        "Bootstrap the new Lore Book from this project's curated glossary "
+        "(e.g. an already-translated book in the same series)."
+    ),
+)
+def lore_new(
+    name: str,
+    source_lang: str,
+    target_lang: str,
+    out_dir: Path | None,
+    description: str | None,
+    from_project: Path | None,
+) -> None:
+    """Create an empty Lore Book.
+
+    With ``--from-project``, the freshly created Lore Book is
+    pre-populated from the given project's glossary so the curator can
+    start a series-wide lore corpus from book one's lore bible without
+    a separate import step. A fresh Lore Book has no entries to clash
+    with, so the import implicitly uses an ``overwrite``-equivalent
+    policy (every row in the project becomes a row in the new book).
+    """
+
+    from epublate.lore import (
+        LoreBook,
+        default_library_dir,
+        import_project_glossary,
+    )
+
+    if out_dir is None:
+        slug = _slugify_lore_name(name) or "lore"
+        out_dir = default_library_dir() / f"{slug}.epublate-lore"
+
+    book = LoreBook.create(
+        out_dir=out_dir,
+        name=name,
+        source_lang=source_lang,
+        target_lang=target_lang,
+        description=description,
+    )
+    try:
+        click.echo(f"Created Lore Book {book.name!r} at {book.lore_dir}")
+        click.echo(f"  database  : {book.db_path}")
+        click.echo(f"  languages : {book.source_lang} -> {book.target_lang}")
+        if from_project is not None:
+            summary = import_project_glossary(
+                book, src_project_dir=from_project, policy="overwrite"
+            )
+            click.echo(
+                f"  bootstrap : imported {summary.created} entries "
+                f"from {from_project}"
+                + (
+                    f" (target-only: {summary.target_only_inserts})"
+                    if summary.target_only_inserts
+                    else ""
+                )
+            )
+    finally:
+        book.close()
+
+
+@lore_cmd.command(name="open")
+@click.argument("lore_dir", type=_LORE_DIR_TYPE)
+def lore_open(lore_dir: Path) -> None:
+    """Print summary info about an existing Lore Book.
+
+    The TUI is the canonical edit surface for Lore Books; this command
+    prints a one-shot summary so headless scripts can sanity-check
+    that a Lore Book directory is readable.
+    """
+
+    from epublate.db import repo as _repo
+    from epublate.lore import LoreBook, list_lore_sources
+
+    book = LoreBook.open(lore_dir)
+    try:
+        entries = _repo.list_glossary_entries(book.engine, book.project_id)
+        sources = list_lore_sources(book.engine, project_id=book.project_id)
+        statuses: dict[str, int] = {}
+        for ent in entries:
+            statuses[ent.status] = statuses.get(ent.status, 0) + 1
+        target_only = sum(1 for ent in entries if not ent.source_known)
+        click.echo(f"Lore Book   : {book.name}")
+        click.echo(f"  path       : {book.lore_dir}")
+        click.echo(f"  languages  : {book.source_lang} -> {book.target_lang}")
+        if book.description:
+            click.echo(f"  description: {book.description}")
+        click.echo(f"  entries    : {len(entries)} (target-only: {target_only})")
+        for st in ("locked", "confirmed", "proposed"):
+            click.echo(f"    {st:<10}: {statuses.get(st, 0)}")
+        click.echo(f"  ingested   : {len(sources)} ePub(s)")
+        for src in sources[-5:]:
+            click.echo(
+                f"    - {src.kind:<6} {src.epub_path}  "
+                f"(+{src.entries_added} entries, status={src.status})"
+            )
+    finally:
+        book.close()
+
+
+@lore_cmd.command(name="list")
+def lore_list() -> None:
+    """List Lore Books in the configured library."""
+
+    from epublate.lore import default_library_dir, iter_library_lore_books
+
+    library = default_library_dir()
+    handles = list(iter_library_lore_books(library))
+    click.echo(f"Library: {library}")
+    if not handles:
+        click.echo("  (no Lore Books yet — try `epublate lore new`)")
+        return
+    for handle in handles:
+        click.echo(f"  - {handle.name}  [{handle.lore_dir}]")
+
+
+@lore_cmd.group(name="ingest")
+def lore_ingest_cmd() -> None:
+    """Ingest an ePub into a Lore Book to seed proper-noun proposals."""
+
+
+@lore_ingest_cmd.command(name="source")
+@click.argument("lore_dir", type=_LORE_DIR_TYPE)
+@click.argument(
+    "epub_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path, resolve_path=True),
+)
+@click.option(
+    "--helper-model",
+    "helper_model",
+    default=None,
+    help=(
+        "Helper model. Defaults to $EPUBLATE_LLM_HELPER_MODEL or the translator model."
+    ),
+)
+@click.option(
+    "--max-segments",
+    "max_segments",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Cap on segments fed to the helper (default: first 30).",
+)
+@click.pass_context
+def lore_ingest_source(
+    ctx: click.Context,
+    lore_dir: Path,
+    epub_path: Path,
+    helper_model: str | None,
+    max_segments: int | None,
+) -> None:
+    """Ingest a *source-language* ePub into ``LORE_DIR``.
+
+    Reuses the same proper-noun extractor the project intake pass uses,
+    so source-side and target-side knowledge accumulate in one place.
+    """
+
+    from epublate.core.extractor import DEFAULT_INTAKE_MAX_SEGMENTS
+    from epublate.llm.factory import ENV_MODEL, build_provider, resolve_helper_model
+    from epublate.lore import LoreBook, ingest_source_epub
+
+    use_mock = bool(ctx.obj.get("mock_llm"))
+    translator_model = os.environ.get(ENV_MODEL)
+    chosen_helper = resolve_helper_model(translator_model, override=helper_model)
+    provider = build_provider(mock=use_mock)
+
+    book = LoreBook.open(lore_dir)
+    try:
+        summary = ingest_source_epub(
+            book,
+            epub_path=epub_path,
+            provider=provider,
+            helper_model=chosen_helper,
+            max_segments=max_segments or DEFAULT_INTAKE_MAX_SEGMENTS,
+        )
+    finally:
+        book.close()
+
+    click.echo("Source ingest complete")
+    click.echo(f"  proposed     : {summary.proposed_count}")
+    if summary.intake_summary is not None:
+        s = summary.intake_summary
+        click.echo(f"  chunks       : {s.chunks} ({s.cached_chunks} cached)")
+        click.echo(f"  failed_chunks: {s.failed_chunks}")
+        click.echo(f"  cost_usd     : ${s.cost_usd:.4f}")
+    else:
+        click.echo("  cost_usd     : (extractor did not run — see logs)")
+    click.echo(f"  source_id    : {summary.source_id}")
+
+
+@lore_ingest_cmd.command(name="target")
+@click.argument("lore_dir", type=_LORE_DIR_TYPE)
+@click.argument(
+    "epub_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path, resolve_path=True),
+)
+@click.option(
+    "--helper-model",
+    "helper_model",
+    default=None,
+    help=(
+        "Helper model. Defaults to $EPUBLATE_LLM_HELPER_MODEL or the translator model."
+    ),
+)
+@click.option(
+    "--max-chapters",
+    "max_chapters",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Cap on chapters scanned for target-only proposals.",
+)
+@click.pass_context
+def lore_ingest_target(
+    ctx: click.Context,
+    lore_dir: Path,
+    epub_path: Path,
+    helper_model: str | None,
+    max_chapters: int | None,
+) -> None:
+    """Ingest a *target-language* ePub into ``LORE_DIR``.
+
+    Useful for series whose first books are already translated: the
+    helper LLM proposes canonical target spellings (no source term)
+    that the translator can then anchor to in later books (PRD F-LB-3).
+    """
+
+    from epublate.llm.factory import ENV_MODEL, build_provider, resolve_helper_model
+    from epublate.lore import LoreBook, ingest_target_epub
+    from epublate.lore.ingest_target import DEFAULT_TARGET_MAX_CHAPTERS
+
+    use_mock = bool(ctx.obj.get("mock_llm"))
+    translator_model = os.environ.get(ENV_MODEL)
+    chosen_helper = resolve_helper_model(translator_model, override=helper_model)
+    provider = build_provider(mock=use_mock)
+
+    book = LoreBook.open(lore_dir)
+    try:
+        source_row, summary = ingest_target_epub(
+            book,
+            epub_path=epub_path,
+            provider=provider,
+            helper_model=chosen_helper,
+            max_chapters=max_chapters or DEFAULT_TARGET_MAX_CHAPTERS,
+        )
+    finally:
+        book.close()
+
+    click.echo("Target ingest complete")
+    click.echo(f"  proposed     : {summary.proposed_count}")
+    click.echo(f"  chunks       : {summary.chunks} ({summary.cached_chunks} cached)")
+    click.echo(f"  failed_chunks: {summary.failed_chunks}")
+    click.echo(f"  cost_usd     : ${summary.cost_usd:.4f}")
+    click.echo(f"  source_id    : {source_row.id}")
+    if summary.notes:
+        click.echo("  notes        :")
+        for note in summary.notes:
+            click.echo(f"    - {note}")
+
+
+@lore_cmd.command(name="export")
+@click.argument("lore_dir", type=_LORE_DIR_TYPE)
+@click.option(
+    "--out",
+    "out_path",
+    type=click.Path(dir_okay=False, path_type=Path, resolve_path=True),
+    required=True,
+    help="Destination JSON file (will be overwritten).",
+)
+def lore_export(lore_dir: Path, out_path: Path) -> None:
+    """Export a Lore Book's glossary to JSON (format v2)."""
+
+    from epublate.glossary import io as glossary_io
+    from epublate.lore import LoreBook
+
+    book = LoreBook.open(lore_dir)
+    try:
+        payload = glossary_io.export_json(book.engine, book.project_id)
+    finally:
+        book.close()
+    glossary_io.write_export(out_path, payload)
+    click.echo(f"Exported {len(payload['entries'])} entries to {out_path}")
+
+
+@lore_cmd.command(name="import")
+@click.argument("lore_dir", type=_LORE_DIR_TYPE)
+@click.argument(
+    "in_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path, resolve_path=True),
+)
+@click.option(
+    "--conflict",
+    "conflict",
+    type=click.Choice(["skip", "overwrite"]),
+    default="skip",
+    show_default=True,
+    help="Behavior when an entry with the same source_term already exists.",
+)
+def lore_import(lore_dir: Path, in_path: Path, conflict: str) -> None:
+    """Import a glossary JSON file into a Lore Book.
+
+    Accepts both v1 and v2 formats; v1 entries are upgraded with
+    ``source_known=True`` (PRD §4.3 / F-LB-10).
+    """
+
+    from epublate.glossary import io as glossary_io
+    from epublate.lore import LoreBook
+
+    payload = glossary_io.read_payload(in_path)
+    book = LoreBook.open(lore_dir)
+    try:
+        summary = glossary_io.import_json(
+            book.engine,
+            project_id=book.project_id,
+            payload=payload,
+            conflict=conflict,  # type: ignore[arg-type]
+        )
+    finally:
+        book.close()
+    click.echo(
+        f"Imported {summary.created} created, "
+        f"{summary.updated} updated, "
+        f"{summary.skipped} skipped"
+    )
+
+
+@lore_cmd.command(name="import-project")
+@click.argument("lore_dir", type=_LORE_DIR_TYPE)
+@click.argument(
+    "project_dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path, resolve_path=True),
+)
+@click.option(
+    "--on-conflict",
+    "on_conflict",
+    type=click.Choice(["skip", "overwrite"]),
+    default="skip",
+    show_default=True,
+    help=(
+        "What to do when an entry already exists in the Lore Book "
+        "with the same source_term + type. Use the TUI for interactive "
+        "per-conflict resolution."
+    ),
+)
+def lore_import_project(lore_dir: Path, project_dir: Path, on_conflict: str) -> None:
+    """Import a translation project's curated glossary into a Lore Book.
+
+    The destination Lore Book accumulates source/target term mappings
+    (and aliases, gender, notes) from the project's glossary so the
+    next book in the series can attach the Lore Book and reuse the
+    canonical translations. The source project is opened read-only and
+    closed before this command returns.
+    """
+
+    from epublate.lore import LoreBook, import_project_glossary
+
+    book = LoreBook.open(lore_dir)
+    try:
+        summary = import_project_glossary(
+            book,
+            src_project_dir=project_dir,
+            policy=on_conflict,  # type: ignore[arg-type]
+        )
+    finally:
+        book.close()
+    click.echo(
+        f"Imported from {project_dir}:\n"
+        f"  created   : {summary.created}"
+        + (
+            f" (target-only: {summary.target_only_inserts})"
+            if summary.target_only_inserts
+            else ""
+        )
+        + f"\n  updated   : {summary.updated}\n"
+        f"  skipped   : {summary.skipped}"
+    )
+
+
+def _slugify_lore_name(text: str) -> str:
+    cleaned: list[str] = []
+    last_dash = False
+    for char in text.lower():
+        if char.isalnum():
+            cleaned.append(char)
+            last_dash = False
+        elif not last_dash and char in (" ", "-", "_"):
+            cleaned.append("-")
+            last_dash = True
+    return "".join(cleaned).strip("-")
 
 
 __all__ = ["main"]

@@ -36,9 +36,18 @@ from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Button, Footer, Header, Input, Label, Static
+from textual.widgets import (
+    Button,
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    Label,
+    Static,
+)
 
 from epublate.app.branding import ICON_ARROW
+from epublate.app.config import UIConfig
 from epublate.app.widgets import BatchProgressMeter, BatchSnapshot, CostMeter
 from epublate.core.batch import (
     BatchOptions,
@@ -46,6 +55,14 @@ from epublate.core.batch import (
     BatchProgressEvent,
     BatchSummary,
     run_batch,
+)
+from epublate.core.book_metadata import (
+    BookMetadata,
+    GlossaryStats,
+    IntakeStatus,
+    compute_glossary_stats,
+    extract_book_metadata,
+    get_intake_status,
 )
 from epublate.core.extractor import (
     DEFAULT_INTAKE_MAX_SEGMENTS,
@@ -55,6 +72,7 @@ from epublate.core.extractor import (
 )
 from epublate.core.project import Project
 from epublate.core.stats import (
+    ChapterShape,
     ChapterShapeSummary,
     ProjectStats,
     compute_chapter_shapes,
@@ -897,11 +915,69 @@ class DashboardScreen(Screen[None]):
     DEFAULT_CSS = """
     DashboardScreen #dashboard-body {
         height: 1fr;
+        padding: 0 1 0 1;
+    }
+    DashboardScreen #dashboard-header-strip {
+        height: auto;
+        margin: 0 0 1 0;
+    }
+    DashboardScreen #dashboard-project {
+        height: auto;
+        padding: 1 2;
+        border: round $primary;
+        margin: 0 0 1 0;
+    }
+    DashboardScreen #dashboard-intake-status {
+        height: auto;
+        padding: 1 2;
+        border: round $accent 50%;
+        background: $boost;
+    }
+    DashboardScreen #dashboard-columns {
+        height: 1fr;
+        layout: horizontal;
+    }
+    DashboardScreen .dashboard-col {
+        width: 1fr;
+        height: 1fr;
+        padding: 0 1 0 0;
+    }
+    DashboardScreen .dashboard-col:last-of-type {
+        padding: 0;
     }
     DashboardScreen .panel {
         border: round $primary;
         padding: 1 2;
         margin: 0 0 1 0;
+        height: auto;
+    }
+    DashboardScreen .panel-title {
+        text-style: bold;
+        color: $primary;
+        padding: 0 0 1 0;
+    }
+    DashboardScreen #dashboard-book-panel {
+        height: auto;
+    }
+    DashboardScreen #dashboard-book-cover {
+        height: auto;
+        color: $text-muted;
+        padding: 0 0 1 0;
+    }
+    DashboardScreen #dashboard-book-meta {
+        height: auto;
+    }
+    DashboardScreen #dashboard-book-description {
+        height: auto;
+        color: $text-muted;
+        padding: 1 0 0 0;
+    }
+    DashboardScreen #dashboard-chapter-panel {
+        height: 1fr;
+    }
+    DashboardScreen #dashboard-chapter-table {
+        height: 1fr;
+        max-height: 16;
     }
     DashboardScreen #dashboard-progress {
         height: auto;
@@ -911,6 +987,16 @@ class DashboardScreen(Screen[None]):
     }
     DashboardScreen #dashboard-inbox-digest {
         height: auto;
+    }
+    DashboardScreen #dashboard-glossary-panel {
+        height: auto;
+    }
+    DashboardScreen #dashboard-llm-activity-panel {
+        height: auto;
+    }
+    DashboardScreen #dashboard-llm-activity-table {
+        height: auto;
+        max-height: 8;
     }
     DashboardScreen #dashboard-batch-panel {
         display: none;
@@ -930,7 +1016,8 @@ class DashboardScreen(Screen[None]):
         color: $text-muted;
     }
     DashboardScreen #dashboard-activity {
-        height: 1fr;
+        height: auto;
+        max-height: 12;
     }
     DashboardScreen #dashboard-status {
         dock: bottom;
@@ -948,6 +1035,9 @@ class DashboardScreen(Screen[None]):
         *,
         provider_factory: ProviderFactory = build_provider,
         default_model: str | None = None,
+        ui_config: UIConfig | None = None,
+        config_path: Path | None = None,
+        auto_intake_on_first_mount: bool = False,
     ) -> None:
         super().__init__()
         self._project = project
@@ -957,6 +1047,25 @@ class DashboardScreen(Screen[None]):
         self._batch_running = False
         self._intake_running = False
         self._export_running = False
+        # We keep a single ``UIConfig`` snapshot per Dashboard instance so
+        # any edits made on the Settings screen round-trip back here
+        # without a disk re-read (which would silently drop unsaved
+        # tweaks made via, e.g., the ``A`` toggle).
+        self._ui_config = ui_config or UIConfig.load(config_path)
+        self._config_path = config_path
+        # ``_book_metadata`` is read lazily on the first refresh so the
+        # Dashboard mount cost stays bounded by SQLite IO; ePub OPF
+        # parsing is fast but not free for large books and we'd rather
+        # show "(loading)" than block the first paint.
+        self._book_metadata: BookMetadata | None = None
+        # ``auto_intake_on_first_mount`` is the bridge between the New
+        # Project flow and the Dashboard — when the curator has
+        # ``intake_run_after_new`` turned on in Settings, the
+        # ProjectsScreen sets this flag so we surface the IntakeModal
+        # immediately after the Dashboard's first paint. We gate on
+        # "no intake event yet" so reopening an existing project never
+        # triggers it accidentally.
+        self._auto_intake_on_first_mount = auto_intake_on_first_mount
 
     @property
     def stats(self) -> ProjectStats | None:
@@ -977,35 +1086,100 @@ class DashboardScreen(Screen[None]):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
         with Vertical(id="dashboard-body"):
-            yield Static("(loading…)", id="dashboard-project", classes="panel")
-            yield Static("Progress: …", id="dashboard-progress", classes="panel")
-            with Vertical(id="dashboard-cost-panel", classes="panel"):
-                yield Label("Cost", classes="panel-title")
-                yield CostMeter(id="dashboard-cost")
-            with Vertical(id="dashboard-batch-panel"):
-                yield BatchProgressMeter(id="dashboard-batch-meter")
+            with Vertical(id="dashboard-header-strip"):
+                yield Static("(loading…)", id="dashboard-project")
                 yield Static(
-                    "Tip: press [b]o[/b] to open the [b]Reader[/b] and watch "
-                    "segments translate live.",
-                    id="dashboard-batch-hint",
+                    "Intake: …",
+                    id="dashboard-intake-status",
                     markup=True,
                 )
-            yield Static(
-                "Inbox: …",
-                id="dashboard-inbox-digest",
-                classes="panel",
-            )
-            yield Static(
-                "(no activity yet)",
-                id="dashboard-activity",
-                classes="panel",
-                markup=True,
-            )
+            with Horizontal(id="dashboard-columns"):
+                with Vertical(classes="dashboard-col"):
+                    with Vertical(id="dashboard-book-panel", classes="panel"):
+                        yield Label("Book", classes="panel-title")
+                        yield Static(
+                            "(no cover)",
+                            id="dashboard-book-cover",
+                        )
+                        yield Static("(loading metadata…)", id="dashboard-book-meta")
+                        yield Static(
+                            "",
+                            id="dashboard-book-description",
+                            markup=False,
+                        )
+                    with Vertical(id="dashboard-chapter-panel", classes="panel"):
+                        yield Label("Chapters", classes="panel-title")
+                        chapter_table: DataTable[str] = DataTable(
+                            id="dashboard-chapter-table",
+                            zebra_stripes=True,
+                            cursor_type="row",
+                        )
+                        yield chapter_table
+                with Vertical(classes="dashboard-col"):
+                    yield Static(
+                        "Progress: …", id="dashboard-progress", classes="panel"
+                    )
+                    with Vertical(id="dashboard-cost-panel", classes="panel"):
+                        yield Label("Cost", classes="panel-title")
+                        yield CostMeter(id="dashboard-cost")
+                    with Vertical(id="dashboard-batch-panel"):
+                        yield BatchProgressMeter(id="dashboard-batch-meter")
+                        yield Static(
+                            "Tip: press [b]o[/b] to open the [b]Reader[/b] and "
+                            "watch segments translate live.",
+                            id="dashboard-batch-hint",
+                            markup=True,
+                        )
+                with Vertical(classes="dashboard-col"):
+                    yield Static(
+                        "Inbox: …",
+                        id="dashboard-inbox-digest",
+                        classes="panel",
+                    )
+                    yield Static(
+                        "(loading glossary stats…)",
+                        id="dashboard-glossary-panel",
+                        classes="panel",
+                        markup=True,
+                    )
+                    with Vertical(id="dashboard-llm-activity-panel", classes="panel"):
+                        yield Label("LLM activity", classes="panel-title")
+                        llm_table: DataTable[str] = DataTable(
+                            id="dashboard-llm-activity-table",
+                            zebra_stripes=True,
+                            cursor_type="none",
+                        )
+                        yield llm_table
+                    yield Static(
+                        "(no activity yet)",
+                        id="dashboard-activity",
+                        classes="panel",
+                        markup=True,
+                    )
             yield Static("Ready.", id="dashboard-status", markup=True)
         yield Footer()
 
     def on_mount(self) -> None:
+        chapter_table = self.query_one("#dashboard-chapter-table", DataTable)
+        if not chapter_table.columns:
+            chapter_table.add_columns("#", "Chapter", "Segs", "% Trans", "% Approved")
+        llm_table = self.query_one("#dashboard-llm-activity-table", DataTable)
+        if not llm_table.columns:
+            llm_table.add_columns("Model", "Purpose", "Tokens", "Cost", "Cache")
         self._refresh_stats()
+        if self._auto_intake_on_first_mount:
+            # Fire-and-forget: the IntakeModal owns its own dispatch.
+            # Reset the flag immediately so a subsequent ``on_mount``
+            # (e.g. tab switch) doesn't spawn a second modal.
+            self._auto_intake_on_first_mount = False
+            try:
+                intake_status = get_intake_status(
+                    self._project.engine, self._project.project_id
+                )
+            except Exception:
+                intake_status = IntakeStatus(has_run=False)
+            if not intake_status.has_run:
+                self.call_later(self.action_intake)
 
     # ------------- state helpers -------------
 
@@ -1048,6 +1222,208 @@ class DashboardScreen(Screen[None]):
 
         activity = self.query_one("#dashboard-activity", Static)
         activity.update(self._format_activity(alerts))
+
+        self._refresh_book_panel()
+        self._refresh_chapter_table()
+        self._refresh_glossary_panel()
+        self._refresh_llm_activity_table()
+        self._refresh_intake_status()
+
+    # ------------- new dashboard panels (M6 / Phase 1) -------------
+
+    def _refresh_book_panel(self) -> None:
+        """Populate the Book panel from the OPF + DB-derived counters.
+
+        We extract metadata only on the first refresh (cached on the
+        instance) — re-running the OPF parser on every keystroke would
+        be wasted work since metadata never changes during a session.
+        Counters that *do* change (chapter / segment counts) come from
+        :class:`ProjectStats` which is recomputed every refresh.
+        """
+
+        if self._book_metadata is None:
+            try:
+                self._book_metadata = extract_book_metadata(
+                    self._project.original_epub_path
+                )
+            except Exception as exc:
+                _logger.warning(
+                    "could not load book metadata for %s: %s",
+                    self._project.original_epub_path,
+                    exc,
+                )
+                self._book_metadata = BookMetadata()
+        meta = self._book_metadata
+
+        cover_widget = self.query_one("#dashboard-book-cover", Static)
+        if meta.cover is not None:
+            kb = meta.cover.bytes_size / 1024
+            cover_widget.update(
+                f"[cover] {meta.cover.href}  ({meta.cover.media_type}, {kb:,.1f} KB)"
+            )
+        else:
+            cover_widget.update("(no cover)")
+
+        meta_widget = self.query_one("#dashboard-book-meta", Static)
+        meta_widget.update(self._format_book_meta(meta))
+
+        description_widget = self.query_one("#dashboard-book-description", Static)
+        description = meta.short_description() or ""
+        description_widget.update(description)
+
+    def _format_book_meta(self, meta: BookMetadata) -> str:
+        title = meta.title or self._project.name
+        author = meta.author_line()
+        publisher = meta.publisher or "(unknown publisher)"
+        publish = meta.publish_date or "(no date)"
+        languages = (
+            f"{self._project.source_lang} → {self._project.target_lang}"
+            if self._project.source_lang
+            else (meta.language or "(unknown lang)")
+        )
+        if meta.word_count is not None:
+            words = f"{meta.word_count:,} words"
+        else:
+            words = "(word count unavailable)"
+        chapters = (
+            f"{meta.chapter_count} chapters"
+            if meta.chapter_count is not None
+            else "(no chapter count)"
+        )
+        return (
+            f"  title     : {title}\n"
+            f"  author(s) : {author}\n"
+            f"  publisher : {publisher}\n"
+            f"  date      : {publish}\n"
+            f"  langs     : {languages}\n"
+            f"  scope     : {chapters}, {words}"
+        )
+
+    def _refresh_chapter_table(self) -> None:
+        """Repopulate the chapter table with per-chapter progress (PRD §4.6)."""
+
+        table = self.query_one("#dashboard-chapter-table", DataTable)
+        try:
+            shapes: list[ChapterShape] = compute_chapter_shapes(
+                self._project.engine, project_id=self._project.project_id
+            )
+        except Exception as exc:
+            _logger.warning("chapter shape compute failed: %s", exc)
+            return
+        table.clear()
+        for shape in shapes:
+            translatable = shape.translatable_count
+            translated_pct = (
+                f"{(shape.translated_count / translatable) * 100:5.1f}%"
+                if translatable
+                else "  —"
+            )
+            approved_pct = (
+                f"{(shape.approved_count / translatable) * 100:5.1f}%"
+                if translatable
+                else "  —"
+            )
+            label = (shape.title or "(untitled)").strip()
+            if len(label) > 40:
+                label = label[:37] + "…"
+            table.add_row(
+                str(shape.spine_idx + 1),
+                label,
+                str(shape.segment_count),
+                translated_pct,
+                approved_pct,
+                key=shape.chapter_id,
+            )
+
+    def _refresh_glossary_panel(self) -> None:
+        """Render glossary status counters with a hint to open the Inbox."""
+
+        widget = self.query_one("#dashboard-glossary-panel", Static)
+        try:
+            counts: GlossaryStats = compute_glossary_stats(
+                self._project.engine, self._project.project_id
+            )
+        except Exception as exc:
+            _logger.warning("glossary stats compute failed: %s", exc)
+            widget.update("[b]Glossary[/b]\n  (could not load stats)")
+            return
+        if counts.total == 0:
+            widget.update(
+                "[b]Glossary[/b]\n"
+                "  no entries yet — press [b]e[/b] to run intake or [b]g[/b] to add\n"
+                "  one manually."
+            )
+            return
+        proposed_hint = (
+            " — press [b]i[/b] to triage in the Inbox" if counts.proposed else ""
+        )
+        widget.update(
+            f"[b]Glossary[/b]: {counts.total} entries\n"
+            f"  locked    : {counts.locked}\n"
+            f"  confirmed : {counts.confirmed}\n"
+            f"  proposed  : {counts.proposed}{proposed_hint}"
+        )
+
+    def _refresh_llm_activity_table(self) -> None:
+        """Show the most recent LLM calls (model, tokens, cost, cache hit)."""
+
+        table = self.query_one("#dashboard-llm-activity-table", DataTable)
+        table.clear()
+        try:
+            recent = repo.list_llm_calls(
+                self._project.engine,
+                self._project.project_id,
+                limit=5,
+                descending=True,
+            )
+        except Exception as exc:
+            _logger.warning("LLM activity load failed: %s", exc)
+            return
+        if not recent:
+            table.add_row("(no calls)", "—", "—", "—", "—")
+            return
+        for row in recent:
+            tokens = (row.prompt_tokens or 0) + (row.completion_tokens or 0)
+            cost = f"${row.cost_usd:.4f}" if row.cost_usd is not None else "—"
+            table.add_row(
+                row.model,
+                row.purpose,
+                str(tokens),
+                cost,
+                "yes" if row.cache_hit else "no",
+            )
+
+    def _refresh_intake_status(self) -> None:
+        """Render the intake header strip (definition + last-run summary)."""
+
+        widget = self.query_one("#dashboard-intake-status", Static)
+        try:
+            status: IntakeStatus = get_intake_status(
+                self._project.engine, self._project.project_id
+            )
+        except Exception as exc:
+            _logger.warning("intake status load failed: %s", exc)
+            widget.update("Intake: (could not load status)")
+            return
+        # The "Intake = …" definition is part of the same Static so the
+        # curator never has to leave the dashboard to remember what the
+        # ``e`` shortcut does (PRD §4.6 / Intake clarity).
+        if not status.has_run:
+            widget.update(
+                "[b]Intake[/b]: not run yet — press [b]e[/b] to scan source "
+                "text for proper nouns and seed the lore bible. "
+                "[dim](no translation happens.)[/dim]"
+            )
+            return
+        proposed = status.proposed_count or 0
+        chunks = status.chunks or 0
+        cost = f", cost ${status.cost_usd:.4f}" if status.cost_usd is not None else ""
+        pov = f", pov={status.pov}" if status.pov else ""
+        tense = f", tense={status.tense}" if status.tense else ""
+        widget.update(
+            f"[b]Intake[/b]: ran on {chunks} chunks → {proposed} proposed "
+            f"entries{cost}{pov}{tense} — press [b]e[/b] to re-run."
+        )
 
     def _format_activity(self, alerts: list[repo.EventRow]) -> str:
         if not alerts:
@@ -1143,6 +1519,25 @@ class DashboardScreen(Screen[None]):
             self._on_child_screen_closed,
         )
 
+    @on(DataTable.RowSelected, "#dashboard-chapter-table")
+    def _open_reader_at_chapter(self, event: DataTable.RowSelected) -> None:
+        """Pressing Enter on a chapter row jumps the Reader to that chapter."""
+
+        from epublate.app.screens.reader import ReaderScreen
+
+        chapter_id = (
+            str(event.row_key.value) if event.row_key.value is not None else None
+        )
+        self.app.push_screen(
+            ReaderScreen(
+                self._project,
+                provider_factory=self._provider_factory,
+                model=self._default_model,
+                initial_chapter_id=chapter_id,
+            ),
+            self._on_child_screen_closed,
+        )
+
     def action_open_glossary(self) -> None:
         from epublate.app.screens.glossary import GlossaryScreen
 
@@ -1165,8 +1560,17 @@ class DashboardScreen(Screen[None]):
     def action_open_settings(self) -> None:
         from epublate.app.screens.settings import SettingsScreen
 
+        # Pass the live ``UIConfig`` snapshot so any edit on the
+        # Settings screen updates this Dashboard instance's view; the
+        # ``_config_path`` lets tests redirect persistence to a tmp
+        # file.
         self.app.push_screen(
-            SettingsScreen(self._project, default_model=self._default_model),
+            SettingsScreen(
+                self._project,
+                default_model=self._default_model,
+                ui_config=self._ui_config,
+                config_path=self._config_path,
+            ),
             self._on_child_screen_closed,
         )
 
@@ -1206,7 +1610,7 @@ class DashboardScreen(Screen[None]):
             shape_summary = None
         modal = BatchModal(
             default_model=self._default_model,
-            default_concurrency=1,
+            default_concurrency=self._ui_config.batch_concurrency,
             default_budget=self._stats.budget_usd if self._stats else None,
             chapter_shape_summary=shape_summary,
             project_stats=self._stats,
@@ -1451,13 +1855,29 @@ class DashboardScreen(Screen[None]):
         if self._intake_running:
             self._set_status("An intake pass is already running.")
             return
-        try:
-            default_helper = resolve_helper_model(self._default_model)
-        except Exception:
-            default_helper = self._default_model
+        # Order of precedence for the intake helper model:
+        #   1. The Settings → Intake override (per-machine UIConfig).
+        #   2. The project-row override (Settings → LLM panel).
+        #   3. ``EPUBLATE_LLM_HELPER_MODEL`` (resolved by ``factory``).
+        #   4. The dashboard's ``default_model`` (translator fallback).
+        helper_default = self._ui_config.intake_helper_model
+        if not helper_default:
+            try:
+                project_overrides = repo.get_llm_overrides(
+                    self._project.engine, self._project.project_id
+                )
+            except Exception:
+                project_overrides = {}
+            try:
+                helper_default = resolve_helper_model(
+                    self._default_model,
+                    project_overrides=project_overrides,
+                )
+            except Exception:
+                helper_default = self._default_model
         modal = IntakeModal(
-            default_helper_model=default_helper,
-            default_max_segments=DEFAULT_INTAKE_MAX_SEGMENTS,
+            default_helper_model=helper_default,
+            default_max_segments=self._ui_config.intake_max_segments,
         )
         self.app.push_screen(modal, self._on_intake_chosen)
 

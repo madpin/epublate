@@ -48,6 +48,26 @@ class GlossaryConstraint(BaseModel):
     notes: str | None = None
 
 
+class TargetOnlyConstraint(BaseModel):
+    """One target-only constraint (PRD §4.3 / F-LB-9).
+
+    Carries the canonical *target* spelling for an entity whose
+    source-side wording is unknown to the curator. The translator is
+    asked to infer the source term in-segment and use the canonical
+    target form when it maps. Soft-locked: a missed match is a warning,
+    not a hard failure (validator-side enforcement lives in
+    :func:`epublate.glossary.enforcer.validate_target`).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    target_term: str
+    type: str = "term"
+    status: GlossaryStatus = "confirmed"
+    notes: str | None = None
+    target_aliases: tuple[str, ...] = ()
+
+
 class TranslatorTrace(BaseModel):
     """Parsed translator response (PRD §8.1).
 
@@ -113,7 +133,7 @@ Hard rules — these are not negotiable:
 4. Locked glossary entries are non-negotiable. Confirmed entries are
    strong defaults. Proposed entries are suggestions.
 
-{style_guide_block}{glossary_block}\
+{style_guide_block}{glossary_block}{target_only_block}\
 Respond with a single JSON object and nothing else:
 
 {{
@@ -156,7 +176,7 @@ Hard rules — these are not negotiable:
    for this batch; if you see any, treat them as literal characters
    that must survive verbatim in the output.
 
-{style_guide_block}{glossary_block}\
+{style_guide_block}{glossary_block}{target_only_block}\
 Input format: the user message is a JSON object of the shape
 ``{{"items": [{{"id": 1, "source": "..."}}, ...]}}``. Respond with a
 single JSON object and nothing else:
@@ -189,8 +209,17 @@ def build_translator_messages(
     source_text: str,
     style_guide: str | None = None,
     glossary: Sequence[GlossaryConstraint] = (),
+    target_only_glossary: Sequence[TargetOnlyConstraint] = (),
 ) -> list[Message]:
-    """Construct the chat messages for one translator call (PRD §8.1)."""
+    """Construct the chat messages for one translator call (PRD §8.1).
+
+    ``target_only_glossary`` carries entries whose canonical *target*
+    spelling is pinned but whose *source* spelling is unknown
+    (PRD §4.3 / F-LB-9). They render in a separate prompt block that
+    asks the model to map source-language references it sees in the
+    segment to the canonical target form. Validator-side these are
+    soft-locked — a missed match is a warning, not a hard failure.
+    """
 
     if not source_text:
         raise ValueError("source_text must not be empty")
@@ -199,12 +228,14 @@ def build_translator_messages(
         f"Style guide:\n{style_guide.strip()}\n\n" if style_guide else ""
     )
     glossary_block = _format_glossary_block(glossary)
+    target_only_block = _format_target_only_block(target_only_glossary)
 
     system_content = _SYSTEM_PROMPT_TEMPLATE.format(
         source_lang=source_lang,
         target_lang=target_lang,
         style_guide_block=style_guide_block,
         glossary_block=glossary_block,
+        target_only_block=target_only_block,
     )
 
     return [
@@ -235,6 +266,61 @@ def _format_glossary_block(glossary: Sequence[GlossaryConstraint]) -> str:
             lines.append(
                 f"    - [{entry.type}] {entry.source_term} → {entry.target_term}{note}"
             )
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _format_target_only_block(
+    glossary: Sequence[TargetOnlyConstraint],
+) -> str:
+    """Render the target-only constraint block (PRD §4.3 / F-LB-9).
+
+    The block deliberately lives separately from the source-keyed
+    glossary section because the contract differs: there is no source
+    pattern to match on, the model has to *infer* the binding from
+    context. Returns an empty string when the list is empty so the
+    prompt template stays compact for the common case.
+    """
+
+    if not glossary:
+        return ""
+    by_status: dict[GlossaryStatus, list[TargetOnlyConstraint]] = {
+        "locked": [],
+        "confirmed": [],
+        "proposed": [],
+    }
+    for entry in glossary:
+        by_status.setdefault(entry.status, []).append(entry)
+
+    lines = [
+        "Canonical target terms used in this work (no source spelling on file):",
+    ]
+    has_any = False
+    for status in ("locked", "confirmed"):
+        bucket = by_status.get(status, [])
+        if not bucket:
+            continue
+        has_any = True
+        lines.append(
+            f"  {status} target forms (use the canonical spelling when applicable):"
+        )
+        for entry in bucket:
+            aliases = (
+                f"  (aliases: {', '.join(entry.target_aliases)})"
+                if entry.target_aliases
+                else ""
+            )
+            note = f" — {entry.notes}" if entry.notes else ""
+            lines.append(f"    - [{entry.type}] {entry.target_term}{aliases}{note}")
+    if not has_any:
+        return ""
+    lines.append("")
+    lines.append(
+        "If you encounter a source-language term in this segment that names "
+        "one of the entities above, you MUST translate it using the canonical "
+        "target form. If no source term in this segment maps to one of these "
+        "entities, ignore this list entirely."
+    )
     lines.append("")
     return "\n".join(lines) + "\n"
 
@@ -315,6 +401,7 @@ def build_group_translator_messages(
     source_items: Sequence[tuple[int, str]],
     style_guide: str | None = None,
     glossary: Sequence[GlossaryConstraint] = (),
+    target_only_glossary: Sequence[TargetOnlyConstraint] = (),
 ) -> list[Message]:
     """Construct chat messages for a *grouped* translator call.
 
@@ -325,6 +412,10 @@ def build_group_translator_messages(
     The caller is expected to filter segments down to the
     grouping-eligible subset (short, placeholder-free) before calling
     this — see ``epublate.core.pipeline.translate_segments_grouped``.
+
+    ``target_only_glossary`` mirrors :func:`build_translator_messages` —
+    target-only constraints (PRD §4.3 / F-LB-9) get rendered in their
+    own block when present.
     """
 
     if not source_items:
@@ -341,12 +432,14 @@ def build_group_translator_messages(
         f"Style guide:\n{style_guide.strip()}\n\n" if style_guide else ""
     )
     glossary_block = _format_glossary_block(glossary)
+    target_only_block = _format_target_only_block(target_only_glossary)
 
     system_content = _GROUP_SYSTEM_PROMPT_TEMPLATE.format(
         source_lang=source_lang,
         target_lang=target_lang,
         style_guide_block=style_guide_block,
         glossary_block=glossary_block,
+        target_only_block=target_only_block,
     )
 
     user_payload = {

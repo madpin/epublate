@@ -18,8 +18,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import ClassVar, cast
+from typing import ClassVar, Protocol, cast
 
+from sqlalchemy.engine import Engine
 from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
@@ -53,6 +54,29 @@ from epublate.glossary.models import (
     GlossaryStatusLiteral,
 )
 
+
+class GlossarySource(Protocol):
+    """Minimal contract a screen owner must satisfy.
+
+    Both :class:`epublate.core.project.Project` and
+    :class:`epublate.lore.lore.LoreBook` implement this implicitly —
+    same field names, same semantics. The Glossary screen calls this
+    contract instead of holding a concrete :class:`Project` so it can
+    edit Lore Books without forking the whole UI.
+    """
+
+    @property
+    def engine(self) -> Engine: ...
+    @property
+    def project_id(self) -> str: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def source_lang(self) -> str: ...
+    @property
+    def target_lang(self) -> str: ...
+
+
 _ENTITY_TYPES: tuple[EntityType, ...] = (
     "character",
     "place",
@@ -81,6 +105,13 @@ _STATUSES: tuple[GlossaryStatusLiteral, ...] = ("proposed", "confirmed", "locked
 
 @dataclass(slots=True)
 class _EntryDraft:
+    """Form-shape mirror of a glossary entry the modal lets a curator edit.
+
+    ``source_term`` defaults to ``""`` and stays optional only inside a
+    Lore Book context (PRD F-LB-3 / F-LB-9). Project-scoped editing
+    enforces a non-empty source term in :meth:`EntryEditScreen.action_save`.
+    """
+
     source_term: str = ""
     target_term: str = ""
     type: EntityType = "term"
@@ -93,7 +124,7 @@ class _EntryDraft:
     @classmethod
     def from_entry(cls, entry: GlossaryEntryWithAliases) -> _EntryDraft:
         return cls(
-            source_term=entry.source_term,
+            source_term=entry.source_term or "",
             target_term=entry.target_term,
             type=entry.entry.type,
             status=entry.status,
@@ -152,10 +183,17 @@ class EntryEditScreen(ModalScreen[_EntryDraftResult | None]):
     }
     """
 
-    def __init__(self, draft: _EntryDraft, *, title: str) -> None:
+    def __init__(
+        self,
+        draft: _EntryDraft,
+        *,
+        title: str,
+        source_term_required: bool = True,
+    ) -> None:
         super().__init__()
         self._draft = draft
         self._title = title
+        self._source_term_required = source_term_required
 
     def compose(self) -> ComposeResult:
         with Vertical(id="entry-box"):
@@ -218,7 +256,10 @@ class EntryEditScreen(ModalScreen[_EntryDraftResult | None]):
     def action_save(self) -> None:
         source_term = self.query_one("#entry-source", Input).value.strip()
         target_term = self.query_one("#entry-target", Input).value.strip()
-        if not source_term or not target_term:
+        if not target_term:
+            self.app.bell()
+            return
+        if self._source_term_required and not source_term:
             self.app.bell()
             return
         type_value = self.query_one("#entry-type", Select).value
@@ -380,7 +421,14 @@ class CascadeFailed(Message):
 
 
 class GlossaryScreen(Screen[None]):
-    """Glossary table + detail pane + edit/cascade flows."""
+    """Glossary table + detail pane + edit/cascade flows.
+
+    The screen is reused by Lore Books (Phase 2 of the Lore Books rollout):
+    the owner is typed as :class:`GlossarySource`, a structural protocol
+    that both :class:`epublate.core.project.Project` and
+    :class:`epublate.lore.lore.LoreBook` satisfy. When the owner is a
+    Lore Book (no chapters/segments) the cascade action is disabled.
+    """
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("n", "new_entry", "New", show=True),
@@ -422,11 +470,28 @@ class GlossaryScreen(Screen[None]):
 
     filter_status: reactive[str] = reactive("all")
 
-    def __init__(self, project: Project) -> None:
+    def __init__(
+        self,
+        source: GlossarySource | Project,
+        *,
+        cascade_enabled: bool | None = None,
+    ) -> None:
         super().__init__()
-        self._project = project
+        self._project = source
         self._entries: list[GlossaryEntryWithAliases] = []
         self._row_to_entry: dict[str, str] = {}
+        # Cascade only makes sense in a translation context (segments
+        # in the DB). Lore Books carry no chapters, so we infer the
+        # default from ``isinstance(source, Project)`` and let the
+        # caller override.
+        self._cascade_enabled = (
+            cascade_enabled
+            if cascade_enabled is not None
+            else isinstance(source, Project)
+        )
+        # Same reasoning for source_term: a Lore Book accepts
+        # target-only entries, projects don't.
+        self._source_term_required = isinstance(source, Project)
 
     @property
     def entries(self) -> list[GlossaryEntryWithAliases]:
@@ -468,10 +533,15 @@ class GlossaryScreen(Screen[None]):
         ]
         for ent in rows:
             aliases = ", ".join(ent.source_aliases) or "—"
+            # Render a friendly placeholder for target-only Lore Book
+            # entries so the column stays aligned. The "(target-only)"
+            # tag makes the row's lore-book provenance obvious without
+            # forcing the curator to open the detail pane.
+            source_label = ent.source_term or "(target-only)"
             row_key = table.add_row(
                 ent.entry.type,
                 ent.status,
-                ent.source_term,
+                source_label,
                 ent.target_term,
                 aliases,
                 key=ent.id,
@@ -498,11 +568,13 @@ class GlossaryScreen(Screen[None]):
         )
         mentions = repo.list_mentions(self._project.engine, entry_id=ent.id)
         notes = ent.entry.notes or ""
+        source_label = ent.source_term or "[i](target-only)[/i]"
         body = "\n".join(
             [
-                f"[b]{ent.source_term}[/b] → [b]{ent.target_term}[/b]",
+                f"[b]{source_label}[/b] → [b]{ent.target_term}[/b]",
                 f"  type: {ent.entry.type}    status: {ent.status}"
-                + (f"    gender: {ent.entry.gender}" if ent.entry.gender else ""),
+                + (f"    gender: {ent.entry.gender}" if ent.entry.gender else "")
+                + ("" if ent.source_known else "    (soft-lock if locked)"),
                 "",
                 f"[b]Source aliases[/b]: {', '.join(ent.source_aliases) or '—'}",
                 f"[b]Target aliases[/b]: {', '.join(ent.target_aliases) or '—'}",
@@ -547,7 +619,11 @@ class GlossaryScreen(Screen[None]):
         self._render_detail()
 
     def action_new_entry(self) -> None:
-        modal = EntryEditScreen(_EntryDraft(), title="New glossary entry")
+        modal = EntryEditScreen(
+            _EntryDraft(),
+            title="New glossary entry",
+            source_term_required=self._source_term_required,
+        )
         self.app.push_screen(modal, self._on_entry_created)
 
     def _on_entry_created(self, result: _EntryDraftResult | None) -> None:
@@ -555,10 +631,12 @@ class GlossaryScreen(Screen[None]):
             self._set_status("Cancelled.")
             return
         draft = result.draft
+        source_term = draft.source_term.strip() or None
+        source_known = source_term is not None
         repo.create_glossary_entry(
             self._project.engine,
             project_id=self._project.project_id,
-            source_term=draft.source_term,
+            source_term=source_term,
             target_term=draft.target_term,
             type=draft.type,
             status=draft.status,
@@ -566,15 +644,20 @@ class GlossaryScreen(Screen[None]):
             notes=draft.notes or None,
             source_aliases=_split_aliases(draft.source_aliases),
             target_aliases=_split_aliases(draft.target_aliases),
+            source_known=source_known,
         )
         repo.append_event(
             self._project.engine,
             project_id=self._project.project_id,
             kind="glossary.created",
-            payload={"source_term": draft.source_term},
+            payload={
+                "source_term": source_term,
+                "target_term": draft.target_term,
+            },
         )
         self._refresh_entries()
-        self._set_status(f"Created entry {draft.source_term!r}.")
+        label = source_term or draft.target_term
+        self._set_status(f"Created entry {label!r}.")
 
     def action_edit_entry(self) -> None:
         ent = self._highlighted_entry()
@@ -582,7 +665,8 @@ class GlossaryScreen(Screen[None]):
             return
         modal = EntryEditScreen(
             _EntryDraft.from_entry(ent),
-            title=f"Edit {ent.source_term!r}",
+            title=f"Edit {(ent.source_term or ent.target_term)!r}",
+            source_term_required=self._source_term_required,
         )
         self.app.push_screen(modal, _make_edit_callback(self, ent.id))
 
@@ -625,10 +709,9 @@ class GlossaryScreen(Screen[None]):
         ent = self._highlighted_entry()
         if ent is None:
             return
-        modal = DeleteConfirmScreen(source_term=ent.source_term)
-        self.app.push_screen(
-            modal, _make_delete_callback(self, ent.id, ent.source_term)
-        )
+        label = ent.source_term or ent.target_term
+        modal = DeleteConfirmScreen(source_term=label)
+        self.app.push_screen(modal, _make_delete_callback(self, ent.id, label))
 
     def apply_delete(self, entry_id: str, source_term: str, confirmed: bool) -> None:
         if not confirmed:
@@ -657,8 +740,9 @@ class GlossaryScreen(Screen[None]):
         ent = self._highlighted_entry()
         if ent is None:
             return
+        label = ent.source_term or ent.target_term
         if ent.status == status:
-            self._set_status(f"{ent.source_term!r} already {status}.")
+            self._set_status(f"{label!r} already {status}.")
             return
         repo.update_glossary_entry(
             self._project.engine,
@@ -673,16 +757,29 @@ class GlossaryScreen(Screen[None]):
             payload={
                 "entry_id": ent.id,
                 "source_term": ent.source_term,
+                "target_term": ent.target_term,
                 "from": ent.status,
                 "to": status,
             },
         )
         self._refresh_entries()
-        self._set_status(f"{ent.source_term!r} → {status}.")
+        self._set_status(f"{label!r} → {status}.")
 
     def action_cascade(self) -> None:
         ent = self._highlighted_entry()
         if ent is None:
+            return
+        if not self._cascade_enabled:
+            self._set_status(
+                "Cascade is disabled in the Lore Book editor "
+                "(no chapters/segments to re-translate)."
+            )
+            return
+        if ent.source_term is None:
+            self._set_status(
+                "Target-only entries can't trigger a cascade — "
+                "the source term is unknown."
+            )
             return
         candidates = compute_affected(
             self._project.engine,
@@ -730,7 +827,8 @@ class GlossaryScreen(Screen[None]):
         except Exception as exc:
             self.post_message(CascadeFailed(str(exc)))
             return
-        self.post_message(CascadeFinished(count=count, source_term=entry.source_term))
+        label = entry.source_term or entry.target_term
+        self.post_message(CascadeFinished(count=count, source_term=label))
 
     @on(CascadeFinished)
     def _handle_cascade_finished(self, message: CascadeFinished) -> None:

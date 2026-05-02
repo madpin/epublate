@@ -33,7 +33,12 @@ from epublate.glossary.models import (
 
 
 class ProjectRow(BaseModel):
-    """Plain projection of a row in the ``project`` table."""
+    """Plain projection of a row in the ``project`` table.
+
+    ``kind`` discriminates regular translation projects (``"book"``)
+    from Lore Book projects (``"lore"``). Defaults to ``"book"`` so
+    legacy DBs (where the column is implicit) keep behaving identically.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -45,7 +50,9 @@ class ProjectRow(BaseModel):
     style_guide: str | None = None
     style_profile: str | None = None
     budget_usd: float | None = None
+    llm_overrides: str | None = None
     created_at: int
+    kind: str = "book"
 
 
 class EventRow(BaseModel):
@@ -179,6 +186,7 @@ def create_project(
     budget_usd: float | None = None,
     project_id: str | None = None,
     created_at: int | None = None,
+    kind: str = schema.ProjectKind.BOOK,
 ) -> ProjectRow:
     row = ProjectRow(
         id=project_id or _new_id(),
@@ -190,6 +198,7 @@ def create_project(
         style_profile=style_profile,
         budget_usd=budget_usd,
         created_at=created_at or _now_unix(),
+        kind=kind,
     )
     stmt = insert(schema.project).values(**row.model_dump())
     with _begin(engine_or_conn) as conn:
@@ -203,14 +212,43 @@ def get_project(
     stmt = select(schema.project).where(schema.project.c.id == project_id)
     with _begin(engine_or_conn) as conn:
         result = conn.execute(stmt).mappings().first()
-    return ProjectRow(**dict(result)) if result is not None else None
+    return _project_row_from_mapping(dict(result)) if result is not None else None
 
 
-def list_projects(engine_or_conn: Engine | Connection) -> list[ProjectRow]:
+def list_projects(
+    engine_or_conn: Engine | Connection,
+    *,
+    kind: str | None = None,
+) -> list[ProjectRow]:
+    """List projects in newest-first order, optionally filtered by kind.
+
+    ``kind=None`` returns every row — the historical behaviour, kept
+    so callers that don't yet know about Lore Books continue to work.
+    Callers that want only translation projects pass
+    ``kind=ProjectKind.BOOK``; the LoreBooksScreen passes
+    ``kind=ProjectKind.LORE``.
+    """
+
     stmt = select(schema.project).order_by(schema.project.c.created_at.desc())
+    if kind is not None:
+        stmt = stmt.where(schema.project.c.kind == kind)
     with _begin(engine_or_conn) as conn:
         rows = conn.execute(stmt).mappings().all()
-    return [ProjectRow(**dict(r)) for r in rows]
+    return [_project_row_from_mapping(dict(r)) for r in rows]
+
+
+def _project_row_from_mapping(row: dict[str, Any]) -> ProjectRow:
+    """Build a :class:`ProjectRow` while tolerating legacy-shape rows.
+
+    Pre-migration DBs may not have ``kind``; we default it to
+    ``"book"`` so an upgrade-in-place doesn't fail in the (brief)
+    window between the column being added and the row being backfilled.
+    """
+
+    payload = dict(row)
+    if "kind" not in payload or payload["kind"] is None:
+        payload["kind"] = schema.ProjectKind.BOOK
+    return ProjectRow(**payload)
 
 
 def update_project_style(
@@ -260,6 +298,137 @@ def update_project_style(
                 "prev_guide_set": prev_guide is not None,
                 "new_guide_set": style_guide is not None,
             },
+        )
+        refreshed = (
+            conn.execute(
+                select(schema.project).where(schema.project.c.id == project_id)
+            )
+            .mappings()
+            .first()
+        )
+    assert refreshed is not None
+    return ProjectRow(**dict(refreshed))
+
+
+def get_llm_overrides(
+    engine_or_conn: Engine | Connection,
+    project_id: str,
+) -> dict[str, Any]:
+    """Decode the ``project.llm_overrides`` JSON blob to a plain dict.
+
+    Returns an empty dict when the column is ``NULL`` (the common case)
+    or when the stored value is not a JSON object — the Settings panel
+    falls back to env-var defaults in either case so a corrupted
+    override row degrades gracefully.
+    """
+
+    row = get_project(engine_or_conn, project_id)
+    if row is None or not row.llm_overrides:
+        return {}
+    try:
+        decoded = json.loads(row.llm_overrides)
+    except json.JSONDecodeError:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def set_llm_overrides(
+    engine_or_conn: Engine | Connection,
+    *,
+    project_id: str,
+    overrides: dict[str, Any] | None,
+) -> ProjectRow:
+    """Persist ``overrides`` (or clear them when ``None``).
+
+    Stores the dict as a JSON string so we can grow keys without a
+    schema migration. The corresponding ``project.llm_overrides_changed``
+    event is appended in the same transaction so the audit log can
+    surface model swaps in the activity feed.
+    """
+
+    payload: str | None
+    if overrides is None or not overrides:
+        payload = None
+    else:
+        payload = json.dumps(overrides, sort_keys=True, ensure_ascii=False)
+
+    with _begin(engine_or_conn) as conn:
+        existing = (
+            conn.execute(
+                select(schema.project).where(schema.project.c.id == project_id)
+            )
+            .mappings()
+            .first()
+        )
+        if existing is None:
+            raise ValueError(f"project not found: {project_id}")
+        prev_raw = existing["llm_overrides"]
+        conn.execute(
+            update(schema.project)
+            .where(schema.project.c.id == project_id)
+            .values(llm_overrides=payload)
+        )
+        append_event(
+            conn,
+            project_id=project_id,
+            kind="project.llm_overrides_changed",
+            payload={
+                "prev_set": bool(prev_raw),
+                "new_set": payload is not None,
+            },
+        )
+        refreshed = (
+            conn.execute(
+                select(schema.project).where(schema.project.c.id == project_id)
+            )
+            .mappings()
+            .first()
+        )
+    assert refreshed is not None
+    return ProjectRow(**dict(refreshed))
+
+
+def update_project_name(
+    engine_or_conn: Engine | Connection,
+    *,
+    project_id: str,
+    name: str,
+) -> ProjectRow:
+    """Rename a project, recording the change as an audit event.
+
+    The Settings screen exposes this as an editable field so curators
+    can fix typos without re-creating the project. Empty / whitespace-
+    only names are rejected — a blank name would render as a void row
+    on the recents list.
+    """
+
+    if not name or not name.strip():
+        raise ValueError("name must be non-empty")
+    new_name = name.strip()
+
+    with _begin(engine_or_conn) as conn:
+        existing = (
+            conn.execute(
+                select(schema.project).where(schema.project.c.id == project_id)
+            )
+            .mappings()
+            .first()
+        )
+        if existing is None:
+            raise ValueError(f"project not found: {project_id}")
+        prev = str(existing["name"])
+        if prev == new_name:
+            return ProjectRow(**dict(existing))
+        conn.execute(
+            update(schema.project)
+            .where(schema.project.c.id == project_id)
+            .values(name=new_name)
+        )
+        append_event(
+            conn,
+            project_id=project_id,
+            kind="project.renamed",
+            payload={"prev_name": prev, "new_name": new_name},
         )
         refreshed = (
             conn.execute(
@@ -631,12 +800,30 @@ def find_llm_call_by_cache_key(
 def list_llm_calls(
     engine_or_conn: Engine | Connection,
     project_id: str,
+    *,
+    limit: int | None = None,
+    descending: bool = False,
 ) -> list[LLMCallRow]:
+    """List ``llm_call`` rows for the project (defaults to ascending, full list).
+
+    The Dashboard's LLM activity panel uses ``limit + descending=True``
+    to get the most recent N calls cheaply; everywhere else (cost
+    rollups, snapshot reconciliation) keeps the original ascending /
+    unbounded contract.
+    """
+
+    order_col = (
+        schema.llm_call.c.created_at.desc()
+        if descending
+        else schema.llm_call.c.created_at.asc()
+    )
     stmt = (
         select(schema.llm_call)
         .where(schema.llm_call.c.project_id == project_id)
-        .order_by(schema.llm_call.c.created_at.asc())
+        .order_by(order_col)
     )
+    if limit is not None and limit > 0:
+        stmt = stmt.limit(limit)
     with _begin(engine_or_conn) as conn:
         rows = conn.execute(stmt).mappings().all()
     return [
@@ -695,11 +882,18 @@ def list_events(engine_or_conn: Engine | Connection, project_id: str) -> list[Ev
 
 
 def _glossary_entry_from_row(row: dict[str, Any]) -> GlossaryEntry:
+    raw_source_term = row.get("source_term")
+    source_term = str(raw_source_term) if raw_source_term is not None else None
+    raw_known = row.get("source_known")
+    # Legacy DBs that haven't run migration 0005 yet have no
+    # ``source_known`` column; treat the row as source-known so the
+    # validator keeps its pre-Lore-Book hard-fail behaviour.
+    source_known = True if raw_known is None else bool(int(raw_known))
     return GlossaryEntry(
         id=str(row["id"]),
         project_id=str(row["project_id"]),
         type=str(row["type"]),  # type: ignore[arg-type]
-        source_term=str(row["source_term"]),
+        source_term=source_term,
         target_term=str(row["target_term"]),
         gender=(str(row["gender"]) if row["gender"] is not None else None),  # type: ignore[arg-type]
         status=str(row["status"]),  # type: ignore[arg-type]
@@ -711,6 +905,7 @@ def _glossary_entry_from_row(row: dict[str, Any]) -> GlossaryEntry:
         ),
         created_at=int(row["created_at"]),
         updated_at=int(row["updated_at"]),
+        source_known=source_known,
     )
 
 
@@ -718,7 +913,7 @@ def create_glossary_entry(
     engine_or_conn: Engine | Connection,
     *,
     project_id: str,
-    source_term: str,
+    source_term: str | None,
     target_term: str,
     type: EntityType = "term",
     status: GlossaryStatusLiteral = "proposed",
@@ -730,13 +925,28 @@ def create_glossary_entry(
     entry_id: str | None = None,
     created_at: int | None = None,
     updated_at: int | None = None,
+    source_known: bool | None = None,
 ) -> GlossaryEntry:
     """Insert one glossary entry plus its aliases in a single transaction.
 
     The aliases are de-duplicated against the canonical term (a source
     alias equal to ``source_term`` is dropped — the matcher already checks
     the canonical term separately) and within their own side.
+
+    When ``source_term`` is ``None`` (target-only Lore Book entry), the
+    caller must pass either ``source_known=False`` explicitly or rely on
+    the auto-derived default (``False`` when no source spelling is
+    provided). Project-DB callers should always pass a string
+    ``source_term`` — the existing pipeline never produces ``None``.
     """
+
+    if source_known is None:
+        source_known = source_term is not None
+    if source_term is None and source_known:
+        raise ValueError(
+            "source_known=True requires a non-empty source_term; "
+            "for target-only Lore Book entries pass source_known=False"
+        )
 
     now = _now_unix()
     entry = GlossaryEntry(
@@ -751,11 +961,16 @@ def create_glossary_entry(
         first_seen_segment_id=first_seen_segment_id,
         created_at=created_at or now,
         updated_at=updated_at or created_at or now,
+        source_known=source_known,
     )
-    insert_entry = insert(schema.glossary_entry).values(**entry.model_dump())
+    payload = entry.model_dump()
+    payload["source_known"] = 1 if entry.source_known else 0
+    insert_entry = insert(schema.glossary_entry).values(**payload)
 
     src_set: list[str] = []
-    seen_src: set[str] = {source_term}
+    seen_src: set[str] = set()
+    if source_term:
+        seen_src.add(source_term)
     for alias in source_aliases:
         if alias and alias not in seen_src:
             seen_src.add(alias)
@@ -1244,6 +1459,227 @@ def list_segments_for_project(
     return out
 
 
+class AttachedLoreRow(BaseModel):
+    """One row in ``attached_lore`` (PRD §4.3 / F-LB-10 phase 3).
+
+    ``priority`` is a stable, low-first order: 0 is "first to apply",
+    higher numbers fall back. ``mode`` is ``read_only`` by default;
+    ``writable`` makes the Lore Book a write-back target for new
+    auto-proposed entries (the pipeline picks the highest-priority
+    writable Lore Book).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    project_id: str
+    lore_path: str
+    mode: str = schema.AttachedLoreMode.READ_ONLY
+    priority: int = 0
+    attached_at: int = 0
+
+
+def list_attached_lore(
+    engine_or_conn: Engine | Connection, *, project_id: str
+) -> list[AttachedLoreRow]:
+    """Return attached Lore Books in priority-ascending, attached-at-tiebreak order."""
+
+    stmt = (
+        select(schema.attached_lore)
+        .where(schema.attached_lore.c.project_id == project_id)
+        .order_by(
+            schema.attached_lore.c.priority.asc(),
+            schema.attached_lore.c.attached_at.asc(),
+        )
+    )
+    with _begin(engine_or_conn) as conn:
+        rows = conn.execute(stmt).mappings().all()
+    return [AttachedLoreRow(**dict(r)) for r in rows]
+
+
+def attach_lore_book(
+    engine_or_conn: Engine | Connection,
+    *,
+    project_id: str,
+    lore_path: str,
+    mode: str = schema.AttachedLoreMode.READ_ONLY,
+    priority: int | None = None,
+) -> AttachedLoreRow:
+    """Attach a Lore Book to ``project_id``.
+
+    Idempotent on ``(project_id, lore_path)``: re-attaching an existing
+    Lore Book updates its ``mode``/``priority`` instead of failing on
+    the unique constraint. ``priority=None`` appends to the end of the
+    list (max + 1).
+    """
+
+    if mode not in (
+        schema.AttachedLoreMode.READ_ONLY,
+        schema.AttachedLoreMode.WRITABLE,
+    ):
+        raise ValueError(f"unknown attached_lore mode: {mode!r}")
+    with _begin(engine_or_conn) as conn:
+        existing = (
+            conn.execute(
+                select(schema.attached_lore).where(
+                    schema.attached_lore.c.project_id == project_id,
+                    schema.attached_lore.c.lore_path == lore_path,
+                )
+            )
+            .mappings()
+            .first()
+        )
+        if existing is not None:
+            new_priority = (
+                priority if priority is not None else int(existing["priority"])
+            )
+            conn.execute(
+                update(schema.attached_lore)
+                .where(schema.attached_lore.c.id == existing["id"])
+                .values(mode=mode, priority=new_priority)
+            )
+            refreshed = (
+                conn.execute(
+                    select(schema.attached_lore).where(
+                        schema.attached_lore.c.id == existing["id"]
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            assert refreshed is not None
+            return AttachedLoreRow(**dict(refreshed))
+
+        if priority is None:
+            max_row = (
+                conn.execute(
+                    select(schema.attached_lore.c.priority)
+                    .where(schema.attached_lore.c.project_id == project_id)
+                    .order_by(schema.attached_lore.c.priority.desc())
+                    .limit(1)
+                )
+                .scalars()
+                .first()
+            )
+            priority = (int(max_row) + 1) if max_row is not None else 0
+
+        row = AttachedLoreRow(
+            id=_new_id(),
+            project_id=project_id,
+            lore_path=lore_path,
+            mode=mode,
+            priority=int(priority),
+            attached_at=_now_unix(),
+        )
+        conn.execute(insert(schema.attached_lore).values(row.model_dump()))
+        append_event(
+            conn,
+            project_id=project_id,
+            kind="lore.attached",
+            payload={
+                "lore_path": lore_path,
+                "mode": mode,
+                "priority": int(priority),
+            },
+        )
+        return row
+
+
+def detach_lore_book(
+    engine_or_conn: Engine | Connection,
+    *,
+    project_id: str,
+    lore_path: str,
+) -> bool:
+    """Detach a Lore Book by its on-disk path. Returns ``True`` if a row was removed."""
+
+    with _begin(engine_or_conn) as conn:
+        result = conn.execute(
+            delete(schema.attached_lore).where(
+                schema.attached_lore.c.project_id == project_id,
+                schema.attached_lore.c.lore_path == lore_path,
+            )
+        )
+        removed = (result.rowcount or 0) > 0
+        if removed:
+            append_event(
+                conn,
+                project_id=project_id,
+                kind="lore.detached",
+                payload={"lore_path": lore_path},
+            )
+        return removed
+
+
+def update_attached_lore(
+    engine_or_conn: Engine | Connection,
+    *,
+    project_id: str,
+    lore_path: str,
+    mode: str | None = None,
+    priority: int | None = None,
+) -> AttachedLoreRow | None:
+    """Patch the mode and/or priority of an attached Lore Book row.
+
+    Returns the refreshed row, or ``None`` when the attachment doesn't
+    exist. Either ``mode`` or ``priority`` must be supplied — passing
+    both ``None`` is a no-op that returns the current row unchanged.
+    """
+
+    if mode is None and priority is None:
+        # Defer to ``list_attached_lore`` rather than reimplementing
+        # the lookup; this preserves the no-op semantics cleanly.
+        for row in list_attached_lore(engine_or_conn, project_id=project_id):
+            if row.lore_path == lore_path:
+                return row
+        return None
+    if mode is not None and mode not in (
+        schema.AttachedLoreMode.READ_ONLY,
+        schema.AttachedLoreMode.WRITABLE,
+    ):
+        raise ValueError(f"unknown attached_lore mode: {mode!r}")
+    with _begin(engine_or_conn) as conn:
+        values: dict[str, Any] = {}
+        if mode is not None:
+            values["mode"] = mode
+        if priority is not None:
+            values["priority"] = int(priority)
+        if not values:
+            return None
+        result = conn.execute(
+            update(schema.attached_lore)
+            .where(
+                schema.attached_lore.c.project_id == project_id,
+                schema.attached_lore.c.lore_path == lore_path,
+            )
+            .values(**values)
+        )
+        if (result.rowcount or 0) == 0:
+            return None
+        refreshed = (
+            conn.execute(
+                select(schema.attached_lore).where(
+                    schema.attached_lore.c.project_id == project_id,
+                    schema.attached_lore.c.lore_path == lore_path,
+                )
+            )
+            .mappings()
+            .first()
+        )
+        assert refreshed is not None
+        append_event(
+            conn,
+            project_id=project_id,
+            kind="lore.attachment_updated",
+            payload={
+                "lore_path": lore_path,
+                "mode": refreshed["mode"],
+                "priority": refreshed["priority"],
+            },
+        )
+        return AttachedLoreRow(**dict(refreshed))
+
+
 class _Begin:
     """Context manager that yields a connection with an active transaction.
 
@@ -1286,6 +1722,7 @@ __all__ = [
     "find_glossary_entry_by_source_term",
     "find_llm_call_by_cache_key",
     "get_glossary_entry",
+    "get_llm_overrides",
     "get_project",
     "get_segment",
     "insert_llm_call",
@@ -1304,8 +1741,10 @@ __all__ = [
     "segment_row_from",
     "segment_row_to",
     "set_aliases",
+    "set_llm_overrides",
     "update_glossary_entry",
     "update_project_budget",
+    "update_project_name",
     "update_project_style",
     "update_segment_status",
     "update_segment_translation",

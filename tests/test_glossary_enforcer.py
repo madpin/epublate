@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from epublate.glossary.enforcer import (
     build_constraints,
+    build_target_only_constraints,
     glossary_hash,
     has_locked_violation,
     validate_target,
@@ -12,7 +13,7 @@ from epublate.glossary.models import GlossaryEntry, GlossaryEntryWithAliases
 
 
 def _entry(
-    source: str,
+    source: str | None,
     target: str,
     *,
     status: str = "confirmed",
@@ -20,6 +21,7 @@ def _entry(
     tgt_aliases: list[str] | None = None,
     eid: str = "e1",
     notes: str | None = None,
+    source_known: bool | None = None,
 ) -> GlossaryEntryWithAliases:
     return GlossaryEntryWithAliases(
         entry=GlossaryEntry(
@@ -30,6 +32,7 @@ def _entry(
             target_term=target,
             status=status,  # type: ignore[arg-type]
             notes=notes,
+            source_known=source is not None if source_known is None else source_known,
         ),
         source_aliases=src_aliases or [],
         target_aliases=tgt_aliases or [],
@@ -143,3 +146,84 @@ def test_glossary_hash_stable_across_id_change() -> None:
     a = [_entry("Élise", "Elisa", eid="a")]
     b = [_entry("Élise", "Elisa", eid="other-id")]
     assert glossary_hash(a) == glossary_hash(b)
+
+
+def test_build_constraints_skips_target_only_entries() -> None:
+    entries = [
+        _entry("Élise", "Elisa", status="locked", eid="src"),
+        _entry(None, "Geralt de Rívia", status="locked", eid="tgt"),
+    ]
+    out = build_constraints(entries)
+    assert [c.source_term for c in out] == ["Élise"]
+
+
+def test_build_target_only_constraints_filters_and_sorts() -> None:
+    entries = [
+        _entry(None, "Vesemir", status="confirmed", eid="b"),
+        _entry(None, "Geralt", status="locked", eid="a", notes="protagonist"),
+        _entry("source-keyed", "should-skip", status="locked", eid="c"),
+        _entry(None, "Triss", status="proposed", eid="d"),
+    ]
+    out = build_target_only_constraints(entries)
+    assert [c.target_term for c in out] == ["Geralt", "Vesemir"]
+    assert out[0].status == "locked"
+    assert out[0].notes == "protagonist"
+    assert out[1].status == "confirmed"
+
+
+def test_build_target_only_constraints_preserves_target_aliases() -> None:
+    entries = [
+        _entry(
+            None,
+            "Vesemir",
+            status="locked",
+            eid="a",
+            tgt_aliases=["velho lobo", "mestre"],
+        ),
+    ]
+    out = build_target_only_constraints(entries)
+    assert out[0].target_aliases == ("mestre", "velho lobo")
+
+
+def test_validate_target_only_locked_is_warning_not_error() -> None:
+    entries = [
+        _entry(
+            "Geralt",
+            "Geralt de Rívia",
+            status="locked",
+            source_known=False,
+            eid="t1",
+        ),
+    ]
+    violations = validate_target(
+        source_text="Geralt walked away.",
+        target_text="Some other guy walked away.",
+        entries=entries,
+    )
+    assert len(violations) == 1
+    assert violations[0].severity == "warning"
+    assert not has_locked_violation(violations)
+
+
+def test_validate_target_only_satisfied_when_canonical_target_present() -> None:
+    entries = [
+        _entry(
+            "Geralt",
+            "Geralt de Rívia",
+            status="locked",
+            source_known=False,
+            eid="t1",
+        ),
+    ]
+    violations = validate_target(
+        source_text="Geralt walked away.",
+        target_text="Geralt de Rívia se afastou.",
+        entries=entries,
+    )
+    assert violations == []
+
+
+def test_glossary_hash_changes_with_source_known_flag() -> None:
+    a = [_entry("Élise", "Elisa", eid="a", source_known=True)]
+    b = [_entry("Élise", "Elisa", eid="a", source_known=False)]
+    assert glossary_hash(a) != glossary_hash(b)

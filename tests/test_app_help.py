@@ -74,3 +74,53 @@ async def test_help_modal_opens_on_f1(
             assert isinstance(pilot.app.screen, HelpScreen)
     finally:
         project.close()
+
+
+@pytest.mark.asyncio
+async def test_help_modal_renders_concept_tabs(
+    tiny_epub_factory: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Each Markdown tab is loaded from the help package and mounted."""
+
+    from textual.widgets import Markdown
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    try:
+        screen = DashboardScreen(project, provider_factory=MockLLMProvider)
+        app = EpublateApp(initial_screen=screen, config_path=tmp_path / "ui.toml")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("?")
+            await pilot.pause()
+            help_screen = pilot.app.screen
+            assert isinstance(help_screen, HelpScreen)
+            for slug in ("concepts", "workflows", "troubleshooting", "keys"):
+                widget = help_screen.query_one(f"#help-md-{slug}", Markdown)
+                # ``Markdown`` exposes the parsed source via the
+                # ``code`` attribute on text nodes; checking ``markdown``
+                # data on the widget level keeps the test resilient to
+                # rendering changes in Textual.
+                source = getattr(widget, "_markdown", None) or getattr(
+                    widget, "markdown", ""
+                )
+                assert source, f"help-md-{slug} should carry markdown"
+    finally:
+        project.close()
+
+
+def test_help_text_loader_round_trips() -> None:
+    """``help_text`` returns the file contents verbatim."""
+
+    from epublate.app.help import help_text
+
+    body = help_text("concepts")
+    assert "Concepts" in body
+    assert "lore bible" in body.lower()
+
+
+def test_help_text_loader_raises_on_missing_slug() -> None:
+    from epublate.app.help import help_text
+
+    with pytest.raises(FileNotFoundError):
+        help_text("does-not-exist")

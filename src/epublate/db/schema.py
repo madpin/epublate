@@ -75,7 +75,21 @@ project = Table(
     Column("style_guide", Text, nullable=True),
     Column("style_profile", Text, nullable=True),
     Column("budget_usd", Float, nullable=True),
+    # Per-project overrides for LLM endpoint / models. Stored as a JSON
+    # blob (see ``epublate.db.repo.set_llm_overrides``) so we don't
+    # churn the schema for each new knob the Settings panel exposes.
+    Column("llm_overrides", Text, nullable=True),
     Column("created_at", Integer, nullable=False),
+    # Discriminator between regular translation projects (``"book"``)
+    # and Lore Book projects (``"lore"``). The Lore Book carries its
+    # own glossary tables — same FKs, different lifecycle (no
+    # chapters/segments). See PRD F-LB-10.
+    Column(
+        "kind",
+        Text,
+        nullable=False,
+        server_default="book",
+    ),
 )
 
 chapter = Table(
@@ -125,7 +139,13 @@ glossary_entry = Table(
         nullable=False,
     ),
     Column("type", Text, nullable=False),
-    Column("source_term", Text, nullable=False),
+    # ``source_term`` is nullable to accommodate target-only Lore Book
+    # entries (PRD F-LB-3 / Phase 3): a curator can lock the canonical
+    # *target* form for a proper noun without yet knowing its source-side
+    # spelling, and the translator picks up the source mapping on the fly.
+    # Project-scoped entries continue to require a source term — the
+    # repo layer enforces that boundary.
+    Column("source_term", Text, nullable=True),
     Column("target_term", Text, nullable=False),
     Column("gender", Text, nullable=True),
     Column("status", Text, nullable=False),
@@ -138,6 +158,17 @@ glossary_entry = Table(
     ),
     Column("created_at", Integer, nullable=False),
     Column("updated_at", Integer, nullable=False),
+    # ``source_known`` defaults to true; the migration backfills every
+    # existing row to true so legacy projects keep behaving identically.
+    # Setting it false implies the entry is target-only and the
+    # validator should treat the locked status as a *soft* lock
+    # (warn-only) per F-LB-9.
+    Column(
+        "source_known",
+        Integer,
+        nullable=False,
+        server_default="1",
+    ),
 )
 
 glossary_alias = Table(
@@ -247,6 +278,123 @@ event = Table(
 )
 
 
+# Lore Book extension tables — coexist with the project schema so a
+# Lore Book DB and a translation-project DB share the same migrations.
+# A regular translation project never inserts rows here.
+lore_meta = Table(
+    "lore_meta",
+    metadata,
+    Column(
+        "project_id",
+        Text,
+        ForeignKey("project.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("description", Text, nullable=True),
+    Column("schema_version", Integer, nullable=False, server_default="1"),
+    Column(
+        "default_proposal_kind",
+        Text,
+        nullable=False,
+        server_default="target",
+    ),
+    Column("created_at", Integer, nullable=False),
+    Column("updated_at", Integer, nullable=False),
+)
+
+
+lore_source = Table(
+    "lore_source",
+    metadata,
+    Column("id", Text, primary_key=True),
+    Column(
+        "project_id",
+        Text,
+        ForeignKey("project.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("kind", Text, nullable=False),
+    Column("epub_path", Text, nullable=False),
+    Column("status", Text, nullable=False, server_default="ingested"),
+    Column("entries_added", Integer, nullable=False, server_default="0"),
+    Column("notes", Text, nullable=True),
+    Column("ingested_at", Integer, nullable=False),
+)
+
+Index(
+    "ix_lore_source_project_id",
+    lore_source.c.project_id,
+)
+
+
+# ``attached_lore`` rows live in a *project* DB and point at on-disk
+# Lore Book directories (PRD §4.3 / F-LB-10 phase 3). The pipeline
+# reads them at translate-time to merge in canonical proper-noun rules,
+# and write-backs are routed to the highest-priority writable Lore Book.
+# Lower ``priority`` means the entry "wins" earlier when merging — this
+# matches the user's mental model ("first in the list = most authoritative").
+attached_lore = Table(
+    "attached_lore",
+    metadata,
+    Column("id", Text, primary_key=True),
+    Column(
+        "project_id",
+        Text,
+        ForeignKey("project.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("lore_path", Text, nullable=False),
+    Column("mode", Text, nullable=False, server_default="read_only"),
+    Column("priority", Integer, nullable=False, server_default="0"),
+    Column("attached_at", Integer, nullable=False),
+    UniqueConstraint("project_id", "lore_path", name="attached_lore_project_path"),
+)
+
+Index(
+    "ix_attached_lore_project_id",
+    attached_lore.c.project_id,
+)
+
+
+class AttachedLoreMode:
+    """``attached_lore.mode`` enum (PRD §4.3 / F-LB-10 phase 3).
+
+    Read-only attachments contribute glossary entries to the merged
+    pipeline view but never receive new proposals. Writable attachments
+    additionally accept auto-proposed entries from the helper pre-pass
+    so the Lore Book accumulates lore across an entire series.
+    """
+
+    READ_ONLY = "read_only"
+    WRITABLE = "writable"
+
+
+class LoreSourceKind:
+    """``lore_source.kind`` enum (PRD F-LB-10)."""
+
+    SOURCE = "source"
+    TARGET = "target"
+
+
+class LoreSourceStatus:
+    """``lore_source.status`` enum."""
+
+    INGESTED = "ingested"
+    FAILED = "failed"
+
+
+class ProjectKind:
+    """``project.kind`` enum.
+
+    A regular translation project is ``BOOK``; a Lore Book project
+    carries the same glossary schema but no chapters / segments and
+    uses :data:`LORE` to mark itself.
+    """
+
+    BOOK = "book"
+    LORE = "lore"
+
+
 ALL_TABLES: tuple[Table, ...] = (
     project,
     chapter,
@@ -258,15 +406,23 @@ ALL_TABLES: tuple[Table, ...] = (
     llm_call,
     embedding,
     event,
+    lore_meta,
+    lore_source,
+    attached_lore,
 )
 
 
 __all__ = [
     "ALL_TABLES",
     "NAMING_CONVENTION",
+    "AttachedLoreMode",
     "ChapterStatus",
     "GlossaryStatus",
+    "LoreSourceKind",
+    "LoreSourceStatus",
+    "ProjectKind",
     "SegmentStatus",
+    "attached_lore",
     "chapter",
     "embedding",
     "entity_mention",
@@ -275,6 +431,8 @@ __all__ = [
     "glossary_entry",
     "glossary_revision",
     "llm_call",
+    "lore_meta",
+    "lore_source",
     "metadata",
     "project",
     "segment",

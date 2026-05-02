@@ -1,35 +1,31 @@
-"""Settings screen — LLM config + UI prefs + style guide (PRD §4.6 / M6).
+"""Settings screen — tabbed layout with editable per-project + per-machine prefs.
 
-Most of the screen is read-only: the user-editable settings already live
-elsewhere (the project's budget on the Dashboard, LLM config in
-environment variables, theme via the ``T`` keystroke). The screen's
-job is to make the *current* values discoverable in one place — so the
-curator can answer "which model is wired up?" and "is my API key
-actually visible?" without leaving the TUI.
+Layout (PRD §4.6 / M6):
 
-The one exception is the **Style guide** panel (PRD F-STYLE-2): the
-curator picks a tone preset at New Project time, and the Settings
-screen lets them swap presets or edit the prompt prose later via
-``E`` → :class:`StyleEditModal`. Changing the style invalidates the
-translator cache automatically (the system-prompt hash is part of every
-cache key per PRD F-LLM-6) so the next batch picks up the new voice
-without any extra plumbing.
+* **Project** — editable name, language pair (read-only), budget cap,
+  style guide modal entry.
+* **LLM** — per-project overrides for base URL, translator model, helper
+  model. The API key stays env-only (invariant 5) and is shown
+  redacted; we never persist it on the project row.
+* **UI** — theme dropdown (cycles with ``T`` globally), auto tone-sniff
+  toggle (PRD F-STYLE-4), config file path.
+* **Intake** — global defaults for the helper-LLM intake pass: helper
+  model, max segments, "run after new project" preference. Persists to
+  :class:`~epublate.app.config.UIConfig` so the IntakeModal and
+  NewProjectModal both pick them up automatically.
+* **Concurrency** — global defaults for the batch worker: concurrency,
+  retries.
 
-The screen also owns the **auto tone-sniff** toggle (PRD F-STYLE-4):
-``A`` flips :attr:`UIConfig.auto_tone_sniff`, persists the new value,
-and the change applies the next time the curator opens the New Project
-modal. ``EPUBLATE_AUTO_TONE_SNIFF`` overrides the persisted value at
-runtime; the panel labels it accordingly so the curator knows when an
-env var is winning.
+The screen reads its in-memory :class:`UIConfig` snapshot at
+construction time; the Dashboard now passes both ``ui_config`` and
+``config_path`` so an edit on the Settings screen round-trips back
+to the Dashboard's view (previously the Dashboard re-loaded UIConfig
+from disk on close, which would silently drop unsaved tweaks).
 
-Inputs:
-
-* ``project`` — the active :class:`epublate.core.project.Project`. We
-  read the budget cap, language pair, and style guide from here.
-* ``ui_config`` — the persisted :class:`epublate.app.config.UIConfig`
-  whose ``theme`` key tracks what the cycler last saved.
-* ``default_model`` — the translator model the Dashboard would dispatch
-  on a batch run.
+Backward-compatibility: the read-only Static IDs (``settings-project-body``,
+``settings-llm-body``, ``settings-style-body``, ``settings-ui-body``,
+``settings-help-body``) are preserved so the existing snapshot and pilot
+tests continue to query them by id even after the move into tab panes.
 """
 
 from __future__ import annotations
@@ -44,7 +40,19 @@ from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Button, Footer, Header, Label, Select, Static, TextArea
+from textual.widgets import (
+    Button,
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    Label,
+    Select,
+    Static,
+    TabbedContent,
+    TabPane,
+    TextArea,
+)
 
 from epublate.app.config import (
     ENV_AUTO_TONE_SNIFF,
@@ -60,6 +68,8 @@ from epublate.core.style import (
     label_for,
     list_profiles,
 )
+from epublate.db import repo
+from epublate.db.schema import AttachedLoreMode
 from epublate.llm.factory import (
     ENV_API_KEY,
     ENV_BASE_URL,
@@ -289,7 +299,7 @@ def _redact_api_key(raw: str | None) -> str:
 
 
 class SettingsScreen(Screen[None]):
-    """Configuration overview + tone editor (PRD §4.6 / M6 / F-STYLE-2)."""
+    """Configuration overview + tabbed editor (PRD §4.6 / M6 / F-STYLE-2)."""
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("e", "edit_style", "Edit style", show=True),
@@ -305,17 +315,61 @@ class SettingsScreen(Screen[None]):
     DEFAULT_CSS = """
     SettingsScreen #settings-body {
         height: 1fr;
-        padding: 1 2;
+        padding: 0 1 0 1;
     }
-    SettingsScreen .panel {
-        border: round $primary;
+    SettingsScreen TabbedContent {
+        height: 1fr;
+    }
+    SettingsScreen TabPane {
         padding: 1 2;
-        margin: 0 0 1 0;
-        height: auto;
     }
     SettingsScreen .panel-title {
         text-style: bold;
         padding: 0 0 1 0;
+        color: $primary;
+    }
+    SettingsScreen .panel-subtitle {
+        color: $text-muted;
+        padding: 0 0 1 0;
+    }
+    SettingsScreen .field-row {
+        height: auto;
+        padding: 0 0 1 0;
+    }
+    SettingsScreen .field-row Label {
+        width: 22;
+        content-align-vertical: middle;
+        padding: 1 1 0 0;
+    }
+    SettingsScreen .field-row Input {
+        width: 1fr;
+    }
+    SettingsScreen .field-row Select {
+        width: 1fr;
+        background: $surface;
+    }
+    SettingsScreen .summary-block {
+        height: auto;
+        margin: 1 0 1 0;
+        padding: 1 1;
+        border: round $primary 50%;
+        background: $boost;
+    }
+    SettingsScreen .panel-actions {
+        height: 3;
+        padding: 1 0 0 0;
+        align-horizontal: right;
+    }
+    SettingsScreen .panel-actions Button {
+        margin: 0 0 0 1;
+    }
+    SettingsScreen .info-banner {
+        height: auto;
+        padding: 1 1;
+        margin: 0 0 1 0;
+        border: round $accent;
+        background: $boost;
+        color: $text;
     }
     SettingsScreen #settings-status {
         dock: bottom;
@@ -342,34 +396,328 @@ class SettingsScreen(Screen[None]):
         self._config_path = config_path
         self._default_model = default_model
 
+    @property
+    def ui_config(self) -> UIConfig:
+        """Expose the in-memory snapshot so the Dashboard can re-read it."""
+
+        return self._ui_config
+
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
-        with VerticalScroll(id="settings-body"):
-            with Vertical(classes="panel", id="settings-project"):
-                yield Static("Project", classes="panel-title")
-                yield Static(self._project_block(), id="settings-project-body")
-            with Vertical(classes="panel", id="settings-style"):
-                yield Static(
-                    "Style guide  [dim](press [/dim][b]E[/b][dim] to edit)[/dim]",
-                    classes="panel-title",
-                    markup=True,
-                )
-                yield Static(self._style_block(), id="settings-style-body", markup=True)
-            with Vertical(classes="panel", id="settings-llm"):
-                yield Static("LLM endpoint", classes="panel-title")
-                yield Static(self._llm_block(), id="settings-llm-body", markup=False)
-            with Vertical(classes="panel", id="settings-ui"):
-                yield Static("UI preferences", classes="panel-title")
-                yield Static(self._ui_block(), id="settings-ui-body")
-            with Vertical(classes="panel", id="settings-help"):
-                yield Static("How to change settings", classes="panel-title")
-                yield Static(self._help_block(), id="settings-help-body")
+        with (
+            Vertical(id="settings-body"),
+            TabbedContent(id="settings-tabs", initial="tab-project"),
+        ):
+            yield from self._compose_project_tab()
+            yield from self._compose_llm_tab()
+            yield from self._compose_ui_tab()
+            yield from self._compose_intake_tab()
+            yield from self._compose_concurrency_tab()
+            yield from self._compose_lore_tab()
+            yield from self._compose_help_tab()
         yield Static(
             "E to edit style · A to toggle auto tone-sniff · "
-            "B (Dashboard) for budget · T for theme.",
+            "Tab to switch panels · click a Save button to persist edits.",
             id="settings-status",
         )
         yield Footer()
+
+    # ------------------------------------------------------------------
+    # Tab compose helpers
+    # ------------------------------------------------------------------
+
+    def _compose_project_tab(self) -> ComposeResult:
+        with TabPane("Project", id="tab-project"):
+            yield Label("Project metadata", classes="panel-title")
+            yield Label(
+                "Edit the project name and budget cap. Languages are pinned at "
+                "creation time — start a new project to switch them.",
+                classes="panel-subtitle",
+            )
+            with Horizontal(classes="field-row"):
+                yield Label("Display name:")
+                yield Input(
+                    value=self._project.name,
+                    placeholder="Project name",
+                    id="settings-project-name",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("Budget USD (blank = none):")
+                yield Input(
+                    value=self._initial_budget_text(),
+                    placeholder="e.g. 5.00",
+                    id="settings-project-budget",
+                )
+            with Horizontal(classes="panel-actions"):
+                yield Button(
+                    "Save project",
+                    id="settings-project-save",
+                    variant="primary",
+                )
+            with Vertical(classes="summary-block"):
+                yield Static(
+                    "Current values",
+                    classes="panel-subtitle",
+                )
+                yield Static(self._project_block(), id="settings-project-body")
+
+            yield Label("Style guide", classes="panel-title")
+            yield Label(
+                "Press [b]E[/b] to pick a tone preset or write your own paragraph. "
+                "Changes invalidate the translator cache automatically.",
+                classes="panel-subtitle",
+                markup=True,
+            )
+            with Vertical(classes="summary-block"):
+                yield Static(
+                    self._style_block(),
+                    id="settings-style-body",
+                    markup=True,
+                )
+
+    def _compose_llm_tab(self) -> ComposeResult:
+        with TabPane("LLM", id="tab-llm"):
+            yield Label("LLM endpoint overrides", classes="panel-title")
+            yield Label(
+                "These override the environment defaults for this project only. "
+                "Leave a field blank to fall back to the matching env variable.",
+                classes="panel-subtitle",
+            )
+            redacted = _redact_api_key(os.environ.get(ENV_API_KEY))
+            yield Static(
+                f"  API key stays env-only. Set [b]${ENV_API_KEY}[/b] in your "
+                f"shell or `.env`. Current: [b]{redacted}[/b].",
+                classes="info-banner",
+                markup=True,
+            )
+            overrides = self._project_overrides()
+            with Horizontal(classes="field-row"):
+                yield Label("Base URL:")
+                yield Input(
+                    value=str(overrides.get("base_url", "") or ""),
+                    placeholder=os.environ.get(ENV_BASE_URL)
+                    or "https://api.openai.com/v1",
+                    id="settings-llm-base-url",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("Translator model:")
+                yield Input(
+                    value=str(overrides.get("translator_model", "") or ""),
+                    placeholder=self._default_model
+                    or os.environ.get(ENV_MODEL)
+                    or "gpt-5-mini",
+                    id="settings-llm-translator-model",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("Helper model:")
+                yield Input(
+                    value=str(overrides.get("helper_model", "") or ""),
+                    placeholder=os.environ.get(ENV_HELPER_MODEL)
+                    or "(falls back to translator)",
+                    id="settings-llm-helper-model",
+                )
+            with Horizontal(classes="panel-actions"):
+                yield Button(
+                    "Clear overrides",
+                    id="settings-llm-clear",
+                    variant="default",
+                )
+                yield Button(
+                    "Save LLM",
+                    id="settings-llm-save",
+                    variant="primary",
+                )
+            with Vertical(classes="summary-block"):
+                yield Static("Effective values", classes="panel-subtitle")
+                yield Static(self._llm_block(), id="settings-llm-body")
+
+    def _compose_ui_tab(self) -> ComposeResult:
+        with TabPane("UI", id="tab-ui"):
+            yield Label("Interface preferences", classes="panel-title")
+            yield Label(
+                "Theme persists to ~/.config/epublate/ui.toml. "
+                "Press [b]T[/b] anywhere to cycle through the order shown below.",
+                classes="panel-subtitle",
+                markup=True,
+            )
+            theme_options: list[tuple[str, str]] = [
+                (t, t) for t in EPUBLATE_THEME_ORDER
+            ]
+            current_theme = self._current_theme()
+            with Horizontal(classes="field-row"):
+                yield Label("Theme:")
+                yield Select(
+                    options=theme_options,
+                    value=current_theme
+                    if current_theme in EPUBLATE_THEME_ORDER
+                    else EPUBLATE_THEME_ORDER[0],
+                    allow_blank=False,
+                    id="settings-ui-theme",
+                )
+            with Horizontal(classes="panel-actions"):
+                yield Button(
+                    "Save theme",
+                    id="settings-ui-save",
+                    variant="primary",
+                )
+            with Vertical(classes="summary-block"):
+                yield Static("Current state", classes="panel-subtitle")
+                yield Static(self._ui_block(), id="settings-ui-body")
+
+    def _compose_intake_tab(self) -> ComposeResult:
+        with TabPane("Intake", id="tab-intake"):
+            yield Label("Intake defaults", classes="panel-title")
+            yield Label(
+                "These pre-fill the IntakeModal and the New Project modal. "
+                "[b]Intake[/b] = scan source text for proper nouns and seed "
+                "the lore bible. No translation happens; just helper-LLM "
+                "extraction.",
+                classes="panel-subtitle",
+                markup=True,
+            )
+            with Horizontal(classes="field-row"):
+                yield Label("Helper model:")
+                yield Input(
+                    value=self._ui_config.intake_helper_model or "",
+                    placeholder=os.environ.get(ENV_HELPER_MODEL)
+                    or "(falls back to translator)",
+                    id="settings-intake-helper-model",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("Max segments:")
+                yield Input(
+                    value=str(self._ui_config.intake_max_segments),
+                    placeholder="30",
+                    id="settings-intake-max-segments",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("Run after new project:")
+                yield Input(
+                    value="y" if self._ui_config.intake_run_after_new else "n",
+                    id="settings-intake-run-after",
+                )
+            with Horizontal(classes="panel-actions"):
+                yield Button(
+                    "Save intake",
+                    id="settings-intake-save",
+                    variant="primary",
+                )
+            with Vertical(classes="summary-block"):
+                yield Static("Current defaults", classes="panel-subtitle")
+                yield Static(self._intake_block(), id="settings-intake-body")
+
+    def _compose_concurrency_tab(self) -> ComposeResult:
+        with TabPane("Concurrency", id="tab-concurrency"):
+            yield Label("Batch defaults", classes="panel-title")
+            yield Label(
+                "Pre-fills the BatchModal. Higher concurrency speeds up large "
+                "batches at the cost of more in-flight LLM tokens (and rate-limit "
+                "exposure).",
+                classes="panel-subtitle",
+            )
+            with Horizontal(classes="field-row"):
+                yield Label("Default concurrency:")
+                yield Input(
+                    value=str(self._ui_config.batch_concurrency),
+                    placeholder="1",
+                    id="settings-concurrency-batch",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("Default retry count:")
+                yield Input(
+                    value=str(self._ui_config.batch_retries),
+                    placeholder="1",
+                    id="settings-concurrency-retries",
+                )
+            with Horizontal(classes="panel-actions"):
+                yield Button(
+                    "Save concurrency",
+                    id="settings-concurrency-save",
+                    variant="primary",
+                )
+            with Vertical(classes="summary-block"):
+                yield Static("Current defaults", classes="panel-subtitle")
+                yield Static(self._concurrency_block(), id="settings-concurrency-body")
+
+    def _compose_lore_tab(self) -> ComposeResult:
+        with TabPane("Lore Books", id="tab-lore"):
+            yield Label("Attached Lore Books", classes="panel-title")
+            yield Label(
+                "Lore Books are portable lore bibles you can attach to this "
+                "project. Their [b]locked[/b] and [b]confirmed[/b] entries "
+                "merge into the translator's view (own > attached). A "
+                "[b]writable[/b] Lore Book also receives newly auto-proposed "
+                "entries during batch runs.",
+                classes="panel-subtitle",
+                markup=True,
+            )
+            with Horizontal(classes="field-row"):
+                yield Label("Lore Book path:")
+                yield Input(
+                    value="",
+                    id="settings-lore-path",
+                    placeholder="/path/to/whatever.epublate-lore",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("Mode:")
+                yield Select(
+                    options=[
+                        (AttachedLoreMode.READ_ONLY, AttachedLoreMode.READ_ONLY),
+                        (AttachedLoreMode.WRITABLE, AttachedLoreMode.WRITABLE),
+                    ],
+                    value=AttachedLoreMode.READ_ONLY,
+                    allow_blank=False,
+                    id="settings-lore-mode",
+                )
+            with Horizontal(classes="panel-actions"):
+                yield Button(
+                    "Detach selected",
+                    id="settings-lore-detach",
+                    variant="warning",
+                )
+                yield Button(
+                    "Toggle mode",
+                    id="settings-lore-toggle-mode",
+                    variant="default",
+                )
+                yield Button(
+                    "Move up",
+                    id="settings-lore-move-up",
+                    variant="default",
+                )
+                yield Button(
+                    "Move down",
+                    id="settings-lore-move-down",
+                    variant="default",
+                )
+                yield Button(
+                    "Attach",
+                    id="settings-lore-attach",
+                    variant="primary",
+                )
+            with Vertical(classes="summary-block"):
+                yield Static(
+                    "Currently attached (lower priority = applied first)",
+                    classes="panel-subtitle",
+                )
+                table: DataTable[str] = DataTable(
+                    id="settings-lore-table",
+                    zebra_stripes=True,
+                    cursor_type="row",
+                    show_header=True,
+                )
+                table.add_columns("Pri", "Mode", "Path")
+                yield table
+
+    def _compose_help_tab(self) -> ComposeResult:
+        with TabPane("Help", id="tab-help"):
+            yield Label("How to change settings", classes="panel-title")
+            with VerticalScroll():
+                yield Static(self._help_block(), id="settings-help-body")
+
+    # ------------------------------------------------------------------
+    # Mount + refresh
+    # ------------------------------------------------------------------
 
     def on_mount(self) -> None:
         self._refresh()
@@ -386,7 +734,37 @@ class SettingsScreen(Screen[None]):
         self.query_one("#settings-style-body", Static).update(self._style_block())
         self.query_one("#settings-llm-body", Static).update(self._llm_block())
         self.query_one("#settings-ui-body", Static).update(self._ui_block())
+        self.query_one("#settings-intake-body", Static).update(self._intake_block())
+        self.query_one("#settings-concurrency-body", Static).update(
+            self._concurrency_block()
+        )
         self.query_one("#settings-help-body", Static).update(self._help_block())
+        self._refresh_lore_table()
+
+    def _refresh_lore_table(self) -> None:
+        table = self.query_one("#settings-lore-table", DataTable)
+        table.clear()
+        for row in self._attached_lore_rows():
+            mode_label = (
+                "[b green]writable[/]"
+                if row.mode == AttachedLoreMode.WRITABLE
+                else "[dim]read-only[/]"
+            )
+            table.add_row(
+                str(row.priority),
+                mode_label,
+                row.lore_path,
+                key=row.lore_path,
+            )
+
+    def _attached_lore_rows(self) -> list[repo.AttachedLoreRow]:
+        return repo.list_attached_lore(
+            self._project.engine, project_id=self._project.project_id
+        )
+
+    # ------------------------------------------------------------------
+    # Style modal
+    # ------------------------------------------------------------------
 
     def action_edit_style(self) -> None:
         modal = StyleEditModal(
@@ -409,9 +787,346 @@ class SettingsScreen(Screen[None]):
             else f"Style guide set: {label_for(result.profile)}."
         )
 
-    def _project_block(self) -> str:
-        from epublate.db import repo
+    # ------------------------------------------------------------------
+    # Save / reset button handling
+    # ------------------------------------------------------------------
 
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        handler = {
+            "settings-project-save": self._save_project_panel,
+            "settings-llm-save": self._save_llm_panel,
+            "settings-llm-clear": self._clear_llm_panel,
+            "settings-ui-save": self._save_ui_panel,
+            "settings-intake-save": self._save_intake_panel,
+            "settings-concurrency-save": self._save_concurrency_panel,
+            "settings-lore-attach": self._attach_lore_book_panel,
+            "settings-lore-detach": self._detach_lore_book_panel,
+            "settings-lore-toggle-mode": self._toggle_lore_mode_panel,
+            "settings-lore-move-up": self._move_lore_up_panel,
+            "settings-lore-move-down": self._move_lore_down_panel,
+        }.get(bid)
+        if handler is None:
+            return
+        try:
+            handler()
+        except ValueError as exc:
+            self._set_status(f"Could not save: {exc}")
+        except OSError as exc:
+            _logger.warning("settings save failed: %s", exc)
+            self._set_status(f"Could not save: {exc}")
+
+    def _save_project_panel(self) -> None:
+        name_input = self.query_one("#settings-project-name", Input)
+        budget_input = self.query_one("#settings-project-budget", Input)
+
+        new_name = name_input.value.strip()
+        if not new_name:
+            self._set_status("Project name must not be blank.")
+            return
+
+        budget = self._parse_budget(budget_input.value.strip())
+        repo.update_project_name(
+            self._project.engine, project_id=self._project.project_id, name=new_name
+        )
+        # Refresh the in-memory dataclass so other screens see the new name
+        # without a round-trip through ``Project.open``.
+        self._project.name = new_name
+        repo.update_project_budget(
+            self._project.engine,
+            project_id=self._project.project_id,
+            budget_usd=budget,
+        )
+        self._refresh()
+        self._set_status(
+            f"Project saved: {new_name!r}; budget = "
+            + ("(none)" if budget is None else f"${budget:.4f}")
+        )
+
+    def _save_llm_panel(self) -> None:
+        base_url = self.query_one("#settings-llm-base-url", Input).value.strip()
+        translator = self.query_one(
+            "#settings-llm-translator-model", Input
+        ).value.strip()
+        helper = self.query_one("#settings-llm-helper-model", Input).value.strip()
+
+        overrides: dict[str, object] = {}
+        if base_url:
+            overrides["base_url"] = base_url
+        if translator:
+            overrides["translator_model"] = translator
+        if helper:
+            overrides["helper_model"] = helper
+
+        repo.set_llm_overrides(
+            self._project.engine,
+            project_id=self._project.project_id,
+            overrides=overrides or None,
+        )
+        self._refresh()
+        if overrides:
+            keys = ", ".join(sorted(overrides))
+            self._set_status(f"LLM overrides saved: {keys}.")
+        else:
+            self._set_status("LLM overrides cleared (env defaults will be used).")
+
+    def _clear_llm_panel(self) -> None:
+        for widget_id in (
+            "#settings-llm-base-url",
+            "#settings-llm-translator-model",
+            "#settings-llm-helper-model",
+        ):
+            self.query_one(widget_id, Input).value = ""
+        repo.set_llm_overrides(
+            self._project.engine,
+            project_id=self._project.project_id,
+            overrides=None,
+        )
+        self._refresh()
+        self._set_status("LLM overrides cleared (env defaults will be used).")
+
+    def _save_ui_panel(self) -> None:
+        select = self.query_one("#settings-ui-theme", Select)
+        chosen = select.value
+        if not isinstance(chosen, str) or not chosen:
+            self._set_status("Pick a theme before saving.")
+            return
+        if chosen != self.app.theme:
+            self.app.theme = chosen
+        self._ui_config.theme = chosen
+        self._ui_config.save(self._config_path)
+        self._refresh()
+        self._set_status(f"Theme saved: {chosen}.")
+
+    def _save_intake_panel(self) -> None:
+        helper = self.query_one("#settings-intake-helper-model", Input).value.strip()
+        max_raw = self.query_one("#settings-intake-max-segments", Input).value.strip()
+        run_raw = (
+            self.query_one("#settings-intake-run-after", Input).value.strip().lower()
+        )
+
+        try:
+            max_seg = int(max_raw) if max_raw else self._ui_config.intake_max_segments
+        except ValueError as exc:
+            raise ValueError("Max segments must be an integer.") from exc
+        if max_seg < 1:
+            raise ValueError("Max segments must be at least 1.")
+
+        run_after = run_raw in {"y", "yes", "true", "1", "on"}
+
+        self._ui_config.intake_helper_model = helper or None
+        self._ui_config.intake_max_segments = max_seg
+        self._ui_config.intake_run_after_new = run_after
+        self._ui_config.save(self._config_path)
+        self._refresh()
+        self._set_status(
+            f"Intake defaults saved: helper="
+            f"{helper or '(unset)'}, max={max_seg}, "
+            f"run-after-new={'on' if run_after else 'off'}."
+        )
+
+    def _save_concurrency_panel(self) -> None:
+        concurrency_raw = self.query_one(
+            "#settings-concurrency-batch", Input
+        ).value.strip()
+        retries_raw = self.query_one(
+            "#settings-concurrency-retries", Input
+        ).value.strip()
+
+        try:
+            concurrency = (
+                int(concurrency_raw)
+                if concurrency_raw
+                else self._ui_config.batch_concurrency
+            )
+        except ValueError as exc:
+            raise ValueError("Concurrency must be an integer.") from exc
+        if concurrency < 1:
+            raise ValueError("Concurrency must be at least 1.")
+
+        try:
+            retries = int(retries_raw) if retries_raw else self._ui_config.batch_retries
+        except ValueError as exc:
+            raise ValueError("Retries must be an integer.") from exc
+        if retries < 0:
+            raise ValueError("Retries must be zero or positive.")
+
+        self._ui_config.batch_concurrency = concurrency
+        self._ui_config.batch_retries = retries
+        self._ui_config.save(self._config_path)
+        self._refresh()
+        self._set_status(
+            f"Concurrency defaults saved: concurrency={concurrency}, retries={retries}."
+        )
+
+    # ------------------------------------------------------------------
+    # Lore Books panel (PRD §4.3 / F-LB-10 phase 3)
+    # ------------------------------------------------------------------
+
+    def _selected_lore_path(self) -> str | None:
+        table = self.query_one("#settings-lore-table", DataTable)
+        if table.row_count == 0:
+            return None
+        try:
+            row_index = int(table.cursor_row)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        rows = self._attached_lore_rows()
+        if row_index < 0 or row_index >= len(rows):
+            return None
+        return rows[row_index].lore_path
+
+    def _attach_lore_book_panel(self) -> None:
+        path_input = self.query_one("#settings-lore-path", Input)
+        mode_select = self.query_one("#settings-lore-mode", Select)
+        raw_path = path_input.value.strip()
+        if not raw_path:
+            raise ValueError("Lore Book path must not be blank.")
+        candidate = Path(raw_path).expanduser()
+        # We accept paths that don't yet exist on disk so curators can
+        # paste a planned location, but flag the case so the status
+        # line stays informative. The pipeline revalidates at translate
+        # time.
+        if not candidate.is_dir():
+            self._set_status(
+                f"Attached {candidate} (not on disk yet — make sure the "
+                "directory exists before the next batch run)."
+            )
+        resolved = candidate.resolve(strict=False)
+        chosen_mode = (
+            str(mode_select.value)
+            if mode_select.value not in (None, Select.BLANK)
+            else AttachedLoreMode.READ_ONLY
+        )
+        repo.attach_lore_book(
+            self._project.engine,
+            project_id=self._project.project_id,
+            lore_path=str(resolved),
+            mode=chosen_mode,
+        )
+        path_input.value = ""
+        self._refresh_lore_table()
+        if candidate.is_dir():
+            self._set_status(f"Attached Lore Book at {resolved} (mode={chosen_mode}).")
+
+    def _detach_lore_book_panel(self) -> None:
+        target = self._selected_lore_path()
+        if target is None:
+            self._set_status("No Lore Book selected to detach.")
+            return
+        removed = repo.detach_lore_book(
+            self._project.engine,
+            project_id=self._project.project_id,
+            lore_path=target,
+        )
+        self._refresh_lore_table()
+        if removed:
+            self._set_status(f"Detached {target}.")
+        else:
+            self._set_status(f"Could not detach {target} — already removed?")
+
+    def _toggle_lore_mode_panel(self) -> None:
+        target = self._selected_lore_path()
+        if target is None:
+            self._set_status("No Lore Book selected to toggle.")
+            return
+        current = next(
+            (r for r in self._attached_lore_rows() if r.lore_path == target),
+            None,
+        )
+        if current is None:
+            self._set_status(f"Could not find {target} on the attached list.")
+            return
+        new_mode = (
+            AttachedLoreMode.READ_ONLY
+            if current.mode == AttachedLoreMode.WRITABLE
+            else AttachedLoreMode.WRITABLE
+        )
+        repo.update_attached_lore(
+            self._project.engine,
+            project_id=self._project.project_id,
+            lore_path=target,
+            mode=new_mode,
+        )
+        self._refresh_lore_table()
+        self._set_status(f"{target} is now [b]{new_mode}[/].")
+
+    def _move_lore_up_panel(self) -> None:
+        self._reorder_lore(direction=-1)
+
+    def _move_lore_down_panel(self) -> None:
+        self._reorder_lore(direction=+1)
+
+    def _reorder_lore(self, *, direction: int) -> None:
+        target = self._selected_lore_path()
+        if target is None:
+            self._set_status("No Lore Book selected to reorder.")
+            return
+        rows = self._attached_lore_rows()
+        try:
+            idx = next(i for i, r in enumerate(rows) if r.lore_path == target)
+        except StopIteration:
+            self._set_status(f"Could not find {target} on the attached list.")
+            return
+        new_idx = idx + direction
+        if new_idx < 0 or new_idx >= len(rows):
+            return
+        # Renumber priorities so the moved row swaps with its neighbour.
+        # We deliberately renumber the whole list afterwards (0..N-1) so
+        # the priority column stays compact even after many shuffles.
+        new_order = list(rows)
+        new_order[idx], new_order[new_idx] = new_order[new_idx], new_order[idx]
+        for new_priority, row in enumerate(new_order):
+            repo.update_attached_lore(
+                self._project.engine,
+                project_id=self._project.project_id,
+                lore_path=row.lore_path,
+                priority=new_priority,
+            )
+        self._refresh_lore_table()
+        self._set_status(
+            "Reordered " + target + " " + ("up" if direction < 0 else "down") + "."
+        )
+
+    # ------------------------------------------------------------------
+    # Auto tone-sniff toggle (PRD F-STYLE-4)
+    # ------------------------------------------------------------------
+
+    def action_toggle_auto_tone_sniff(self) -> None:
+        """Flip and persist :attr:`UIConfig.auto_tone_sniff`.
+
+        We surface the env-var override case loudly: if
+        ``EPUBLATE_AUTO_TONE_SNIFF`` is pinning a value, persistence
+        still happens (so the bool is correct once the env var is
+        unset) but the status row tells the curator their flip won't
+        take effect this session.
+        """
+
+        new_value = not self._ui_config.auto_tone_sniff
+        self._ui_config.auto_tone_sniff = new_value
+        try:
+            self._ui_config.save(self._config_path)
+        except OSError as exc:
+            _logger.warning("could not persist UI config: %s", exc)
+            self._set_status(f"Could not persist toggle: {exc}")
+            return
+        self._refresh()
+        env_override = os.environ.get(ENV_AUTO_TONE_SNIFF, "").strip()
+        effective = resolve_auto_tone_sniff(self._ui_config)
+        if env_override and effective != new_value:
+            self._set_status(
+                f"Auto tone-sniff saved as {'on' if new_value else 'off'}, but "
+                f"${ENV_AUTO_TONE_SNIFF}={env_override} pins it "
+                f"{'on' if effective else 'off'} this session."
+            )
+        else:
+            self._set_status(f"Auto tone-sniff turned {'on' if new_value else 'off'}.")
+
+    # ------------------------------------------------------------------
+    # Read-only summary blocks
+    # ------------------------------------------------------------------
+
+    def _project_block(self) -> str:
         row = repo.get_project(self._project.engine, self._project.project_id)
         budget = (
             f"${row.budget_usd:.4f}" if row and row.budget_usd is not None else "(none)"
@@ -454,26 +1169,45 @@ class SettingsScreen(Screen[None]):
 
     def _llm_block(self) -> str:
         provider = os.environ.get(ENV_PROVIDER, "(default: openai-compat)") or "(unset)"
+        overrides = self._project_overrides()
         base_url = (
-            os.environ.get(ENV_BASE_URL) or "(default: https://api.openai.com/v1)"
+            str(overrides.get("base_url"))
+            if overrides.get("base_url")
+            else os.environ.get(ENV_BASE_URL) or "(default: https://api.openai.com/v1)"
         )
         api_key = _redact_api_key(os.environ.get(ENV_API_KEY))
+        translator_override = overrides.get("translator_model")
         model = (
-            self._default_model
+            str(translator_override)
+            if translator_override
+            else self._default_model
             or os.environ.get(ENV_MODEL)
             or "(unset — falls back to Reader default)"
         )
+        helper_override = overrides.get("helper_model")
         helper = (
-            os.environ.get(ENV_HELPER_MODEL) or "(unset — falls back to translator)"
+            str(helper_override)
+            if helper_override
+            else os.environ.get(ENV_HELPER_MODEL)
+            or "(unset — falls back to translator)"
         )
         org = os.environ.get(ENV_ORG) or "(unset)"
+        # Use parentheses (not [brackets]) for the override marker so the
+        # summary Static renders it verbatim — Static's default
+        # ``markup=True`` would otherwise eat ``[override]`` as a rich
+        # markup tag and leave a confusing blank space behind.
+        suffix = " (override)" if overrides else ""
         return (
             f"  provider     : {provider}\n"
-            f"  base url     : {base_url}\n"
+            f"  base url     : {base_url}"
+            f"{' (override)' if overrides.get('base_url') else ''}\n"
             f"  api key      : {api_key}\n"
             f"  organization : {org}\n"
-            f"  translator   : {model}\n"
+            f"  translator   : {model}"
+            f"{' (override)' if translator_override else ''}\n"
             f"  helper       : {helper}"
+            f"{' (override)' if helper_override else ''}\n"
+            f"  overrides    : {'set' if overrides else 'none'}{suffix}"
         )
 
     def _ui_block(self) -> str:
@@ -501,54 +1235,81 @@ class SettingsScreen(Screen[None]):
             f"{sniff_line}"
         )
 
-    # ------------------------------------------------------------------
-    # Auto tone-sniff toggle (PRD F-STYLE-4)
-    # ------------------------------------------------------------------
+    def _intake_block(self) -> str:
+        helper = self._ui_config.intake_helper_model or "(falls back to translator)"
+        env_helper = os.environ.get(ENV_HELPER_MODEL)
+        if env_helper and not self._ui_config.intake_helper_model:
+            helper = f"{env_helper}  [via ${ENV_HELPER_MODEL}]"
+        return (
+            f"  helper model        : {helper}\n"
+            f"  max segments        : {self._ui_config.intake_max_segments}\n"
+            f"  run after new proj  : "
+            f"{'on' if self._ui_config.intake_run_after_new else 'off'}"
+        )
 
-    def action_toggle_auto_tone_sniff(self) -> None:
-        """Flip and persist :attr:`UIConfig.auto_tone_sniff`.
+    def _concurrency_block(self) -> str:
+        return (
+            f"  default concurrency : {self._ui_config.batch_concurrency}\n"
+            f"  default retries     : {self._ui_config.batch_retries}"
+        )
 
-        We surface the env-var override case loudly: if
-        ``EPUBLATE_AUTO_TONE_SNIFF`` is pinning a value, persistence
-        still happens (so the bool is correct once the env var is
-        unset) but the status row tells the curator their flip won't
-        take effect this session.
-        """
+    def _project_overrides(self) -> dict[str, object]:
+        return repo.get_llm_overrides(self._project.engine, self._project.project_id)
 
-        new_value = not self._ui_config.auto_tone_sniff
-        self._ui_config.auto_tone_sniff = new_value
+    def _initial_budget_text(self) -> str:
+        row = repo.get_project(self._project.engine, self._project.project_id)
+        if row is None or row.budget_usd is None:
+            return ""
+        return f"{row.budget_usd:.4f}"
+
+    def _current_theme(self) -> str:
         try:
-            self._ui_config.save(self._config_path)
-        except OSError as exc:
-            _logger.warning("could not persist UI config: %s", exc)
-            self._set_status(f"Could not persist toggle: {exc}")
-            return
-        self._refresh()
-        env_override = os.environ.get(ENV_AUTO_TONE_SNIFF, "").strip()
-        effective = resolve_auto_tone_sniff(self._ui_config)
-        if env_override and effective != new_value:
-            self._set_status(
-                f"Auto tone-sniff saved as {'on' if new_value else 'off'}, but "
-                f"${ENV_AUTO_TONE_SNIFF}={env_override} pins it "
-                f"{'on' if effective else 'off'} this session."
-            )
-        else:
-            self._set_status(f"Auto tone-sniff turned {'on' if new_value else 'off'}.")
+            return str(self.app.theme)
+        except Exception:  # screen not yet attached
+            return self._ui_config.theme or EPUBLATE_THEME_ORDER[0]
+
+    @staticmethod
+    def _parse_budget(raw: str) -> float | None:
+        if not raw:
+            return None
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise ValueError("Budget must be numeric or blank.") from exc
+        if value < 0:
+            raise ValueError("Budget cannot be negative.")
+        return value
 
     @staticmethod
     def _help_block() -> str:
-        return (
-            "  - Style guide   : press E to pick a tone preset or edit prose.\n"
-            "  - Auto tone-sniff: press A to toggle helper-LLM detection on\n"
-            "                    new project source picks (PRD F-STYLE-4).\n"
-            "  - Budget cap    : open the Dashboard and press B.\n"
-            "  - Theme         : press T anywhere to cycle dark / light / contrast.\n"
-            "  - LLM config    : set EPUBLATE_LLM_BASE_URL / EPUBLATE_LLM_API_KEY /\n"
-            "                    EPUBLATE_LLM_MODEL (and optionally\n"
-            "                    EPUBLATE_LLM_HELPER_MODEL) before launching.\n"
-            "  - Mock mode     : pass --mock-llm or set EPUBLATE_LLM=mock.\n"
-            "  - Help          : press ? or F1 for the cheat sheet."
-        )
+        # Wrap the multi-line block as several string literals; ruff E501
+        # gets unhappy when long phrases like "Theme: dropdown / [b]T[/b]"
+        # push past 88 columns.
+        lines = [
+            "  - Style guide      : press [b]E[/b] to pick a tone preset or",
+            "                       edit prose verbatim.",
+            "  - Auto tone-sniff  : press [b]A[/b] to toggle helper-LLM",
+            "                       detection on new project source picks",
+            "                       (PRD F-STYLE-4).",
+            "  - Project name     : Project tab → edit field → Save.",
+            "  - Budget cap       : Project tab → set USD → Save",
+            "                       (or B on Dashboard).",
+            "  - LLM overrides    : LLM tab → optional per-project",
+            "                       model / base URL.",
+            "  - Theme            : UI tab dropdown, or press [b]T[/b]",
+            "                       anywhere to cycle.",
+            "  - Intake defaults  : Intake tab → helper, max segments,",
+            "                       run-after-new.",
+            "  - Concurrency      : Concurrency tab → batch concurrency",
+            "                       / retries.",
+            "  - LLM env vars     : EPUBLATE_LLM_BASE_URL /",
+            "                       EPUBLATE_LLM_API_KEY /",
+            "                       EPUBLATE_LLM_MODEL (and optionally",
+            "                       EPUBLATE_LLM_HELPER_MODEL).",
+            "  - Mock mode        : pass --mock-llm or set EPUBLATE_LLM=mock.",
+            "  - Help             : press [b]?[/b] or F1 for the cheat sheet.",
+        ]
+        return "\n".join(lines)
 
     @property
     def is_attached(self) -> bool:

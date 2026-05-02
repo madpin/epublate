@@ -618,3 +618,274 @@ async def test_export_modal_rejects_non_epub_suffix(
             await pilot.press("escape")
     finally:
         project.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: dashboard book panel + chapter table + glossary stats + intake
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dashboard_book_panel_shows_metadata(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """The Book panel renders title / author / langs / counts from the OPF."""
+
+    from textual.widgets import Static
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    try:
+        screen = DashboardScreen(project, provider_factory=MockLLMProvider)
+        app = EpublateApp(initial_screen=screen, config_path=tmp_path / "ui.toml")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            current = pilot.app.screen
+            assert isinstance(current, DashboardScreen)
+            meta_widget = current.query_one("#dashboard-book-meta", Static)
+            text = str(meta_widget.render())
+            # tiny_epub_factory pins the title; sanity-check we read it.
+            assert "title" in text
+            assert "author(s)" in text
+            assert "en → pt" in text
+            assert "scope" in text
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_chapter_table_lists_chapters(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """The chapter table mounts with a row per imported chapter."""
+
+    from textual.widgets import DataTable
+
+    src = tiny_epub_factory(
+        chapters=[
+            ("Chapter One", "<p>Intro.</p>"),
+            ("Chapter Two", "<p>Middle.</p>"),
+            ("Chapter Three", "<p>End.</p>"),
+        ]
+    )
+    project = Project.create(
+        src, out_dir=tmp_path / "multi-proj", source_lang="en", target_lang="pt"
+    )
+    try:
+        screen = DashboardScreen(project, provider_factory=MockLLMProvider)
+        app = EpublateApp(initial_screen=screen, config_path=tmp_path / "ui.toml")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            current = pilot.app.screen
+            assert isinstance(current, DashboardScreen)
+            table = current.query_one("#dashboard-chapter-table", DataTable)
+            assert table.row_count >= 3
+            assert {col.label.plain for col in table.columns.values()} >= {
+                "#",
+                "Chapter",
+                "Segs",
+                "% Trans",
+                "% Approved",
+            }
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_glossary_panel_shows_zero_state(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """A fresh project shows the empty-glossary nudge."""
+
+    from textual.widgets import Static
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    try:
+        screen = DashboardScreen(project, provider_factory=MockLLMProvider)
+        app = EpublateApp(initial_screen=screen, config_path=tmp_path / "ui.toml")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            current = pilot.app.screen
+            assert isinstance(current, DashboardScreen)
+            panel = current.query_one("#dashboard-glossary-panel", Static)
+            text = str(panel.render())
+            assert "Glossary" in text
+            assert "no entries yet" in text
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_intake_status_defaults_to_not_run(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """The intake header strip teaches the curator what intake does."""
+
+    from textual.widgets import Static
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    try:
+        screen = DashboardScreen(project, provider_factory=MockLLMProvider)
+        app = EpublateApp(initial_screen=screen, config_path=tmp_path / "ui.toml")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            current = pilot.app.screen
+            assert isinstance(current, DashboardScreen)
+            widget = current.query_one("#dashboard-intake-status", Static)
+            text = str(widget.render())
+            assert "Intake" in text
+            assert "not run" in text
+            assert "lore bible" in text
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_intake_status_shows_summary_after_event(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """An ``intake.completed`` event renders chunks/proposed counts."""
+
+    from textual.widgets import Static
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    try:
+        repo.append_event(
+            project.engine,
+            project_id=project.project_id,
+            kind="intake.completed",
+            payload={
+                "chunks": 12,
+                "proposed_count": 7,
+                "cost_usd": 0.0123,
+                "pov": "third",
+                "tense": "past",
+            },
+        )
+        screen = DashboardScreen(project, provider_factory=MockLLMProvider)
+        app = EpublateApp(initial_screen=screen, config_path=tmp_path / "ui.toml")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            widget = pilot.app.screen.query_one("#dashboard-intake-status", Static)
+            text = str(widget.render())
+            assert "12 chunks" in text
+            assert "7 proposed" in text
+            assert "$0.0123" in text
+            assert "pov=third" in text
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_llm_activity_table_empty_state(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """No LLM calls yet → the table renders a single placeholder row."""
+
+    from textual.widgets import DataTable
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    try:
+        screen = DashboardScreen(project, provider_factory=MockLLMProvider)
+        app = EpublateApp(initial_screen=screen, config_path=tmp_path / "ui.toml")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = pilot.app.screen.query_one(
+                "#dashboard-llm-activity-table", DataTable
+            )
+            assert table.row_count == 1
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_chapter_row_enter_opens_reader(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """Selecting a chapter row pushes Reader at the chosen chapter id."""
+
+    from textual.widgets import DataTable
+
+    src = tiny_epub_factory(
+        chapters=[
+            ("Chapter One", "<p>Intro.</p>"),
+            ("Chapter Two", "<p>Middle.</p>"),
+        ]
+    )
+    project = Project.create(
+        src, out_dir=tmp_path / "row-proj", source_lang="en", target_lang="pt"
+    )
+    try:
+        screen = DashboardScreen(project, provider_factory=MockLLMProvider)
+        app = EpublateApp(initial_screen=screen, config_path=tmp_path / "ui.toml")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            current = pilot.app.screen
+            assert isinstance(current, DashboardScreen)
+            table = current.query_one("#dashboard-chapter-table", DataTable)
+            table.focus()
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(pilot.app.screen, ReaderScreen)
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_auto_intake_on_first_mount_when_enabled(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """``auto_intake_on_first_mount=True`` surfaces the IntakeModal once."""
+
+    from epublate.app.screens.dashboard import IntakeModal
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    try:
+        screen = DashboardScreen(
+            project,
+            provider_factory=MockLLMProvider,
+            auto_intake_on_first_mount=True,
+        )
+        app = EpublateApp(initial_screen=screen, config_path=tmp_path / "ui.toml")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            assert isinstance(pilot.app.screen, IntakeModal)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert isinstance(pilot.app.screen, DashboardScreen)
+            # The auto-trigger fires only once: pressing R (refresh)
+            # must not re-summon the modal.
+            await pilot.press("r")
+            await pilot.pause()
+            assert isinstance(pilot.app.screen, DashboardScreen)
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_auto_intake_skipped_when_intake_already_ran(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """If an intake event already exists we do *not* re-run automatically."""
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    try:
+        repo.append_event(
+            project.engine,
+            project_id=project.project_id,
+            kind="intake.completed",
+            payload={"chunks": 1, "proposed_count": 0, "cost_usd": 0.0},
+        )
+        screen = DashboardScreen(
+            project,
+            provider_factory=MockLLMProvider,
+            auto_intake_on_first_mount=True,
+        )
+        app = EpublateApp(initial_screen=screen, config_path=tmp_path / "ui.toml")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            assert isinstance(pilot.app.screen, DashboardScreen)
+    finally:
+        project.close()

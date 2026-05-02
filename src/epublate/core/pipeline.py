@@ -39,6 +39,7 @@ from epublate.glossary import io as glossary_io
 from epublate.glossary.enforcer import (
     Violation,
     build_constraints,
+    build_target_only_constraints,
     find_mentions,
     glossary_hash,
     has_locked_violation,
@@ -50,6 +51,7 @@ from epublate.llm.pricing import estimate_cost
 from epublate.llm.prompts.translator import (
     GlossaryConstraint,
     GroupTranslatorItem,
+    TargetOnlyConstraint,
     TranslatorTrace,
     build_group_translator_messages,
     build_translator_messages,
@@ -179,11 +181,17 @@ def translate_segment(
       transaction, crash safe.
     """
 
-    project_entries = _load_glossary(engine, project_id=project_id)
+    glossary_view = _load_glossary_view(engine, project_id=project_id)
+    project_entries = glossary_view.entries
     constraints = (
         list(options.glossary)
         if options.glossary is not None
         else build_constraints(project_entries)
+    )
+    target_only_constraints = (
+        []
+        if options.glossary is not None
+        else build_target_only_constraints(project_entries)
     )
     g_hash = glossary_hash(project_entries)
 
@@ -193,6 +201,7 @@ def translate_segment(
         source_text=segment.source_text,
         style_guide=style_guide,
         glossary=constraints,
+        target_only_glossary=target_only_constraints,
     )
     key = cache_key_for_messages(
         model=options.model, messages=messages, glossary_hash=g_hash
@@ -226,7 +235,9 @@ def translate_segment(
                 request_json=request_json,
                 options=options,
                 entries=project_entries,
+                glossary_view=glossary_view,
             )
+            glossary_view.close()
             return outcome
 
     chat_result = provider.chat(
@@ -255,6 +266,7 @@ def translate_segment(
             prompt_tokens=chat_result.prompt_tokens,
             completion_tokens=chat_result.completion_tokens,
         )
+        glossary_view.close()
         raise
 
     spliced = _splice_target(segment, target=trace.target)
@@ -272,9 +284,10 @@ def translate_segment(
 
     mentions = find_mentions(segment.source_text, project_entries)
     mention_entry_ids = tuple(dict.fromkeys(m.entry_id for m in mentions))
-    mention_payload: list[tuple[str, int | None, int | None]] = [
+    raw_mentions: list[tuple[str, int | None, int | None]] = [
         (m.entry_id, m.start, m.end) for m in mentions
     ]
+    mention_payload = glossary_view.filter_mentions(raw_mentions)
 
     cost = estimate_cost(
         chat_result.model,
@@ -341,7 +354,7 @@ def translate_segment(
                     "violations": [_violation_to_payload(v) for v in violations],
                 },
             )
-        if options.auto_propose:
+        if options.auto_propose and glossary_view.writable_lore_engine is None:
             proposed_ids.extend(
                 _auto_propose_entities(
                     conn,
@@ -350,7 +363,21 @@ def translate_segment(
                     trace=trace,
                 )
             )
+    if options.auto_propose and glossary_view.writable_lore_engine is not None:
+        # Run write-back AFTER the project transaction commits so a
+        # lore-book write failure can never roll back the segment write.
+        proposed_ids.extend(
+            _auto_propose_entities(
+                None,
+                project_id=project_id,
+                segment_id=segment.id,
+                trace=trace,
+                write_back_engine=glossary_view.writable_lore_engine,
+                write_back_project_id=glossary_view.writable_lore_project_id,
+            )
+        )
 
+    glossary_view.close()
     _logger.info(
         "translated segment %s (%d→%d tokens, $%.6f) via %s%s",
         segment.id,
@@ -387,6 +414,7 @@ def _replay_from_cache(
     request_json: str,
     options: TranslateOptions,
     entries: Sequence[GlossaryEntryWithAliases],
+    glossary_view: _GlossaryView | None = None,
 ) -> TranslateOutcome:
     """Hydrate a translation from a cached ``llm_call`` row.
 
@@ -395,6 +423,11 @@ def _replay_from_cache(
     The cache key already incorporates the glossary state hash, so a
     hit means *the same glossary produced the same prompt*; we re-run
     the validator anyway as defensive belt-and-braces.
+
+    ``glossary_view`` carries attached-Lore-Book metadata (entry origin
+    set + write-back engine). When ``None`` we fall back to the
+    project-only behaviour for callers (and tests) that haven't
+    migrated yet.
     """
 
     payload = json.loads(hit.response_json or "{}")
@@ -425,9 +458,14 @@ def _replay_from_cache(
 
     mentions = find_mentions(segment.source_text, entries)
     mention_entry_ids = tuple(dict.fromkeys(m.entry_id for m in mentions))
-    mention_payload: list[tuple[str, int | None, int | None]] = [
+    raw_mentions: list[tuple[str, int | None, int | None]] = [
         (m.entry_id, m.start, m.end) for m in mentions
     ]
+    mention_payload = (
+        glossary_view.filter_mentions(raw_mentions)
+        if glossary_view is not None
+        else raw_mentions
+    )
 
     response_json = hit.response_json or json.dumps(
         {"content": trace.target, "trace": trace.model_dump()},
@@ -484,7 +522,9 @@ def _replay_from_cache(
                     "violations": [_violation_to_payload(v) for v in violations],
                 },
             )
-        if options.auto_propose:
+        if options.auto_propose and (
+            glossary_view is None or glossary_view.writable_lore_engine is None
+        ):
             proposed_ids.extend(
                 _auto_propose_entities(
                     conn,
@@ -493,6 +533,21 @@ def _replay_from_cache(
                     trace=trace,
                 )
             )
+    if (
+        options.auto_propose
+        and glossary_view is not None
+        and glossary_view.writable_lore_engine is not None
+    ):
+        proposed_ids.extend(
+            _auto_propose_entities(
+                None,
+                project_id=project_id,
+                segment_id=segment.id,
+                trace=trace,
+                write_back_engine=glossary_view.writable_lore_engine,
+                write_back_project_id=glossary_view.writable_lore_project_id,
+            )
+        )
 
     return TranslateOutcome(
         segment_id=segment.id,
@@ -582,6 +637,7 @@ def estimate_segment_tokens(
     source_text: str,
     style_guide: str | None,
     glossary: Sequence[GlossaryConstraint] = (),
+    target_only_glossary: Sequence[TargetOnlyConstraint] = (),
     model: str | None = None,
 ) -> int:
     """Coarse upper-bound on prompt tokens for one segment (PRD F-LLM-4)."""
@@ -592,6 +648,7 @@ def estimate_segment_tokens(
         source_text=source_text,
         style_guide=style_guide,
         glossary=glossary,
+        target_only_glossary=target_only_glossary,
     )
     return sum(count_tokens(m.content, model=model) for m in messages)
 
@@ -604,9 +661,147 @@ def _load_glossary(engine: Any, *, project_id: str) -> list[GlossaryEntryWithAli
     the curator can see how often a candidate name appears. The hash
     (``glossary_hash``) likewise covers the proposed set so cache keys
     invalidate when the curator promotes or merges entries.
+
+    .. note::
+       This helper now only returns *project*-owned entries. Use
+       :func:`_load_glossary_view` to also fold in entries from
+       attached Lore Books — the broader pipeline does so since
+       PRD §4.3 / F-LB-10 phase 3.
     """
 
     return list(repo.list_glossary_entries(engine, project_id))
+
+
+@dataclass(slots=True)
+class _GlossaryView:
+    """Bundle of glossary state used by one translate call.
+
+    ``entries`` is the merged matcher view (project + attached Lore
+    Books, in priority order); ``own_entry_ids`` keeps track of which
+    of those entries originate in the project DB so the pipeline can
+    avoid recording dangling ``entity_mention`` rows for entries that
+    live in another SQLite file. ``writable_lore_engine`` is the
+    highest-priority writable Lore Book engine, used for write-back
+    routing of auto-proposed entries (PRD F-LB-10 phase 3).
+
+    Lore Book engines are opened lazily by :func:`_load_glossary_view`
+    and must be closed via :meth:`close` once the caller is done.
+    """
+
+    entries: list[GlossaryEntryWithAliases] = field(default_factory=list)
+    own_entry_ids: set[str] = field(default_factory=set)
+    writable_lore_engine: Any | None = None
+    writable_lore_project_id: str | None = None
+    _opened_books: list[Any] = field(default_factory=list, repr=False)
+
+    def filter_mentions(
+        self,
+        mentions: Sequence[tuple[str, int | None, int | None]],
+    ) -> list[tuple[str, int | None, int | None]]:
+        """Strip mention tuples whose entry_id is not in this project.
+
+        ``entity_mention`` has a FK on ``glossary_entry.id`` in the
+        project DB; mentions for entries that come from an attached
+        Lore Book would dangle (or fail the FK with foreign_keys=on).
+        We still surface them in the matcher / validator paths — only
+        the persisted audit trail is restricted to local entries.
+        """
+
+        return [m for m in mentions if m[0] in self.own_entry_ids]
+
+    def close(self) -> None:
+        """Dispose of any Lore Book engines opened during load."""
+
+        for book in self._opened_books:
+            try:
+                book.close()
+            except Exception:  # pragma: no cover — best effort cleanup
+                _logger.warning("error closing attached lore book", exc_info=True)
+        self._opened_books = []
+        self.writable_lore_engine = None
+        self.writable_lore_project_id = None
+
+
+def _load_glossary_view(engine: Any, *, project_id: str) -> _GlossaryView:
+    """Build a :class:`_GlossaryView` for ``project_id``.
+
+    Steps:
+
+    1. Load the project's own glossary entries.
+    2. Resolve attached Lore Books in priority order.
+    3. For each Lore Book, open its DB and append its entries to the
+       merged list, skipping entries whose ``(source_term, target_term, type)``
+       triple is already covered by a higher-priority entry. The
+       triple-key dedupe prevents the matcher from double-counting the
+       same canonical translation that lives in both a project and an
+       attached Lore Book.
+    4. Pick the highest-priority writable Lore Book (lowest priority
+       number, mode == ``writable``) as the auto-propose write-back
+       target.
+
+    A broken or missing Lore Book is logged and skipped — the
+    pipeline never throws because the curator detached a folder.
+    """
+
+    own_entries = list(repo.list_glossary_entries(engine, project_id))
+    attached_rows = repo.list_attached_lore(engine, project_id=project_id)
+    if not attached_rows:
+        return _GlossaryView(
+            entries=own_entries,
+            own_entry_ids={e.id for e in own_entries},
+        )
+
+    seen_keys: set[tuple[str, str, str]] = {
+        (ent.source_term or "", ent.target_term, ent.entry.type) for ent in own_entries
+    }
+    merged: list[GlossaryEntryWithAliases] = list(own_entries)
+    opened_books: list[Any] = []
+    writable_engine: Any | None = None
+    writable_project_id: str | None = None
+
+    # Imported lazily to avoid a hard dependency cycle: ``epublate.lore``
+    # imports ``epublate.core.extractor`` and friends, which in turn
+    # touch this module via ``epublate.core.pipeline``. Top-level
+    # imports here would form a circular import at module load time.
+    from epublate.lore import LoreBook
+
+    for attached in attached_rows:
+        from pathlib import Path as _Path
+
+        lore_dir = _Path(attached.lore_path)
+        try:
+            book = LoreBook.open(lore_dir)
+        except Exception as exc:
+            _logger.warning(
+                "skipping attached lore book %s: %s", attached.lore_path, exc
+            )
+            continue
+        opened_books.append(book)
+        if (
+            attached.mode == schema.AttachedLoreMode.WRITABLE
+            and writable_engine is None
+        ):
+            writable_engine = book.engine
+            writable_project_id = book.project_id
+        try:
+            for ent in repo.list_glossary_entries(book.engine, book.project_id):
+                key = (ent.source_term or "", ent.target_term, ent.entry.type)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                merged.append(ent)
+        except Exception as exc:  # pragma: no cover — best-effort
+            _logger.warning(
+                "could not read entries from %s: %s", attached.lore_path, exc
+            )
+
+    return _GlossaryView(
+        entries=merged,
+        own_entry_ids={e.id for e in own_entries},
+        writable_lore_engine=writable_engine,
+        writable_lore_project_id=writable_project_id,
+        _opened_books=opened_books,
+    )
 
 
 def _violation_to_payload(violation: Violation) -> dict[str, Any]:
@@ -626,17 +821,71 @@ def _auto_propose_entities(
     project_id: str,
     segment_id: str,
     trace: TranslatorTrace,
+    write_back_engine: Any | None = None,
+    write_back_project_id: str | None = None,
 ) -> list[str]:
     """Upsert ``trace.new_entities`` candidates as ``proposed`` glossary rows.
 
-    Runs inside the caller's transaction (``conn`` is a Connection) so
-    the auto-proposal commits atomically with the segment write. We
-    de-dup against existing rows by ``(source_term, type)``; an
-    ``entity.proposed`` event is appended for each *new* row so a
-    future Inbox screen can surface the curator's worklist.
+    By default runs inside the caller's transaction (``conn`` is a
+    Connection) so the auto-proposal commits atomically with the
+    segment write. We de-dup against existing rows by
+    ``(source_term, type)``; an ``entity.proposed`` event is appended
+    for each *new* row so a future Inbox screen can surface the
+    curator's worklist.
+
+    When ``write_back_engine`` is provided (PRD F-LB-10 phase 3),
+    proposals are routed to that engine in a *separate* transaction
+    instead of the project DB. Write-back failures are logged but never
+    abort the segment commit — auto-proposal is best-effort and the
+    canonical translation has already been recorded by the caller.
     """
 
     created_ids: list[str] = []
+
+    if write_back_engine is not None:
+        # ``segment_id`` and ``first_seen_segment_id`` would dangle in
+        # the lore book DB (the segment lives in another file), so we
+        # null them out for the write-back path. The lore book event
+        # log keeps the breadcrumb via ``payload['segment_id']``.
+        try:
+            with write_back_engine.begin() as lore_conn:
+                target_pid = write_back_project_id or project_id
+                for raw in trace.new_entities:
+                    candidate = _normalize_new_entity(raw)
+                    if candidate is None:
+                        continue
+                    source_term, type_ = candidate
+                    entry_id, created = glossary_io.upsert_proposed(
+                        lore_conn,
+                        project_id=target_pid,
+                        source_term=source_term,
+                        type=type_,
+                        first_seen_segment_id=None,
+                        notes=None,
+                    )
+                    if not created:
+                        continue
+                    created_ids.append(entry_id)
+                    repo.append_event(
+                        lore_conn,
+                        project_id=target_pid,
+                        kind="lore.entity_proposed",
+                        payload={
+                            "entry_id": entry_id,
+                            "source_project_id": project_id,
+                            "source_segment_id": segment_id,
+                            "source_term": source_term,
+                            "type": type_,
+                        },
+                    )
+        except Exception as exc:
+            _logger.warning(
+                "write-back to attached lore book failed for segment %s: %s",
+                segment_id,
+                exc,
+            )
+        return created_ids
+
     for raw in trace.new_entities:
         candidate = _normalize_new_entity(raw)
         if candidate is None:
@@ -756,11 +1005,17 @@ def translate_segments_grouped(
       batch still commits.
     """
 
-    project_entries = _load_glossary(engine, project_id=project_id)
+    glossary_view = _load_glossary_view(engine, project_id=project_id)
+    project_entries = glossary_view.entries
     constraints = (
         list(options.glossary)
         if options.glossary is not None
         else build_constraints(project_entries)
+    )
+    target_only_constraints = (
+        []
+        if options.glossary is not None
+        else build_target_only_constraints(project_entries)
     )
     g_hash = glossary_hash(project_entries)
 
@@ -792,6 +1047,7 @@ def translate_segments_grouped(
             source_text=seg.source_text,
             style_guide=style_guide,
             glossary=constraints,
+            target_only_glossary=target_only_constraints,
         )
         key = cache_key_for_messages(
             model=options.model, messages=messages, glossary_hash=g_hash
@@ -823,6 +1079,7 @@ def translate_segments_grouped(
                     request_json=request_json,
                     options=options,
                     entries=project_entries,
+                    glossary_view=glossary_view,
                 )
                 continue
 
@@ -832,6 +1089,7 @@ def translate_segments_grouped(
 
     if not group_segments:
         # Every segment was a cache hit or ineligible — nothing to do.
+        glossary_view.close()
         return [o for o in outcomes if o is not None]
 
     # Pass 2 — one LLM call for the surviving misses.
@@ -844,6 +1102,7 @@ def translate_segments_grouped(
         source_items=source_items,
         style_guide=style_guide,
         glossary=constraints,
+        target_only_glossary=target_only_constraints,
     )
     request_payload = {
         "model": options.model,
@@ -869,6 +1128,7 @@ def translate_segments_grouped(
             len(group_segments),
             exc,
         )
+        glossary_view.close()
         return _fill_fallback(
             engine=engine,
             project_id=project_id,
@@ -891,6 +1151,7 @@ def translate_segments_grouped(
         _logger.warning(
             "group translate parse failed — falling back per-segment (%s)", exc
         )
+        glossary_view.close()
         return _fill_fallback(
             engine=engine,
             project_id=project_id,
@@ -1008,9 +1269,11 @@ def translate_segments_grouped(
             batch_response_json=per_item_response_json,
             entries=project_entries,
             options=options,
+            glossary_view=glossary_view,
         )
 
     assert all(o is not None for o in outcomes), "group fill left a hole"
+    glossary_view.close()
     return [cast(TranslateOutcome, o) for o in outcomes]
 
 
@@ -1065,12 +1328,18 @@ def _commit_group_item(
     batch_response_json: str,
     entries: Sequence[GlossaryEntryWithAliases],
     options: TranslateOptions,
+    glossary_view: _GlossaryView | None = None,
 ) -> TranslateOutcome:
     """Persist one item from a successful group call.
 
     Mirrors the non-cache branch of :func:`translate_segment`: runs
     glossary validation + auto-propose, writes the segment update +
     ``llm_call`` audit row + events in a single transaction.
+
+    ``glossary_view`` carries attached-Lore-Book metadata so we can
+    skip mentions for entries that live in another DB and route
+    auto-proposed entries to a writable Lore Book when one is
+    configured (PRD F-LB-10 phase 3).
     """
 
     violations = validate_target(
@@ -1085,9 +1354,14 @@ def _commit_group_item(
 
     mentions = find_mentions(segment.source_text, entries)
     mention_entry_ids = tuple(dict.fromkeys(m.entry_id for m in mentions))
-    mention_payload: list[tuple[str, int | None, int | None]] = [
+    raw_mentions: list[tuple[str, int | None, int | None]] = [
         (m.entry_id, m.start, m.end) for m in mentions
     ]
+    mention_payload = (
+        glossary_view.filter_mentions(raw_mentions)
+        if glossary_view is not None
+        else raw_mentions
+    )
 
     llm_call_id = uuid.uuid4().hex
     proposed_ids: list[str] = []
@@ -1143,7 +1417,9 @@ def _commit_group_item(
                     "violations": [_violation_to_payload(v) for v in violations],
                 },
             )
-        if options.auto_propose:
+        if options.auto_propose and (
+            glossary_view is None or glossary_view.writable_lore_engine is None
+        ):
             proposed_ids.extend(
                 _auto_propose_entities(
                     conn,
@@ -1152,6 +1428,21 @@ def _commit_group_item(
                     trace=trace,
                 )
             )
+    if (
+        options.auto_propose
+        and glossary_view is not None
+        and glossary_view.writable_lore_engine is not None
+    ):
+        proposed_ids.extend(
+            _auto_propose_entities(
+                None,
+                project_id=project_id,
+                segment_id=segment.id,
+                trace=trace,
+                write_back_engine=glossary_view.writable_lore_engine,
+                write_back_project_id=glossary_view.writable_lore_project_id,
+            )
+        )
     _logger.info(
         "translated segment %s (grouped, %d→%d tokens, $%.6f) via %s%s",
         segment.id,

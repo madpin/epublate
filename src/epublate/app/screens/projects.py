@@ -51,16 +51,23 @@ _HERO_HINT = (
     f"  {ICON_BULLET} [b]n[/b] new project   "
     f"{ICON_BULLET} [b]o[/b] open by path   "
     f"{ICON_BULLET} [b]enter[/b] open selected   "
+    f"{ICON_BULLET} [b]L[/b] lore books   "
     f"{ICON_BULLET} [b]?[/b] help"
 )
 
 _EMPTY_BODY = (
     "[b]Welcome to epublate.[/b]\n\n"
-    "No projects opened yet — let's fix that.\n\n"
-    "  [b yellow]n[/]  Create a new project from a [i]source.epub[/]\n"
-    "  [b yellow]o[/]  Open an existing project folder by path\n"
-    "  [b yellow]?[/]  Cheat sheet (or [b]F1[/])  ·  "
-    "[b yellow]T[/]  Cycle theme  ·  [b yellow]q[/]  Quit"
+    "No projects opened yet — start one in three keystrokes.\n\n"
+    "  [b yellow]n[/]  Create a [b]new project[/] from a [i]source.epub[/]\n"
+    "         (you'll pick languages and an optional tone preset)\n\n"
+    "  [b yellow]o[/]  Open an existing project [b]folder[/] by path\n"
+    "         (look for a [i]<book>.epublate[/] file)\n\n"
+    "  [b yellow]L[/]  Browse [b]Lore Books[/] — portable lore bibles you\n"
+    "         can attach to multiple projects in a series\n\n"
+    "  [b yellow]?[/]  Cheat sheet (or [b]F1[/]) — keys, concepts, workflows\n"
+    "  [b yellow]T[/]  Cycle theme   ·   [b yellow]q[/]  Quit\n\n"
+    "  [dim]Tip: set [b]EPUBLATE_LLM_API_KEY[/] + [b]EPUBLATE_LLM_MODEL[/] in your\n"
+    "  shell, or pass [b]--mock-llm[/] to try the deterministic mock provider.[/]"
 )
 
 
@@ -70,6 +77,11 @@ class ProjectsScreen(Screen[None]):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("n", "new_project", "New", show=True),
         Binding("o", "open_project", "Open", show=True),
+        # Capital L jumps to the Lore Books screen — the second tab in
+        # the landing experience. We deliberately avoid binding lower
+        # ``l`` so it stays available as a raw character if a future
+        # search-as-you-type lands here.
+        Binding("L", "open_lore_books", "Lore Books", show=True),
         Binding("delete", "remove_selected", "Remove", show=True),
         Binding("x", "remove_selected", "Remove", show=False),
         Binding("r", "refresh", "Refresh", show=True),
@@ -174,6 +186,7 @@ class ProjectsScreen(Screen[None]):
         provider_factory: object | None = None,
         default_model: str | None = None,
         ui_config: UIConfig | None = None,
+        config_path: Path | None = None,
     ) -> None:
         super().__init__()
         # ``recents_path`` is exposed for the test suite so we don't poke
@@ -187,6 +200,11 @@ class ProjectsScreen(Screen[None]):
         # of any preference flips. Tests can pass a synthetic config to
         # exercise specific toggle states (auto tone-sniff, theme, …).
         self._ui_config: UIConfig = ui_config or UIConfig()
+        # The ``config_path`` carries through to the Dashboard → Settings
+        # so any per-machine preference edits land at the same file the
+        # caller is reading from. Production code passes ``None`` and
+        # falls back to ``default_config_path()``.
+        self._config_path = config_path
         self._store: RecentsStore = RecentsStore()
         self._active_project: Project | None = None
 
@@ -305,6 +323,24 @@ class ProjectsScreen(Screen[None]):
         modal = OpenProjectModal(recents_path=self._recents_path)
         self.app.push_screen(modal, self._on_open_project_done)
 
+    def action_open_lore_books(self) -> None:
+        """Push the Lore Books "tab".
+
+        We deliberately implement the Projects/Lore Books split as two
+        sibling screens rather than a ``TabbedContent`` so each list
+        keeps its own lifecycle: opening a Lore Book pushes its own
+        Dashboard, and popping back lands on the Lore Books screen,
+        not on Projects. ``q`` / ``Esc`` returns here.
+        """
+
+        from epublate.app.screens.lore_books import LoreBooksScreen
+
+        screen = LoreBooksScreen(
+            provider_factory=self._provider_factory,
+            helper_model=self._default_model,
+        )
+        self.app.push_screen(screen)
+
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         # Pressing Enter (or double-click) on a recents row picks that
         # project. We resolve the entry via the cursor row index since
@@ -336,7 +372,11 @@ class ProjectsScreen(Screen[None]):
             return
         self._reload_store()
         self._refresh_table()
-        self._open_project_handle(project)
+        # The "run intake after new project" preference (Settings →
+        # Intake) only fires here, never on a plain reopen.
+        self._open_project_handle(
+            project, auto_intake=self._ui_config.intake_run_after_new
+        )
 
     def _on_open_project_done(self, project: Project | None) -> None:
         if project is None:
@@ -376,7 +416,9 @@ class ProjectsScreen(Screen[None]):
         self._refresh_table()
         self._open_project_handle(project)
 
-    def _open_project_handle(self, project: Project) -> None:
+    def _open_project_handle(
+        self, project: Project, *, auto_intake: bool = False
+    ) -> None:
         from epublate.app.screens.dashboard import DashboardScreen
 
         self._close_active_project()
@@ -394,6 +436,9 @@ class ProjectsScreen(Screen[None]):
             project,
             provider_factory=provider_factory,  # type: ignore[arg-type]
             default_model=self._default_model or DEFAULT_MODEL,
+            ui_config=self._ui_config,
+            config_path=self._config_path,
+            auto_intake_on_first_mount=auto_intake,
         )
         self.app.push_screen(screen, self._on_dashboard_closed)
         self._set_status(f"Opened {project.name!r}.")

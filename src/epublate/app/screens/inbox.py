@@ -172,10 +172,15 @@ class InboxScreen(Screen[None]):
             status="proposed",
         )
         for entry in proposed:
+            label = (
+                entry.source_term
+                if entry.source_term is not None
+                else f"(target-only) {entry.target_term}"
+            )
             rows.append(
                 InboxRow(
                     kind="proposed",
-                    label=entry.source_term,
+                    label=label,
                     detail=f"type={entry.entry.type}",
                     timestamp=entry.entry.created_at or None,
                     payload_id=entry.id,

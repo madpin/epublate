@@ -469,12 +469,19 @@ class ReaderScreen(Screen[None]):
         *,
         provider_factory: ProviderFactory = build_provider,
         model: str = DEFAULT_MODEL,
+        initial_chapter_id: str | None = None,
     ) -> None:
         super().__init__()
         self._project = project
         self._provider_factory = provider_factory
         self._model = model
         self._provider: LLMProvider | None = None
+        # ``initial_chapter_id`` lets the Dashboard's chapter table jump
+        # straight to a chapter on Enter. We resolve it to the
+        # translatable index in :meth:`_load_state` because we don't
+        # know the chapter list until SQL has been read; until then we
+        # stash the requested id so the resolver can't be skipped.
+        self._initial_chapter_id = initial_chapter_id
         self._state: _ReaderState = _ReaderState(chapters=[], segments_by_chapter={})
         # Segment id → SegmentCard for the source / target panes. Both
         # panes mount/unmount in lockstep when the chapter changes.
@@ -583,6 +590,12 @@ class ReaderScreen(Screen[None]):
             chapters=translatable,
             segments_by_chapter=seg_map,
         )
+        if self._initial_chapter_id is not None:
+            for idx, chap in enumerate(translatable):
+                if chap.id == self._initial_chapter_id:
+                    self.chapter_idx = idx
+                    break
+            self._initial_chapter_id = None
         if self.chapter_idx >= len(translatable):
             self.chapter_idx = max(0, len(translatable) - 1)
         current_segs = self._current_segments()

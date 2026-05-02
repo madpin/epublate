@@ -61,6 +61,13 @@ class GlossaryEntry(BaseModel):
     curator may not have decided yet, in which case the auto-proposer
     seeds it with the source term verbatim (a sentinel the curator is
     expected to overwrite before promoting).
+
+    ``source_term`` is optional to support *target-only* entries that
+    live in a Lore Book (PRD F-LB-3): the curator pins the canonical
+    target form from an already-translated edition and lets the
+    translator pipeline discover the source-side mapping at runtime.
+    Project-scoped entries continue to require a source term — that
+    boundary is enforced in :mod:`epublate.db.repo`.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -68,7 +75,7 @@ class GlossaryEntry(BaseModel):
     id: str
     project_id: str
     type: EntityType = "term"
-    source_term: str
+    source_term: str | None = None
     target_term: str
     gender: GenderTag | None = None
     status: GlossaryStatusLiteral = "proposed"
@@ -76,6 +83,14 @@ class GlossaryEntry(BaseModel):
     first_seen_segment_id: str | None = None
     created_at: int = 0
     updated_at: int = 0
+    source_known: bool = True
+    """Whether this entry was authored with a known source spelling.
+
+    Defaults to ``True`` so existing project-scoped code paths and
+    legacy DB rows keep their original semantics. Set ``False`` for
+    target-only Lore Book entries; the validator (PRD F-LB-9) treats
+    locked target-only rows as a *soft* lock — warn rather than fail.
+    """
 
 
 class GlossaryAlias(BaseModel):
@@ -138,17 +153,29 @@ class GlossaryEntryWithAliases(BaseModel):
         return self.entry.status
 
     @property
-    def source_term(self) -> str:
+    def source_term(self) -> str | None:
         return self.entry.source_term
 
     @property
     def target_term(self) -> str:
         return self.entry.target_term
 
-    def all_source_terms(self) -> list[str]:
-        """Canonical source term followed by its aliases (deduped, ordered)."""
+    @property
+    def source_known(self) -> bool:
+        return self.entry.source_known
 
-        seen: dict[str, None] = {self.entry.source_term: None}
+    def all_source_terms(self) -> list[str]:
+        """Canonical source term followed by its aliases (deduped, ordered).
+
+        Target-only entries (``source_known=False`` / no ``source_term``)
+        return only their non-empty aliases — the matcher uses this list
+        to know which source spellings to look for, and a target-only
+        entry is allowed to have zero of them.
+        """
+
+        seen: dict[str, None] = {}
+        if self.entry.source_term:
+            seen[self.entry.source_term] = None
         for alias in self.source_aliases:
             if alias and alias not in seen:
                 seen[alias] = None

@@ -41,6 +41,19 @@ and ask the user.
    source contains a locked source-term but whose target does not use
    the canonical target-term. `confirmed` entries are warnings.
    `proposed` entries are suggestions only.
+
+   **Target-only entries are an explicit, narrow exception**
+   (PRD F-LB-9). Entries authored from a translated edition of the
+   work — Lore Books built via target ingest — pin the canonical
+   *target* spelling but leave `source_term` NULL (the curator never
+   saw the source wording). A locked target-only entry is therefore
+   **soft-locked**: the validator emits a warning, not an error, when
+   the canonical target form is missing, and the LLM prompt renders
+   it in a separate "canonical target terms used in this work" block
+   that asks the model to do the source→target binding in-segment.
+   Source-keyed `locked` entries keep their hard-fail semantics
+   without exception. Do not relax the source-keyed path "to make
+   target-only tests pass" — fix the prompt or the entry instead.
 3. **Resumability.** Every state-changing action goes through the DB
    in a single transaction. The app must be safe to crash and reopen
    at any point with no corruption. SQLite is in WAL mode. ePub

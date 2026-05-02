@@ -7,6 +7,8 @@ import pytest
 from epublate.errors import LLMResponseError
 from epublate.llm.prompts.translator import (
     GlossaryConstraint,
+    TargetOnlyConstraint,
+    build_group_translator_messages,
     build_translator_messages,
     parse_translator_response,
 )
@@ -73,6 +75,81 @@ def test_style_guide_appears_in_system_prompt() -> None:
 def test_empty_source_rejected() -> None:
     with pytest.raises(ValueError):
         build_translator_messages(source_lang="en", target_lang="pt", source_text="")
+
+
+def test_target_only_block_renders_when_provided() -> None:
+    target_only = [
+        TargetOnlyConstraint(
+            target_term="Geralt de Rívia",
+            type="character",
+            status="locked",
+            notes="protagonist",
+        ),
+        TargetOnlyConstraint(
+            target_term="Vesemir",
+            type="character",
+            status="confirmed",
+            target_aliases=("velho lobo",),
+        ),
+    ]
+    [system, _] = build_translator_messages(
+        source_lang="en",
+        target_lang="pt",
+        source_text="x",
+        target_only_glossary=target_only,
+    )
+    assert "Canonical target terms used in this work" in system.content
+    assert "Geralt de Rívia" in system.content
+    assert "Vesemir" in system.content
+    assert "aliases: velho lobo" in system.content
+    assert "MUST translate it using the canonical" in system.content
+    locked_idx = system.content.index("locked target forms")
+    confirmed_idx = system.content.index("confirmed target forms")
+    assert locked_idx < confirmed_idx
+
+
+def test_target_only_block_omitted_when_empty() -> None:
+    [system, _] = build_translator_messages(
+        source_lang="en",
+        target_lang="pt",
+        source_text="x",
+    )
+    assert "Canonical target terms used in this work" not in system.content
+
+
+def test_target_only_block_skips_proposed_only() -> None:
+    target_only = [
+        TargetOnlyConstraint(
+            target_term="Maybe-Term",
+            type="term",
+            status="proposed",
+        ),
+    ]
+    [system, _] = build_translator_messages(
+        source_lang="en",
+        target_lang="pt",
+        source_text="x",
+        target_only_glossary=target_only,
+    )
+    assert "Canonical target terms used in this work" not in system.content
+
+
+def test_group_messages_inject_target_only_block() -> None:
+    target_only = [
+        TargetOnlyConstraint(
+            target_term="Ciri",
+            type="character",
+            status="locked",
+        ),
+    ]
+    [system, _] = build_group_translator_messages(
+        source_lang="en",
+        target_lang="pt",
+        source_items=[(1, "hello"), (2, "world")],
+        target_only_glossary=target_only,
+    )
+    assert "Canonical target terms used in this work" in system.content
+    assert "Ciri" in system.content
 
 
 def test_parse_well_formed_json() -> None:

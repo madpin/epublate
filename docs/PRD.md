@@ -221,6 +221,49 @@ For each segment, the pipeline runs these phases:
   the old term and offers bulk re-translation.
 - **F-LB-8.** **Import/Export.** JSON and CSV. Optional "starter
   glossary" import at project creation.
+- **F-LB-9.** **Target-only entries** (soft-locked). Some entries pin
+  a canonical target spelling without ever recording the source-side
+  wording — typical when a Lore Book (F-LB-10) is built from an
+  already-translated edition rather than the original text. These
+  entries set ``source_term=NULL`` and ``source_known=False``. Because
+  there is no source pattern to anchor the validator, locked
+  target-only entries are **soft-locked**: the validator emits a
+  warning (not an error) when the canonical target form is missing,
+  and the translator's system prompt renders them in a dedicated
+  "canonical target terms used in this work" block that asks the
+  model to map source-language references it sees in-segment to the
+  canonical target form. Source-keyed locked entries (F-LB-3) keep
+  their hard-fail semantics — the relaxation applies only to
+  target-only entries.
+- **F-LB-10.** **Lore Books and series.** A *Lore Book* is a portable
+  Lore Bible stored as its own SQLite-backed folder
+  (``<name>.epublate-lore``). It can be created standalone, populated
+  from a source-language ePub via intake or from an already-translated
+  ePub via target-only extraction (F-LB-9), and then **attached** to
+  one or more translation projects. Each project keeps an
+  ``attached_lore`` list with a per-attachment mode
+  (``read_only`` | ``writable``) and priority. At translate time the
+  pipeline merges entries from the project DB and every attached
+  Lore Book (own *locked* > attached *locked* > own *confirmed* > …)
+  into a single matcher view; the LLM cache key hashes that merged
+  state so attaching/detaching invalidates cleanly. New auto-proposed
+  entries route to the highest-priority writable Lore Book when one
+  exists (else the project's own DB), so a Lore Book accumulates
+  bilingual mappings across an entire series. Projects can attach
+  any number of Lore Books; Lore Books can be shared across projects.
+  **Bootstrapping from a translated book.** A Lore Book can also be
+  populated directly from an existing translation project's curated
+  glossary — ``epublate lore new --from-project <path>`` and
+  ``epublate lore import-project <lore> <project>`` (CLI, ``--on-conflict
+  skip|overwrite``) and the Dashboard's ``p`` keybinding (TUI, with
+  per-conflict resolution). This is the fast path for series whose
+  book one was translated before the curator decided to factor a
+  Lore Book out: the destination accumulates source/target term
+  mappings with aliases, gender, notes, and source-known flags from
+  the project, and source-keyed conflicts are resolved by the curator
+  (``keep_existing`` / ``use_incoming`` / ``skip``). Re-importing the
+  same project is a no-op for unchanged rows.
+  Resolves PRD §11 open question #4.
 
 ### 4.4 LLM Integration
 
@@ -957,14 +1000,20 @@ explicitly and given a short failure-handling instruction.
    appears.
 3. **Title / front-matter / TOC translation.** Translate by default but
    make it opt-out per item.
-4. **Multi-book projects** (a series sharing a glossary). Out of scope
-   for v1, but the schema is ready: `project` could become `book` under
-   a parent `series`.
-5. **License and distribution model.** Already MIT per repo; confirm
+4. **License and distribution model.** Already MIT per repo; confirm
    we're happy distributing on PyPI as MIT.
 
 ### Resolved
 
+- ~~**Multi-book projects** (a series sharing a glossary).~~ Resolved:
+  shipped as **Lore Books** (PRD F-LB-10). Rather than turning
+  ``project`` into ``book`` under a parent ``series`` we kept the
+  project shape and introduced an attachable Lore Book artifact —
+  same outcome (one shared lore corpus across many books), simpler
+  schema, and the Lore Book is portable so it can travel with the
+  curator across machines or be shared between projects. Target-only
+  entries (F-LB-9) make the workflow viable even for series where
+  the curator only has the translated editions on hand.
 - ~~**`epubcheck` strictness** (M6).~~ Resolved: opt-in via the
   `[epubcheck]` PyPI extra, warn-only by default, `epublate export
   --strict` toggles hard-fail mode (PRD F-IO-6).

@@ -432,3 +432,297 @@ async def test_settings_screen_announces_env_override(
             assert "pins it on" in status
     finally:
         project.close()
+
+
+# ---------------------------------------------------------------------------
+# Editable panels (PRD §4.6 / M6 — settings overhaul)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_settings_project_panel_saves_name_and_budget(
+    tiny_epub_factory: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """The Project tab's Save button persists name + budget via the repo."""
+
+    from textual.widgets import Button, Input
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    try:
+        screen = SettingsScreen(project, config_path=tmp_path / "ui.toml")
+        app = EpublateApp(initial_screen=screen, config_path=tmp_path / "ui.toml")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            current = pilot.app.screen
+            assert isinstance(current, SettingsScreen)
+            current.query_one("#settings-project-name", Input).value = "Renamed Book"
+            current.query_one("#settings-project-budget", Input).value = "3.25"
+            current.query_one("#settings-project-save", Button).press()
+            await pilot.pause()
+
+            row = repo.get_project(project.engine, project.project_id)
+            assert row is not None
+            assert row.name == "Renamed Book"
+            assert row.budget_usd == pytest.approx(3.25)
+            assert project.name == "Renamed Book"
+
+            body = str(current.query_one("#settings-project-body").render())
+            assert "Renamed Book" in body
+            assert "$3.2500" in body
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
+async def test_settings_project_panel_blank_budget_clears(
+    tiny_epub_factory: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Clearing the budget input must wipe the persisted cap."""
+
+    from textual.widgets import Button, Input
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    try:
+        repo.update_project_budget(
+            project.engine, project_id=project.project_id, budget_usd=5.0
+        )
+        screen = SettingsScreen(project, config_path=tmp_path / "ui.toml")
+        app = EpublateApp(initial_screen=screen, config_path=tmp_path / "ui.toml")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            current = pilot.app.screen
+            assert isinstance(current, SettingsScreen)
+            current.query_one("#settings-project-budget", Input).value = ""
+            current.query_one("#settings-project-save", Button).press()
+            await pilot.pause()
+            row = repo.get_project(project.engine, project.project_id)
+            assert row is not None
+            assert row.budget_usd is None
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
+async def test_settings_llm_panel_saves_overrides(
+    tiny_epub_factory: Callable[..., Path],
+    tmp_path: Path,
+    llm_env: None,
+) -> None:
+    """The LLM tab persists per-project overrides as a JSON blob."""
+
+    from textual.widgets import Button, Input
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    try:
+        screen = SettingsScreen(
+            project, default_model="gpt-5-mini", config_path=tmp_path / "ui.toml"
+        )
+        app = EpublateApp(initial_screen=screen, config_path=tmp_path / "ui.toml")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            current = pilot.app.screen
+            assert isinstance(current, SettingsScreen)
+            current.query_one(
+                "#settings-llm-base-url", Input
+            ).value = "https://router.example/v1"
+            current.query_one(
+                "#settings-llm-translator-model", Input
+            ).value = "gpt-5-pro"
+            current.query_one("#settings-llm-helper-model", Input).value = "gpt-5-nano"
+            current.query_one("#settings-llm-save", Button).press()
+            await pilot.pause()
+
+            persisted = repo.get_llm_overrides(project.engine, project.project_id)
+            assert persisted == {
+                "base_url": "https://router.example/v1",
+                "translator_model": "gpt-5-pro",
+                "helper_model": "gpt-5-nano",
+            }
+
+            body = str(current.query_one("#settings-llm-body").render())
+            assert "gpt-5-pro" in body
+            assert "router.example" in body
+            assert "(override)" in body
+
+            current.query_one("#settings-llm-clear", Button).press()
+            await pilot.pause()
+            assert repo.get_llm_overrides(project.engine, project.project_id) == {}
+            body_cleared = str(current.query_one("#settings-llm-body").render())
+            assert "overrides    : none" in body_cleared
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
+async def test_settings_intake_panel_saves_to_ui_config(
+    tiny_epub_factory: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Intake defaults persist to the UIConfig snapshot + the TOML file."""
+
+    from textual.widgets import Button, Input
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    config_path = tmp_path / "ui.toml"
+    ui_config = UIConfig()
+    try:
+        screen = SettingsScreen(project, ui_config=ui_config, config_path=config_path)
+        app = EpublateApp(initial_screen=screen, config_path=config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            current = pilot.app.screen
+            assert isinstance(current, SettingsScreen)
+            current.query_one(
+                "#settings-intake-helper-model", Input
+            ).value = "gpt-5-nano"
+            current.query_one("#settings-intake-max-segments", Input).value = "75"
+            current.query_one("#settings-intake-run-after", Input).value = "y"
+            current.query_one("#settings-intake-save", Button).press()
+            await pilot.pause()
+
+            assert ui_config.intake_helper_model == "gpt-5-nano"
+            assert ui_config.intake_max_segments == 75
+            assert ui_config.intake_run_after_new is True
+
+            persisted = UIConfig.load(config_path)
+            assert persisted.intake_helper_model == "gpt-5-nano"
+            assert persisted.intake_max_segments == 75
+            assert persisted.intake_run_after_new is True
+
+            body = str(current.query_one("#settings-intake-body").render())
+            assert "gpt-5-nano" in body
+            assert "75" in body
+            assert "on" in body
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
+async def test_settings_concurrency_panel_validates_and_saves(
+    tiny_epub_factory: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Concurrency tab persists ints; an invalid value is reported, not raised."""
+
+    from textual.widgets import Button, Input
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    config_path = tmp_path / "ui.toml"
+    ui_config = UIConfig()
+    try:
+        screen = SettingsScreen(project, ui_config=ui_config, config_path=config_path)
+        app = EpublateApp(initial_screen=screen, config_path=config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            current = pilot.app.screen
+            assert isinstance(current, SettingsScreen)
+            current.query_one("#settings-concurrency-batch", Input).value = "0"
+            current.query_one("#settings-concurrency-save", Button).press()
+            await pilot.pause()
+            status = str(current.query_one("#settings-status").render())
+            assert "Concurrency must be at least 1" in status
+            assert ui_config.batch_concurrency == 1
+
+            current.query_one("#settings-concurrency-batch", Input).value = "4"
+            current.query_one("#settings-concurrency-retries", Input).value = "3"
+            current.query_one("#settings-concurrency-save", Button).press()
+            await pilot.pause()
+
+            assert ui_config.batch_concurrency == 4
+            assert ui_config.batch_retries == 3
+            persisted = UIConfig.load(config_path)
+            assert persisted.batch_concurrency == 4
+            assert persisted.batch_retries == 3
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
+async def test_settings_ui_panel_saves_theme_dropdown(
+    tiny_epub_factory: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Theme dropdown saves to the live ``UIConfig`` and persists to disk."""
+
+    from textual.widgets import Button, Select
+
+    from epublate.app.themes import EPUBLATE_THEME_ORDER
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    config_path = tmp_path / "ui.toml"
+    ui_config = UIConfig(theme=EPUBLATE_THEME_ORDER[0])
+    try:
+        screen = SettingsScreen(project, ui_config=ui_config, config_path=config_path)
+        app = EpublateApp(initial_screen=screen, config_path=config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            current = pilot.app.screen
+            assert isinstance(current, SettingsScreen)
+            target_theme = EPUBLATE_THEME_ORDER[-1]
+            select = current.query_one("#settings-ui-theme", Select)
+            select.value = target_theme
+            await pilot.pause()
+            current.query_one("#settings-ui-save", Button).press()
+            await pilot.pause()
+
+            assert pilot.app.theme == target_theme
+            assert ui_config.theme == target_theme
+            persisted = UIConfig.load(config_path)
+            assert persisted.theme == target_theme
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_propagates_ui_config_to_settings(
+    tiny_epub_factory: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Edits made on the Settings screen survive a Dashboard round-trip.
+
+    Regression test for the original drift bug: Dashboard pushed
+    Settings without a ``UIConfig`` snapshot, so any persisted edit
+    was silently re-loaded from disk and ignored on Dashboard refresh.
+    Now both screens share the same in-memory snapshot.
+    """
+
+    from textual.widgets import Button, Input
+
+    from epublate.app.themes import EPUBLATE_THEME_ORDER
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    config_path = tmp_path / "ui.toml"
+    ui_config = UIConfig(theme=EPUBLATE_THEME_ORDER[0], batch_concurrency=1)
+    try:
+        screen = DashboardScreen(
+            project,
+            provider_factory=MockLLMProvider,
+            ui_config=ui_config,
+            config_path=config_path,
+        )
+        app = EpublateApp(initial_screen=screen, config_path=config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("s")
+            await pilot.pause()
+            settings = pilot.app.screen
+            assert isinstance(settings, SettingsScreen)
+            assert settings.ui_config is ui_config
+
+            settings.query_one("#settings-concurrency-batch", Input).value = "5"
+            settings.query_one("#settings-concurrency-save", Button).press()
+            await pilot.pause()
+            assert ui_config.batch_concurrency == 5
+
+            await pilot.press("q")
+            await pilot.pause()
+            dashboard = pilot.app.screen
+            assert isinstance(dashboard, DashboardScreen)
+            # The Dashboard's snapshot is the same object Settings just
+            # mutated, so its BatchModal would default to 5 concurrency.
+            assert dashboard._ui_config is ui_config  # type: ignore[attr-defined]
+            assert dashboard._ui_config.batch_concurrency == 5  # type: ignore[attr-defined]
+    finally:
+        project.close()
