@@ -56,6 +56,12 @@ dev = [
     "hypothesis>=6.100",
     "ruff>=0.6",
     "mypy>=1.10",
+    # Pure-Rust SVG rasterizer used by ``scripts/capture_screenshots.py``
+    # to emit PNGs alongside the SVG screenshots committed in
+    # ``docs/screenshots/``. It bundles all native deps in the wheel so
+    # the script works on macOS / Linux / Windows without a system
+    # cairo/librsvg install.
+    "resvg-py>=0.3",
 ]
 
 [tool.hatch.build.targets.wheel]

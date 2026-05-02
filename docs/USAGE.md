@@ -21,6 +21,8 @@ plus the keys that drive the rest of the app.
 uv run epublate --mock-llm
 ```
 
+![Projects landing screen](screenshots/01-projects.png)
+
 | Key       | Action                                                          |
 | --------- | --------------------------------------------------------------- |
 | `n`       | New project (modal: source ePub, target / source lang, out dir) |
@@ -36,6 +38,14 @@ The recents list lives at `~/.config/epublate/recents.json` and is
 written every time you create or open a project (whether from the
 TUI or the CLI). Pressing `enter` on a row pushes the Project
 Dashboard.
+
+Pressing `n` opens the **New Project** modal (or `o` for **Open
+Project**); both let you bootstrap or import a project without
+leaving the TUI:
+
+| New project (`n`) | Open project (`o`) |
+| --- | --- |
+| ![New project modal](screenshots/02-new-project.png) | ![Open project modal](screenshots/03-open-project.png) |
 
 ## 1b. CLI bootstrap (scripts / CI)
 
@@ -74,6 +84,8 @@ uv run epublate --mock-llm open /tmp/epublate-sample
 The Dashboard is the landing screen for an open project. It shows
 progress, cost, the curator inbox digest, and recent activity.
 
+![Project Dashboard](screenshots/04-dashboard.png)
+
 Key bindings (PRD §4.6 / M6):
 
 | Key       | Action                                                             |
@@ -97,11 +109,25 @@ hidden from the binding bar to keep the footer compact, but it works
 identically.
 
 The cheat sheet introspects the active screen's `BINDINGS`, so it
-stays accurate when new actions land.
+stays accurate when new actions land. Press `?` (or `F1`) anywhere to
+overlay it on the current screen:
+
+![Help / cheat sheet overlay](screenshots/09-help.png)
 
 The chosen theme persists across runs in
 `~/.config/epublate/ui.toml` (the file is created on demand and
 otherwise managed by the TUI; you don't need to edit it by hand).
+The `T` keybinding rotates through the four bundled themes —
+`epublate` (the warm default), `textual-dark`, `textual-light`, and
+the WCAG-AA-tuned `epublate-contrast`:
+
+| `epublate` (default) | `textual-dark` |
+| --- | --- |
+| ![epublate theme](screenshots/04-dashboard.png) | ![textual-dark](screenshots/10-dashboard-theme-textual-dark.png) |
+
+| `textual-light` | `epublate-contrast` |
+| --- | --- |
+| ![textual-light](screenshots/11-dashboard-theme-textual-light.png) | ![epublate-contrast](screenshots/12-dashboard-theme-contrast.png) |
 
 ## 3. Translate
 
@@ -110,6 +136,8 @@ Two paths are available:
 * **Interactively** — press `o` from the Dashboard to open the Reader.
   `t` translates, `j`/`k` navigate segments, `J`/`K` navigate
   chapters, `a` accepts, `e` edits, `r` retries.
+
+  ![Reader screen](screenshots/05-reader.png)
 
 * **Headlessly** — exit the TUI and run a batch:
 
@@ -131,8 +159,14 @@ The Inbox (`i` from the Dashboard) groups three kinds of work:
   trigger a cascade re-translation (PRD F-G-7).
 * **Alerts** — budget pauses, LLM errors, intake summaries.
 
+![Curator Inbox](screenshots/07-inbox.png)
+
 Use `g` for the full Glossary curator: edit translations, lock
-entries, manage aliases, view per-entry revision history.
+entries, manage aliases, view per-entry revision history. The right
+pane shows the highlighted entry's notes, alias list, mention count,
+and revision log:
+
+![Glossary curator](screenshots/06-glossary.png)
 
 ## 5. Inspect cost / progress
 
@@ -219,7 +253,9 @@ export EPUBLATE_LLM_HELPER_MODEL=gpt-5-mini  # optional, defaults to $EPUBLATE_L
 Any OpenAI-compatible endpoint works (Azure OpenAI, OpenRouter,
 Together, Ollama, vLLM, llama.cpp). The Settings screen (`s` on the
 Dashboard) shows the resolved values with the API key redacted to
-the first four / last two characters.
+the first four / last two characters:
+
+![Settings screen](screenshots/08-settings.png)
 
 ## Where things live on disk
 

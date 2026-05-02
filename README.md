@@ -5,6 +5,8 @@
 > characters, places, and events stay **consistent** across the entire
 > book.
 
+![epublate Projects landing screen](docs/screenshots/01-projects.png)
+
 **Status:** v1 release-ready (`0.1.0`). All milestones M0 through M6
 are landed: the project skeleton + CI, ePub round-trip, single-segment
 translation, glossary v1 with cascade, Project Dashboard + batch + cost
@@ -61,6 +63,26 @@ memory of prior decisions. `epublate` fixes all three:
 
 PDF support is a **non-goal in v1**, but the format-handling layer is
 designed to make it pluggable later.
+
+## A tour, in pictures
+
+| Project Dashboard | Reader |
+| --- | --- |
+| ![Project Dashboard](docs/screenshots/04-dashboard.png) | ![Reader](docs/screenshots/05-reader.png) |
+
+| Glossary curator | Curator Inbox |
+| --- | --- |
+| ![Glossary](docs/screenshots/06-glossary.png) | ![Inbox](docs/screenshots/07-inbox.png) |
+
+| Settings | Help / cheat sheet (press `?`) |
+| --- | --- |
+| ![Settings](docs/screenshots/08-settings.png) | ![Help overlay](docs/screenshots/09-help.png) |
+
+See [`docs/USAGE.md`](docs/USAGE.md) for the full curator walkthrough.
+The screenshots above are regenerated from the live TUI by
+[`scripts/capture_screenshots.py`](scripts/capture_screenshots.py)
+(`uv run python scripts/capture_screenshots.py`); both SVGs and PNGs
+land in [`docs/screenshots/`](docs/screenshots/).
 
 ## Quickstart (development)
 

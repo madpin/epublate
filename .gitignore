@@ -226,3 +226,4 @@ __marimo__/
 # pytest-textual-snapshot diff report (artifacts only — baselines are committed)
 /snapshot_report.html
 .DS_Store
+docs/Dictator.epub
