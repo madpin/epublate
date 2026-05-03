@@ -355,6 +355,196 @@ def test_merge_glossary_entries_no_op_on_empty_losers(project_db: Engine) -> Non
     assert merged == 0
 
 
+def test_count_mentions_per_entry_aggregates_total_and_segments(
+    project_db: Engine,
+) -> None:
+    """Aggregate counts: total mentions and distinct segments per entry.
+
+    Several mentions in the same segment count toward ``mentions``
+    once per match, but only once toward ``segments`` — that's the
+    contract surfaced as ``"5 (3s)"`` on the Glossary screen.
+    """
+
+    pid = _ensure_project(project_db)
+    other = repo.create_glossary_entry(
+        project_db,
+        project_id=pid,
+        source_term="Other",
+        target_term="Outro",
+    )
+    senate = repo.create_glossary_entry(
+        project_db,
+        project_id=pid,
+        source_term="Senate",
+        target_term="Senado",
+    )
+    chap = repo.ChapterRow(
+        id="c1", project_id=pid, spine_idx=0, href="c.xhtml", status="pending"
+    )
+    repo.bulk_insert_chapters(project_db, [chap])
+    segs = [
+        repo.SegmentRow(
+            id="s1",
+            chapter_id="c1",
+            idx=0,
+            source_text="Senate met. Senate voted.",
+            source_hash="0" * 64,
+        ),
+        repo.SegmentRow(
+            id="s2",
+            chapter_id="c1",
+            idx=1,
+            source_text="Senate adjourned.",
+            source_hash="1" * 64,
+        ),
+    ]
+    repo.bulk_insert_segments(project_db, segs)
+    repo.record_mentions(
+        project_db,
+        segment_id="s1",
+        mentions=[(senate.id, 0, 6), (senate.id, 12, 18)],
+    )
+    repo.record_mentions(
+        project_db,
+        segment_id="s2",
+        mentions=[(senate.id, 0, 6)],
+    )
+
+    counts = repo.count_mentions_per_entry(project_db, pid)
+    assert counts[senate.id] == repo.MentionCounts(mentions=3, segments=2)
+    assert other.id not in counts
+
+
+def test_count_mentions_per_entry_scoped_to_project(project_db: Engine) -> None:
+    """A sibling project's mentions never leak into another project's counts."""
+
+    pid = _ensure_project(project_db, project_id="proj-A")
+    other_pid = _ensure_project(project_db, project_id="proj-B")
+    entry = repo.create_glossary_entry(
+        project_db, project_id=pid, source_term="X", target_term="X"
+    )
+    repo.bulk_insert_chapters(
+        project_db,
+        [
+            repo.ChapterRow(
+                id="cA", project_id=pid, spine_idx=0, href="a.xhtml", status="pending"
+            ),
+            repo.ChapterRow(
+                id="cB",
+                project_id=other_pid,
+                spine_idx=0,
+                href="b.xhtml",
+                status="pending",
+            ),
+        ],
+    )
+    repo.bulk_insert_segments(
+        project_db,
+        [
+            repo.SegmentRow(
+                id="sA",
+                chapter_id="cA",
+                idx=0,
+                source_text="X",
+                source_hash="0" * 64,
+            ),
+            repo.SegmentRow(
+                id="sB",
+                chapter_id="cB",
+                idx=0,
+                source_text="X",
+                source_hash="1" * 64,
+            ),
+        ],
+    )
+    repo.record_mentions(project_db, segment_id="sA", mentions=[(entry.id, 0, 1)])
+    repo.record_mentions(project_db, segment_id="sB", mentions=[(entry.id, 0, 1)])
+
+    counts_a = repo.count_mentions_per_entry(project_db, pid)
+    counts_b = repo.count_mentions_per_entry(project_db, other_pid)
+    assert counts_a[entry.id].mentions == 1
+    assert counts_a[entry.id].segments == 1
+    assert counts_b[entry.id].mentions == 1
+
+
+def test_list_occurrences_orders_by_book_position(project_db: Engine) -> None:
+    """Occurrences come back in book order: spine_idx → seg.idx → span_start.
+
+    The Glossary "Show occurrences" modal feeds rows straight into a
+    DataTable, so the repo must do the ordering — otherwise the
+    curator sees a chaotic, insertion-order list.
+    """
+
+    pid = _ensure_project(project_db)
+    entry = repo.create_glossary_entry(
+        project_db,
+        project_id=pid,
+        source_term="House",
+        target_term="Câmara",
+    )
+    chapters = [
+        repo.ChapterRow(
+            id="c2",
+            project_id=pid,
+            spine_idx=1,
+            href="c2.xhtml",
+            title="Two",
+            status="pending",
+        ),
+        repo.ChapterRow(
+            id="c1",
+            project_id=pid,
+            spine_idx=0,
+            href="c1.xhtml",
+            title="One",
+            status="pending",
+        ),
+    ]
+    repo.bulk_insert_chapters(project_db, chapters)
+    segs = [
+        repo.SegmentRow(
+            id="s2-1",
+            chapter_id="c2",
+            idx=1,
+            source_text="The House debated.",
+            source_hash="2" * 64,
+            target_text="A Câmara debateu.",
+        ),
+        repo.SegmentRow(
+            id="s1-0",
+            chapter_id="c1",
+            idx=0,
+            source_text="House and House.",
+            source_hash="1" * 64,
+            target_text="Câmara e Câmara.",
+        ),
+    ]
+    repo.bulk_insert_segments(project_db, segs)
+    # Insert mentions out of order to verify the sort happens in SQL.
+    repo.record_mentions(
+        project_db,
+        segment_id="s2-1",
+        mentions=[(entry.id, 4, 9)],
+    )
+    repo.record_mentions(
+        project_db,
+        segment_id="s1-0",
+        mentions=[(entry.id, 11, 16), (entry.id, 0, 5)],
+    )
+
+    rows = repo.list_occurrences(project_db, project_id=pid, entry_id=entry.id)
+    keyed = [(r.chapter_spine_idx, r.segment_idx, r.source_span_start) for r in rows]
+    assert keyed == [(0, 0, 0), (0, 0, 11), (1, 1, 4)]
+    assert rows[0].chapter_title == "One"
+    assert rows[2].chapter_title == "Two"
+    assert rows[0].target_text == "Câmara e Câmara."
+
+
+def test_list_occurrences_empty_for_unknown_entry(project_db: Engine) -> None:
+    pid = _ensure_project(project_db)
+    assert repo.list_occurrences(project_db, project_id=pid, entry_id="nope") == []
+
+
 def test_update_segment_status_does_not_touch_target(project_db: Engine) -> None:
     pid = _ensure_project(project_db)
     chap = repo.ChapterRow(

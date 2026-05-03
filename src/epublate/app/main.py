@@ -39,7 +39,7 @@ from textual.binding import Binding, BindingType
 from textual.screen import Screen
 
 from epublate.app.config import UIConfig
-from epublate.app.messages import BatchFinished, BatchTick
+from epublate.app.messages import BatchFinished, BatchPrePassTick, BatchTick
 from epublate.app.screens.help import HelpScreen
 from epublate.app.screens.projects import ProjectsScreen
 from epublate.app.themes import (
@@ -53,6 +53,7 @@ from epublate.core.batch import (
     BatchCancelled,
     BatchOptions,
     BatchPaused,
+    BatchPrePassProgress,
     BatchProgressEvent,
     BatchSummary,
     run_batch,
@@ -327,6 +328,7 @@ class EpublateApp(App[None]):
                 provider=provider,
                 options=options,
                 on_progress=self._post_batch_progress,
+                on_pre_pass_progress=self._post_pre_pass_progress,
                 cancel_event=handle.cancel_event,
             )
         except BatchPaused as paused:
@@ -380,6 +382,26 @@ class EpublateApp(App[None]):
                 listener.post_message(BatchTick(event))
             except Exception:  # pragma: no cover — defensive
                 _logger.debug("listener no longer accepts messages")
+
+    def _post_pre_pass_progress(self, event: BatchPrePassProgress) -> None:
+        """Worker-thread callback: posts a pre-pass tick to the listener.
+
+        Pre-pass progress doesn't move the segment-count meter (the
+        helper LLM doesn't translate segments) but it surfaces "the
+        helper is alive" to the curator's status line, which kept
+        bug-2026-05 alive long enough for users to think a pre-pass
+        was a deadlock. The Dashboard reads ``event.chapter_index``
+        / ``chunk_index`` to render "pre-pass: ch 2/30 chunk 1/3" in
+        the status footer.
+        """
+
+        listener = self._batch_listener
+        if listener is None:
+            return
+        try:
+            listener.post_message(BatchPrePassTick(event))
+        except Exception:  # pragma: no cover — defensive
+            _logger.debug("listener no longer accepts pre-pass messages")
 
     def _on_worker_done(
         self,

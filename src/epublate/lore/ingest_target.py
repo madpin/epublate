@@ -51,7 +51,11 @@ from epublate.formats.epub import EpubAdapter
 from epublate.glossary.enforcer import glossary_hash
 from epublate.glossary.models import EntityType, GlossaryEntryWithAliases
 from epublate.llm.base import LLMProvider, ResponseFormat
+from epublate.llm.json_mode import chat_with_json_fallback
 from epublate.llm.pricing import estimate_cost
+from epublate.llm.prompts.extractor_target import (
+    DEFAULT_RESPONSE_FORMAT as DEFAULT_TARGET_EXTRACTOR_RESPONSE_FORMAT,
+)
 from epublate.llm.prompts.extractor_target import (
     TargetExtractedEntity,
     TargetExtractorTrace,
@@ -67,6 +71,15 @@ _logger = logging.getLogger(__name__)
 PURPOSE_LORE_TARGET_EXTRACT = "lore_target_extract"
 DEFAULT_TARGET_CHUNK_MAX_CHARS = 6000
 DEFAULT_TARGET_MAX_CHAPTERS = 8
+DEFAULT_TARGET_FAILURE_STREAK_LIMIT = 3
+"""Abort the loop after this many *consecutive* failed chunks.
+
+Mirrors :data:`epublate.core.extractor.DEFAULT_FAILURE_STREAK_LIMIT`.
+Set to ``0`` to disable the breaker and keep the legacy "best-effort,
+never abort" behavior.
+"""
+
+_TARGET_ERROR_TRUNCATION = 240
 
 _VALID_ENTITY_TYPES: frozenset[str] = frozenset(
     [
@@ -116,7 +129,8 @@ def ingest_target_epub(
     chunk_max_chars: int = DEFAULT_TARGET_CHUNK_MAX_CHARS,
     bypass_cache: bool = False,
     notes: str | None = None,
-    response_format: ResponseFormat | None = None,
+    response_format: ResponseFormat | None = DEFAULT_TARGET_EXTRACTOR_RESPONSE_FORMAT,
+    failure_streak_limit: int = DEFAULT_TARGET_FAILURE_STREAK_LIMIT,
 ) -> tuple[lore_repo.LoreSourceRow, TargetIngestSummary]:
     """Run a target-language extractor pass against ``epub_path``.
 
@@ -187,7 +201,10 @@ def ingest_target_epub(
         lore_book.engine, lore_book.project_id
     )
 
-    for chunk in chunks:
+    streak = 0
+    last_error: str | None = None
+    aborted = False
+    for idx, chunk in enumerate(chunks):
         try:
             outcome = _extract_target_chunk(
                 lore_book=lore_book,
@@ -211,12 +228,35 @@ def ingest_target_epub(
                     "reason": str(exc),
                 },
             )
+            streak += 1
+            last_error = _short_target_error(exc)
+            if _should_trip_target_breaker(streak, failure_streak_limit):
+                aborted = True
+                _log_target_abort(
+                    streak=streak,
+                    remaining=len(chunks) - (idx + 1),
+                    last_error=last_error,
+                )
+                summary.failed_chunks += len(chunks) - (idx + 1)
+                break
             continue
         except Exception as exc:
             _logger.warning("lore target ingest chunk failed: %s", exc)
             summary.failed_chunks += 1
+            streak += 1
+            last_error = _short_target_error(exc)
+            if _should_trip_target_breaker(streak, failure_streak_limit):
+                aborted = True
+                _log_target_abort(
+                    streak=streak,
+                    remaining=len(chunks) - (idx + 1),
+                    last_error=last_error,
+                )
+                summary.failed_chunks += len(chunks) - (idx + 1)
+                break
             continue
 
+        streak = 0
         summary.chunks += 1
         summary.prompt_tokens += outcome.prompt_tokens
         summary.completion_tokens += outcome.completion_tokens
@@ -245,7 +285,7 @@ def ingest_target_epub(
     repo.append_event(
         lore_book.engine,
         project_id=lore_book.project_id,
-        kind="lore.target_ingested",
+        kind=("lore.target_ingest_aborted" if aborted else "lore.target_ingested"),
         payload={
             "source_id": source_row.id,
             "epub_path": str(stash_path),
@@ -253,6 +293,7 @@ def ingest_target_epub(
             "failed_chunks": summary.failed_chunks,
             "status": schema.LoreSourceStatus.INGESTED,
             "cost_usd": summary.cost_usd,
+            **({"failure_streak": streak, "last_error": last_error} if aborted else {}),
         },
     )
     return source_row, summary
@@ -268,6 +309,46 @@ class _TargetExtractOutcome:
     completion_tokens: int
     cost_usd: float
     proposed_entry_ids: tuple[str, ...]
+
+
+def _should_trip_target_breaker(streak: int, limit: int) -> bool:
+    """Whether the failure streak crossed the configured circuit-breaker limit.
+
+    Mirrors :func:`epublate.core.extractor._should_trip_breaker`. A
+    non-positive ``limit`` disables the breaker.
+    """
+
+    return limit > 0 and streak >= limit
+
+
+def _short_target_error(exc: BaseException) -> str:
+    """Truncate an exception message for an event payload / log line."""
+
+    text = str(exc)
+    if len(text) <= _TARGET_ERROR_TRUNCATION:
+        return text
+    return text[: _TARGET_ERROR_TRUNCATION - 1] + "\u2026"
+
+
+def _log_target_abort(*, streak: int, remaining: int, last_error: str) -> None:
+    """Single-line warning for a tripped target-ingest circuit breaker.
+
+    Calls out the most likely root cause (reasoning helper on a hosted
+    endpoint that returns empty visible content) so the curator has a
+    one-step fix to try.
+    """
+
+    _logger.warning(
+        "lore target ingest aborted after %d consecutive failed chunks "
+        "(skipping %d remaining). Last error: %s. If you're using a "
+        "reasoning-style helper (gpt-oss-*, deepseek-r1, ...), it may "
+        "be returning empty visible content because reasoning tokens "
+        "consume the entire visible-channel budget. Try a non-reasoning "
+        "helper via $EPUBLATE_LLM_HELPER_MODEL or the project override.",
+        streak,
+        remaining,
+        last_error,
+    )
 
 
 def _extract_target_chunk(
@@ -321,7 +402,8 @@ def _extract_target_chunk(
                 request_json=request_json,
             )
 
-    chat_result = provider.chat(
+    chat_result = chat_with_json_fallback(
+        provider,
         messages,
         model=helper_model,
         response_format=response_format,

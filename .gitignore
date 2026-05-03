@@ -157,6 +157,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# Local credential bundles for scripts/smoke_llm_credentials.py
+.smoke_configs.json
+
 # Spyder project settings
 .spyderproject
 .spyproject

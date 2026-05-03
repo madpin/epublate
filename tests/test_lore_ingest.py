@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from epublate.db import repo, schema
-from epublate.llm.base import Message
+from epublate.llm.base import Message, ResponseFormat
 from epublate.llm.mock import MockLLMProvider
 from epublate.lore import (
     LoreBook,
@@ -230,6 +230,36 @@ def test_ingest_target_epub_dedupes_known_target_terms(
             for e in repo.list_glossary_entries(book.engine, book.project_id)
         }
         assert targets == {"Geralt", "Kaer Morhen"}
+    finally:
+        book.close()
+
+
+def test_ingest_target_epub_defaults_to_json_response_format(
+    tmp_path: Path,
+    tiny_epub_factory: Callable[..., Path],
+) -> None:
+    """The target ingest helper requests JSON mode by default so the
+    target extractor doesn't have to recover JSON from prose (the
+    failure mode reasoning helpers like ``gpt-oss-20b`` hit when
+    the visible-channel budget is consumed by reasoning tokens).
+    """
+
+    book = _make_lore_book(tmp_path)
+    provider = MockLLMProvider()
+    provider.set_response(json.dumps({"entities": []}))
+    target_epub = tiny_epub_factory(
+        _portuguese_chapters(), name="lore-target-jsonmode", language="pt"
+    )
+    try:
+        ingest_target_epub(
+            book,
+            epub_path=target_epub,
+            provider=provider,
+            helper_model="mock-helper",
+        )
+        last = provider.last_request
+        assert last is not None
+        assert last.response_format == ResponseFormat(type="json_object")
     finally:
         book.close()
 

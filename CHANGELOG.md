@@ -7,6 +7,487 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Rate-limit (HTTP 429) pauses the batch instead of failing every segment
+
+A curator running a batch against the OpenRouter free tier hit
+`Rate limit exceeded: free-models-per-day. Add 6.55 credits to unlock
+1000 free model requests per day` *per segment* for the rest of the
+run — the daily quota was depleted, every retry burned a worker, and
+the meter looked like translation was happening when nothing was
+landing in the database. Two compounding causes:
+
+1. The OpenAI-compatible provider treated 429 as a generic retryable
+   status (4 quick retries with 0.5–8s backoff) and then surfaced it
+   as ``LLMResponseError``. A free-tier daily quota resets at UTC
+   midnight, *not* in 8 seconds — every retry was wasted.
+2. The batch worker caught the resulting error as an opaque per-segment
+   failure, recorded it in ``summary.failures``, and immediately moved
+   on to the next segment, which hit the same 429.
+
+Fix: the provider now distinguishes *short* rate-limit waits (server
+hint ``Retry-After: 5`` → honor it, retry within budget) from *long*
+waits (``X-RateLimit-Reset`` minutes-to-hours away → lift out as a
+typed ``LLMRateLimitError``). The batch runner catches that error
+class in both worker boundaries — translator and helper-LLM
+pre-pass — and pauses the run with the provider's verbatim message in
+the pause reason (so the curator sees "Add 6.55 credits to unlock
+1000 free model requests per day" or "resets in ~5h" without digging
+through logs). Pending segments stay ``pending`` so the run resumes
+cleanly after the curator switches model, adds credits, or waits.
+
+- ``epublate.errors.LLMRateLimitError`` → new typed exception. Subclass
+  of ``LLMResponseError`` (so callers that already catch the parent
+  see it) carrying ``retry_after_seconds`` and ``provider_message``
+  for actionable surfacing.
+- ``epublate.llm.openai_compat`` → 429 is no longer in the generic
+  retryable-statuses set. ``RateLimitError`` is caught explicitly:
+  ``Retry-After`` ≤ 120s sleeps and retries within the per-call
+  budget; ``X-RateLimit-Reset`` more than 120s away (free-tier daily
+  quotas, monthly caps) raises immediately.
+- ``epublate.llm.json_mode.chat_with_json_fallback`` → never silently
+  retries a 429 as a "JSON-mode rejected" fallback, even though
+  ``LLMRateLimitError`` is technically a subclass of
+  ``LLMResponseError``.
+- ``epublate.core.batch.run_batch`` → catches ``LLMRateLimitError``
+  from both translator workers (per-future) and helper pre-pass
+  (per-chapter), pauses the run with a curator-friendly reason
+  (``rate limit hit: <provider message> (resets in ~Xh; switch model,
+  add credits, or wait and resume)``).
+- ``epublate.core.extractor.run_pre_pass`` → re-raises
+  ``LLMRateLimitError`` so the rate-limit signal isn't lost in the
+  per-chunk failure breaker, and emits a new
+  ``batch.pre_pass_rate_limited`` audit event (rendered in Inbox /
+  Dashboard with the provider message and reset hint).
+- ``epublate.app.screens.reader._handle_chapter_batch_finished`` →
+  surfaces ``summary.paused_reason`` verbatim in the status bar
+  (curator sees the actionable hint without opening Inbox) and clears
+  the chapter queue on a pause so the rest of the queue doesn't
+  silently fail-and-pause-again on the same wall.
+
+Tests cover (a) the depleted-quota path
+(``X-RateLimit-Reset`` an hour away → ``LLMRateLimitError`` on the
+first call, no per-call retries burned), (b) the canonical short
+``Retry-After`` honored within the existing retry budget, (c) the
+header-less 429 fallback (legacy retry path preserved), (d) retries
+exhausted surfacing as ``LLMRateLimitError`` (not generic
+``LLMResponseError``), (e) translator rate-limit pauses the batch
+without recording a per-segment failure, (f) helper pre-pass
+rate-limit pauses the run before any segment translates.
+
+### Fixed — Batch pre-pass no longer blocks translation start
+
+A curator running the M5 batch pre-pass against a slow helper model
+(any reasoning model on a permissive endpoint, e.g. OpenRouter
+Nemotron at ~25s/chunk) reported that "the batch from the dashboard
+does a few helper-model calls but never starts to translate the
+segments". Diagnosis: ``run_batch`` ran *every* chapter's pre-pass
+before submitting *any* segment to the translator pool. For a
+30-chapter book, that's 30 × 30s ≈ 15 minutes of helper calls before
+the segment-count meter ticks once — long enough to look like a
+deadlock. ``cancel_event`` was only checked inside the translator
+dispatch loop, so Cancel was a no-op during pre-pass; the budget cap
+also wasn't enforced between chapters, so a runaway helper could
+blow past the cap before the cap-check fired.
+
+Fix: pre-pass and translation now **interleave per chapter**.
+``run_batch`` walks chapters in spine order and, for each chapter,
+runs pre-pass → submits that chapter's segments to the (shared)
+thread pool → drains them → moves on. First translation event lands
+within ~30s on a fresh run instead of after every chapter's pre-pass
+completes. Trade-off (intentional): chapter N's translator only sees
+``proposed`` glossary entries discovered through chapters 1..N — but
+book-wide consistency comes from the Lore Book / Book Intake (M5,
+F-LB-1..F-LB-9), not from the per-chapter pre-pass.
+
+- ``epublate.core.extractor.run_pre_pass`` → new optional
+  ``cancel_event: threading.Event | None`` (checked between chunks,
+  emits ``batch.pre_pass_cancelled`` on early exit) and ``on_chunk:
+  Callable[[PrePassChunkEvent], None] | None`` (fires once per chunk
+  so the orchestrator can surface "pre-pass: ch X/Y chunk A/B").
+- ``epublate.core.batch.run_batch`` → new optional
+  ``on_pre_pass_progress: Callable[[BatchPrePassProgress], None]``
+  callback. Pre-pass spend is folded into ``summary.cost_usd``
+  *between* chapters so the budget cap is enforced inside the helper
+  loop, not after it (PRD F-LLM-7 / F-LLM-8). Cancel is checked
+  before each chapter's pre-pass and inside ``run_pre_pass``'s chunk
+  loop, so curators can stop a slow pre-pass at any time.
+- ``epublate.app.main.EpublateApp._post_pre_pass_progress`` →
+  forwards ticks to the Dashboard listener as a new
+  ``BatchPrePassTick`` message; the Dashboard renders
+  "pre-pass: ch X/Y chunk A/B {ok|cached|failed (...)}" in the
+  status footer so a slow helper looks like progress, not a hang.
+- ``epublate.core.stats.ALERT_KINDS`` picks up
+  ``batch.pre_pass_cancelled`` and ``batch.pre_pass_aborted`` so
+  both terminations show up in the recent-activity strip with
+  context (``cancelled after N chunks``, ``aborted after K
+  failures``).
+
+This is a behavior change for the helper extractor (the per-chapter
+pre-pass run happens later than before — at most one chapter's
+worth of helper output is "ahead of" the translator at any moment)
+but doesn't move any product invariant: the translator still sees
+every locked / confirmed / proposed entry that exists at the moment
+its segment is submitted, and the existing
+``test_run_batch_pre_pass_seeds_glossary_before_translating`` still
+passes (chapter 1's pre-pass still runs before chapter 1's
+translation). New tests pin down the new semantics:
+
+- ``test_run_batch_pre_pass_interleaves_with_translation_per_chapter``
+  records LLM call order and asserts a translator call lands before
+  the second chapter's extractor call.
+- ``test_run_batch_pre_pass_cancels_promptly`` sets cancel inside the
+  first helper response and asserts ``BatchCancelled`` lifts out
+  *without* any chapter's translator running.
+- ``test_run_batch_pre_pass_budget_cap_pauses_before_translation``
+  forces a non-zero helper price, sets a tiny cap, and asserts
+  ``BatchPaused`` lifts before any segment translates.
+- ``test_run_batch_pre_pass_emits_progress_callback`` asserts
+  ``on_pre_pass_progress`` fires for every chunk in every chapter,
+  in chapter order, with valid 1-based indices.
+
+### Added — `EPUBLATE_LLM_REASONING_EFFORT` knob for reasoning models
+
+Curators on reasoning models (``gpt-5-*``, ``gpt-oss-*``, ``o1-*``,
+``o3-*``, OpenRouter's Nemotron ``-reasoning`` slugs) reported the
+pipeline being "very very slow" — the user-facing translation step
+sat at ~30s per segment because every call burned several thousand
+hidden chain-of-thought tokens before emitting the JSON the
+pipeline cares about.
+
+Fix: ``OpenAICompatProvider`` now exposes the standard OpenAI
+``reasoning_effort`` field (``minimal | low | medium | high``).
+Lowering it cuts latency dramatically — the smoke probe against
+``nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`` dropped from
+30.2s → 13.6s for one translator segment with ``low`` (55% faster),
+with no quality regression on the 1-segment translator and
+pre-pass-size extractor probes.
+
+- ``OpenAICompatProvider.reasoning_effort`` is the new field;
+  defaults to ``None`` so non-reasoning models on stricter endpoints
+  (which would reject the unknown parameter) keep working.
+- Validation is at construction time (``LLMResponseError`` for an
+  invalid value) so a typo in ``$EPUBLATE_LLM_REASONING_EFFORT``
+  fails fast instead of surfacing as a 400 mid-batch.
+- ``epublate.llm.factory.build_provider`` reads
+  ``$EPUBLATE_LLM_REASONING_EFFORT`` and the optional per-project
+  ``reasoning_effort`` override (Settings → LLM panel will surface
+  this in M6); the project override wins over the env default so
+  one project can run on ``high`` (quality matters) while another
+  runs on ``low`` (speed matters) using the same shell environment.
+- Cache key (PRD §6.4) is *not* hashed by ``reasoning_effort``: a
+  cached high-effort response served to a low-effort re-run is
+  strictly an improvement (better answer, free), and the failure
+  mode (low → high cache hit) is also fine because the cached
+  answer was at least as good.
+
+This is the standard OpenAI field, not provider-specific code, so
+it doesn't violate AGENTS.md §2.5 ("OpenAI-compatible LLMs only").
+OpenRouter forwards the field to upstream; non-reasoning models on
+permissive endpoints just ignore it.
+
+### Added — `scripts/smoke_llm_credentials.py` dev utility
+
+A read-only probe that hits an OpenAI-compatible endpoint with the
+*actual* prompt shapes the pipeline ships in production —
+translator, group translator, extractor (1 paragraph + pre-pass
+chunk size), and target-language extractor — through
+:func:`epublate.llm.json_mode.chat_with_json_fallback`, then verifies
+JSON parse and (for the translator) placeholder round-trip.
+
+Configs live in a gitignored ``.smoke_configs.json`` (or any path
+pointed at by ``$EPUBLATE_SMOKE_CONFIGS``); credentials never enter
+git history. Per-config output names which channel is broken, the
+specific failure mode (HTTP error / parse failure / empty visible
+content / placeholder mismatch), and the per-call latency + token
+spend. Useful when picking a helper model for a new endpoint or
+when triaging "did the LLM regress overnight?". Bootstrap contract
+is preserved — the probe is intentionally not part of
+``uv run pytest``.
+
+### Fixed — Helper-LLM loops now stop hammering broken endpoints
+
+Even with the JSON-mode soft-fallback, some helper endpoints emit
+empty visible content for *every* call (the canonical example:
+``gpt-oss-20b`` on Groq returning the empty string after the fallback
+retries without ``response_format``, because reasoning tokens consume
+the entire visible-channel budget). The pre-pass and intake loops
+were "best-effort, never abort" by design — useful when one chunk is
+flaky, terrible when the endpoint is fundamentally broken: the loop
+walked every chunk in the chapter / book, logged the same warning
+per chunk, and kept asking the curator's wallet for more nothing.
+
+Fix: every helper-LLM chunk loop now has a configurable
+**consecutive-failure circuit breaker**. Three failures in a row
+(``DEFAULT_FAILURE_STREAK_LIMIT``) abort the loop and emit a
+structured event so the curator's Inbox surfaces the abort with the
+same shape as the success path:
+
+- ``epublate.core.extractor.run_pre_pass`` → emits
+  ``batch.pre_pass_aborted`` (instead of ``batch.pre_pass_completed``)
+  with ``failure_streak`` and a truncated ``last_error`` in the
+  payload.
+- ``epublate.core.extractor.run_book_intake`` → emits
+  ``intake.aborted`` (instead of ``intake.completed``).
+- ``epublate.lore.ingest_target.ingest_target_epub`` → emits
+  ``lore.target_ingest_aborted`` (instead of ``lore.target_ingested``).
+- ``IntakeOptions.failure_streak_limit`` is the per-call knob; set to
+  ``0`` to keep the legacy "best-effort, never abort" behavior.
+- ``ingest_target_epub`` exposes the same knob via
+  ``failure_streak_limit`` (default
+  ``DEFAULT_TARGET_FAILURE_STREAK_LIMIT``).
+- A successful chunk resets the streak so a transiently flaky
+  endpoint (one rate-limited call mid-chapter) does not abort the
+  rest of the run.
+- The single warning emitted when the breaker trips names the
+  most likely root cause and a one-step fix
+  (``... it may be returning empty visible content because reasoning
+  tokens consume the entire visible-channel budget. Try a
+  non-reasoning helper via $EPUBLATE_LLM_HELPER_MODEL or the project
+  override.``).
+
+This bounds the wasted-call cost on broken endpoints to ``failure_streak_limit``
+helper calls per chapter / book — and gives the curator a clear,
+actionable next step instead of a Ctrl+C.
+
+### Fixed — Soft-fallback when helper endpoints reject JSON mode
+
+After the previous fix turned on ``response_format=json_object`` by
+default for helper-LLM calls, curators on Groq (proxied via LiteLLM)
+started seeing a different failure mode for the same root cause:
+
+```
+pre-pass chunk failed: OpenAI API status 400: …
+litellm.BadRequestError: GroqException - {"error":{"message":
+"Failed to validate JSON. Please adjust your prompt. …",
+"type":"invalid_request_error","code":"json_validate_failed",
+"failed_generation":""}}
+```
+
+What's happening: Groq runs its grammar validator *after* generation.
+For a reasoning helper (``gpt-oss-20b``), the model spends the entire
+visible-channel token budget on reasoning tokens, the visible content
+is the empty string, the validator can't validate "nothing", and the
+endpoint returns a 400 instead of empty content. Same upstream cause
+as before — just a louder failure surface.
+
+Fix: ``epublate.llm.json_mode.chat_with_json_fallback`` is a thin
+wrapper around ``provider.chat`` that catches ``LLMResponseError``
+whose message indicates an endpoint-level rejection of
+``response_format`` (matched on substrings such as
+``json_validate_failed``, ``response_format``, ``json mode``) and
+retries the call once **without** ``response_format``. The
+prompt-level "respond with a single JSON object" instruction is the
+only constraint left; endpoints that work cleanly (OpenAI proper,
+OpenRouter, vLLM, the non-Groq LiteLLM backends) never hit the
+fallback.
+
+Wired in at every helper-LLM entry point:
+
+- ``epublate.core.extractor.extract_entities`` (and therefore
+  ``run_book_intake`` and ``run_pre_pass``).
+- ``epublate.core.style_sniff.sniff_tone`` (the New-Project tone
+  helper).
+- ``epublate.lore.ingest_target._extract_target_chunk`` (target-Lore-
+  Book ingest).
+
+Trade-off: on incompatible endpoints, the first call to a fresh cache
+slot now costs one extra round-trip (the rejected call). The fallback
+is logged once per call as a structured warning, with the upstream
+error truncated so the Inbox stays readable. Network-layer errors
+(``LLMTransportError``) and unrelated 400s still propagate unchanged
+so the OpenAI-compat retry policy and the curator's audit trail keep
+their existing semantics. Genuinely cleaner: switch the helper to a
+non-reasoning model (``llama-3.1-8b-instant``, ``gpt-5-mini``,
+``Qwen3-32B``, …) — but the soft-fallback means ``gpt-oss-20b`` no
+longer breaks the pre-pass on Groq either.
+
+### Fixed — Helper-LLM extractor now requests JSON mode by default
+
+Curators running reasoning-style helper models (notably ``gpt-oss-20b``
+through LiteLLM) were seeing the pre-pass log line repeat per chunk:
+
+```
+pre-pass chunk failed: extractor response was empty
+pre-pass chunk failed: failed to recover JSON from extractor response: …
+```
+
+Root cause: nothing in the codebase passed ``response_format`` to the
+provider, so reasoning helpers spent the visible-channel token budget on
+reasoning tokens and returned empty content (and on the rare occasion
+they did emit JSON, prose around it broke the recovery regex). The
+batch's per-chunk error handler logged each failure and continued, so
+no work was lost — but every pre-pass effectively produced zero
+``proposed`` glossary entries on those endpoints.
+
+Fix: every helper-LLM extractor entry point now defaults to
+``response_format=ResponseFormat(type="json_object")`` (the OpenAI
+chat-completions JSON-mode contract, which our prompts already satisfy
+with their "respond with a single JSON object" instruction).
+
+- ``epublate.llm.prompts.extractor.DEFAULT_RESPONSE_FORMAT`` is the new
+  shared constant; the regular extractor and the target-language
+  extractor both export their own copy so each prompt module stays
+  self-contained.
+- ``ExtractOptions.response_format`` defaults to that constant via
+  ``field(default_factory=...)`` (frozen-dataclass-safe). Both
+  ``run_book_intake`` (Dashboard intake) and ``run_pre_pass`` (batch
+  pre-pass) inherit the default automatically.
+- ``epublate.core.style_sniff.sniff_tone`` now passes the same
+  response format on the New-Project tone-sniff helper call.
+- ``epublate.lore.ingest_target.ingest_target_epub`` flips its
+  ``response_format`` parameter default from ``None`` to the JSON-mode
+  constant, so target-Lore-Book ingests behave the same way.
+
+Curators on endpoints that genuinely don't speak ``response_format``
+can still opt out per call (``ExtractOptions(response_format=
+ResponseFormat(type="text"))``); the prompt-level "JSON only"
+instruction still applies, just unconstrained. The cache key is
+unaffected — it's hashed from the messages and the glossary state, not
+from ``response_format`` — so previously cached extractor calls remain
+cache hits.
+
+### Changed — Helper pre-pass is now on by default for UI batch / chapter translate
+
+The helper-LLM pre-pass (PRD §4.2 phase 3 / M5) is the cheap
+extractor scan that walks each chapter's pending segments before the
+translator fires, surfacing fresh proper-noun candidates as
+`proposed` glossary entries so the translator's prompt is
+glossary-aware on the first attempt. It used to be reachable only
+via `epublate batch --extract` on the CLI; the UI couldn't trigger
+it at all. Curators who lived in the TUI were silently missing the
+glossary-growth pass on every translate.
+
+- **`BatchModal` (`b` from the Dashboard)** grew a `Helper pre-pass
+  [y/n]:` row that defaults to `y`. Submitting the form unchanged
+  enables the pre-pass; typing `n` opts out for that run only.
+- **Reader chapter translate (`b`, sidebar button, queue ladder)**
+  now passes `pre_pass=True` on the `BatchOptions` it hands to
+  `run_batch`. The Reader has no modal so there's no toggle — the
+  reasoning is that a per-chapter translate from the Reader is the
+  same shape as a Dashboard batch, and the curator should get the
+  same glossary growth either way.
+- **Helper-model resolution** is centralized in both call sites: we
+  call `resolve_helper_model(translator_model,
+  project_overrides=...)` so the project's `helper_model` setting
+  (Settings → LLM panel) and `EPUBLATE_LLM_HELPER_MODEL` actually
+  win over the translator-model fallback that `run_batch` would have
+  used otherwise. Failures in resolution fall back to the translator
+  model rather than blocking the batch.
+- **CLI default unchanged.** `epublate batch` keeps `--no-extract`
+  as its default to preserve scripted/CI workflows that rely on the
+  old behavior. Pass `--extract` to opt in (or leave the UI to do it
+  for you).
+
+### Changed — Glossary entries must have symmetric leading articles / prepositions
+
+A curator audit surfaced a subtle but explosive bug: the helper LLM
+was happily proposing entries like `Europe → na Europa` (asymmetric:
+the target carries the contracted preposition + article, the source
+doesn't). The translator dutifully applied the entry on the next
+"in Europe" mention and emitted `"na na Europa"` — the same
+preposition twice. The mirror case `the USA → EUA` shows the same
+shape on the source side. Both are now blocked end-to-end (PRD
+F-LB-3 / glossary-invariants §1).
+
+- **`epublate.glossary.normalize`** is the new home for per-language
+  leading-particle detection. Ships curated sets for English,
+  Portuguese, Spanish, French, Italian, and German covering the
+  common articles, prepositions, and prep+def contractions
+  (`na/no/da/do/del/au/aux/im/zum`, …). Public surface:
+  `leading_particle`, `normalize_term`, `analyze_pair`, and
+  `find_doubled_particles` for the validator hook.
+- **Auto-proposer (lemma form).** `glossary.io.upsert_proposed` now
+  takes optional `source_lang` / `target_lang` and strips a single
+  leading particle from each side before insert. The pipeline and
+  the extractor pass the project's languages through, so a noisy
+  helper-LLM proposal of `the USA → os EUA` lands as `USA → EUA`
+  and `Europe → na Europa` lands as `Europe → Europa`. Curators
+  can still author symmetric pairs (`the USA → os EUA`) manually
+  via the edit modal — the auto path defaults to lemma because
+  it's the unambiguous winner for the noisy proposer.
+- **Curator save (symmetry required).** `EntryEditScreen` now
+  validates the source/target pair on save: either both sides
+  carry a leading article/preposition, or neither does. The save
+  is rejected with an inline error pointing at the mismatch
+  (`target "na Europa" starts with "na" but the source "Europe"
+  has no matching article/preposition.`). Curators can fix it
+  either way — drop the particle from the target (lemma form) or
+  add the missing one to the source.
+- **Runtime soft-warn validator.** A new `find_target_doubled_particles`
+  enforcer pass scans the LLM's target output for adjacent identical
+  function words (`"na na Europa"`, `"the the Senate"`). Hits are
+  recorded as `severity="warning"` / `kind="doubled_particle"`
+  Violation rows. The pipeline's flag rule moves from
+  `has_locked_violation` to a new `has_flagging_violation` that
+  flips the segment to `flagged` for either locked errors *or*
+  doubled-particle warnings, so the curator sees them in the Inbox.
+  No retry budget is consumed — this is meant to be a soft signal,
+  not a hard failure.
+- **Translator prompt rule.** A new bullet in both single-segment
+  and grouped translator templates explicitly instructs the model
+  about the lemma-vs-symmetric shape and forbids `"na na X"` /
+  `"the the X"` style runs. The cache key folds the prompt content
+  so this change invalidates any pre-existing translations that
+  baked the older rule.
+
+The user agreed to wipe existing project DBs rather than running a
+migration over confirmed/locked entries, so no `epublate migrate`
+helper ships in this release.
+
+### Fixed — Auto-proposed glossary entries record their birthing segment as the first occurrence
+
+The Glossary "Uses" column read `0` and the new Occurrences modal
+sat empty for entries that were *just* auto-proposed, even though
+the segment that birthed them obviously contained the term. Cause:
+`translate_segment` ran `find_mentions` against the project glossary
+*before* `_auto_propose_entities` inserted the new rows, so the
+matcher couldn't see entries that didn't exist yet, and
+`record_mentions` then committed without the first-occurrence row.
+
+The pipeline now runs auto-propose *before* `record_mentions` in all
+three project-write paths (`translate_segment` miss path,
+`_replay_from_cache`, `_commit_group_item`), then computes
+first-occurrence spans for the freshly created entries via a new
+`_spans_for_new_entries` helper that calls `match_source` against
+the actual segment text. The matcher's spans land in
+`entity_mention` with proper character offsets, so the Occurrences
+modal's `«…»` highlight works on the very first listing. When the
+matcher comes back empty — typically because lemma normalization
+stripped a particle the source still carries, or the helper LLM
+hallucinated a surface form — we fall back to a span-less mention
+so the segment still appears in the Occurrences list (just without
+an inline highlight). The `segment.translated` event's
+`mention_entry_ids` list now includes the proposed entries too, so
+the Inbox / event tail surfaces them.
+
+### Added — Glossary "Uses" column and "Show occurrences" modal
+
+Curators reviewing the lore bible asked two practical questions the
+Glossary screen couldn't answer: *how often is this entry actually
+firing?* and *where is it firing?*. The data was already in the DB
+(every translated segment writes `entity_mention` rows), it just
+wasn't surfaced.
+
+- **Uses column on the Glossary table.** New rightmost column reads
+  `N (Ms)` — total mentions and the distinct segment count. Renders
+  `—` for entries with no recorded mentions yet (e.g. proposed entries
+  that haven't been re-translated past). Backed by a single
+  aggregate query (`repo.count_mentions_per_entry`), so opening the
+  screen on a thousand-entry lore bible is still one round trip.
+- **`o` → Show occurrences.** New `OccurrencesScreen` modal lists
+  every recorded use of the highlighted entry in book order
+  (chapter spine_idx → segment idx → span start), with the matched
+  span wrapped in `«…»` so the curator can spot the exact sentence
+  that fired. Backed by `repo.list_occurrences`, a single
+  `entity_mention` ⨝ `segment` ⨝ `chapter` join scoped to the
+  current project so a sibling translation's mentions can never
+  leak in. Locked Lore Book entries (no project chapters) get a
+  graceful empty state.
+- **Detail-pane label fix.** The detail pane previously said
+  `Mentions: N segment(s)` while actually counting *mention rows*
+  (a segment with three matches counted three). It now says
+  `N (across M segments)` and points at the new `o` action.
+
 ### Changed — Glossary applied per-segment, gender-aware, and dedup-safe
 
 This batch addresses three curator-reported regressions in how the

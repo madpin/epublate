@@ -16,7 +16,7 @@ from epublate.core.style_sniff import (
 )
 from epublate.errors import FormatError, LLMResponseError
 from epublate.formats.base import Segment
-from epublate.llm.base import Message
+from epublate.llm.base import Message, ResponseFormat
 from epublate.llm.mock import MockLLMProvider
 
 # ---------------------------------------------------------------------------
@@ -281,6 +281,10 @@ def test_sniff_tone_calls_helper_with_extractor_messages(
     assert call.model == "helper-model"
     assert call.temperature == 0.0
     assert call.seed == 7
+    # JSON mode mirrors the regular extractor's default — without it,
+    # reasoning helpers like ``gpt-oss-20b`` return empty content and
+    # the modal silently shows "no suggestion".
+    assert call.response_format == ResponseFormat(type="json_object")
     # We expect the sniff to send an extractor-shaped pair (system + user).
     roles = [msg.role for msg in call.messages]
     assert roles == ["system", "user"]

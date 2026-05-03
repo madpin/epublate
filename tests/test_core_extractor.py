@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from epublate.core.extractor import (
 from epublate.core.project import Project
 from epublate.db import repo
 from epublate.errors import LLMResponseError
+from epublate.llm.base import ResponseFormat
 from epublate.llm.mock import MockLLMProvider
 
 
@@ -46,6 +48,155 @@ def fixture_project(tiny_epub_factory: Callable[..., Path], tmp_path: Path) -> P
         src, out_dir=tmp_path / "proj", source_lang="en", target_lang="pt"
     )
     return project
+
+
+def test_extract_options_defaults_to_json_object_response_format() -> None:
+    """The default ``ExtractOptions`` requests JSON mode so reasoning
+    helpers (e.g. ``gpt-oss-20b``) don't burn the visible-channel
+    budget on reasoning tokens and return empty content.
+
+    The prompt module owns the canonical default; ``ExtractOptions``
+    just plumbs it via ``field(default_factory=...)`` so the dataclass
+    stays frozen-safe.
+    """
+
+    options = ExtractOptions(model="gpt-mock")
+    assert options.response_format == ResponseFormat(type="json_object")
+
+
+def test_extract_entities_forwards_response_format_to_provider(
+    fixture_project: Project,
+) -> None:
+    """``extract_entities`` threads ``options.response_format`` straight
+    onto the provider so the underlying chat-completion request gets
+    ``{"type": "json_object"}`` (the OpenAI-compat JSON-mode contract).
+    """
+
+    project = fixture_project
+    try:
+        provider = MockLLMProvider()
+        provider.set_response(
+            _extractor_response(
+                {"type": "character", "source": "Élise", "confidence": 0.9},
+            )
+        )
+
+        extract_entities(
+            engine=project.engine,
+            project_id=project.project_id,
+            source_lang="en",
+            target_lang="pt",
+            source_text="Élise opened the door.",
+            provider=provider,
+            options=ExtractOptions(model="gpt-mock"),
+        )
+
+        last = provider.last_request
+        assert last is not None
+        assert last.response_format == ResponseFormat(type="json_object")
+    finally:
+        project.close()
+
+
+def test_extract_entities_honors_response_format_override(
+    fixture_project: Project,
+) -> None:
+    """Passing ``response_format=ResponseFormat(type="text")`` lets a
+    curator opt out of JSON mode for endpoints that reject it."""
+
+    project = fixture_project
+    try:
+        provider = MockLLMProvider()
+        provider.set_response(_extractor_response())
+
+        extract_entities(
+            engine=project.engine,
+            project_id=project.project_id,
+            source_lang="en",
+            target_lang="pt",
+            source_text="Élise opened the door.",
+            provider=provider,
+            options=ExtractOptions(
+                model="gpt-mock",
+                response_format=ResponseFormat(type="text"),
+            ),
+        )
+
+        last = provider.last_request
+        assert last is not None
+        assert last.response_format == ResponseFormat(type="text")
+    finally:
+        project.close()
+
+
+def test_extract_entities_recovers_from_endpoint_json_mode_rejection(
+    fixture_project: Project,
+) -> None:
+    """End-to-end smoke test for the soft-fallback path
+    (:func:`epublate.llm.json_mode.chat_with_json_fallback`).
+
+    Reproduces the user's bug verbatim: an OpenAI-compatible endpoint
+    (Groq via LiteLLM in the wild) hard-fails the first call with
+    ``json_validate_failed`` because the reasoning helper exhausted
+    its visible-channel budget on reasoning tokens and emitted no
+    visible content. The wrapper retries once without
+    ``response_format`` and we expect:
+
+    * the second call to succeed with valid JSON,
+    * ``extract_entities`` to return the parsed entities,
+    * the audit row in ``llm_call`` to record the *successful* call
+      (so ``llm_call.response_json`` is populated and the cache key
+      is satisfied for future runs).
+    """
+
+    project = fixture_project
+    try:
+        provider = MockLLMProvider()
+        attempts = {"n": 0}
+        groq_error = (
+            "OpenAI API status 400: Error code: 400 - {'error': "
+            "{'message': 'litellm.BadRequestError: GroqException - "
+            '{"error":{"message":"Failed to validate JSON. Please '
+            "adjust your prompt. See 'failed_generation' for more "
+            'details.","type":"invalid_request_error","code":'
+            '"json_validate_failed","failed_generation":""}}"}}'
+        )
+
+        def _responder(messages: object, _model: str) -> str:
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise LLMResponseError(groq_error)
+            return _extractor_response(
+                {"type": "character", "source": "Élise", "confidence": 0.9},
+            )
+
+        provider.set_responder(_responder)
+
+        outcome = extract_entities(
+            engine=project.engine,
+            project_id=project.project_id,
+            source_lang="en",
+            target_lang="pt",
+            source_text="Élise opened the door of Vale Verde.",
+            provider=provider,
+            options=ExtractOptions(model="gpt-oss-20b"),
+        )
+
+        assert provider.call_count == 2
+        assert provider.calls[0].response_format == ResponseFormat(type="json_object")
+        assert provider.calls[1].response_format is None
+        assert [e.source for e in outcome.trace.entities] == ["Élise"]
+        assert outcome.proposed_entry_ids
+        with project.engine.connect() as conn:
+            row = conn.exec_driver_sql(
+                "SELECT response_json FROM llm_call "
+                "WHERE project_id = ? AND purpose = ?",
+                (project.project_id, PURPOSE_EXTRACT),
+            ).one()
+        assert row is not None
+        assert json.loads(row[0])["content"]
+    finally:
+        project.close()
 
 
 def test_extract_entities_persists_audit_and_proposes(
@@ -313,6 +464,250 @@ def test_run_book_intake_zero_segments_emits_completed(
         kinds = [ev.kind for ev in repo.list_events(project.engine, project.project_id)]
         assert "intake.started" in kinds
         assert "intake.completed" in kinds
+    finally:
+        project.close()
+
+
+def test_run_pre_pass_trips_circuit_breaker_after_consecutive_failures(
+    tiny_epub_factory: Callable[..., Path],
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Endpoint-broken scenario: when every helper call raises, the
+    pre-pass loop must abort after ``failure_streak_limit`` consecutive
+    failures so it doesn't burn through the rest of the chapter on a
+    fundamentally broken endpoint (the original bug: ``gpt-oss-20b``
+    on Groq returning empty visible content for every chunk because
+    reasoning tokens consume the entire visible-channel budget, even
+    *after* the JSON-mode soft-fallback has retried without
+    ``response_format``).
+
+    Asserts:
+
+    * the provider sees exactly ``failure_streak_limit`` calls (not
+      one per chunk);
+    * the loop's ``failed_chunks`` total reflects every chunk in scope
+      (the processed-and-failed ones plus the skipped ones), so the
+      summary is honest about what didn't run;
+    * a ``batch.pre_pass_aborted`` event is emitted with the truncated
+      last-error string;
+    * the warning log line names the most likely root cause and a
+      one-step fix (switching helper models).
+    """
+
+    paragraphs = "".join(f"<p>Paragraph number {i} of the loop.</p>" for i in range(8))
+    src = tiny_epub_factory(chapters=[("Loop test", "<h1>Loop test</h1>" + paragraphs)])
+    project = Project.create(
+        src, out_dir=tmp_path / "loop", source_lang="en", target_lang="pt"
+    )
+    try:
+        # Pick the chapter with the most translatable segments (the
+        # TOC chapter is also stored, with ``kind='pair'`` rows we
+        # don't want to feed to the helper).
+        all_chapters = repo.list_chapters(project.engine, project.project_id)
+        per_chapter = [
+            (c, repo.list_segments(project.engine, c.id)) for c in all_chapters
+        ]
+        _chapter, segments = max(per_chapter, key=lambda pair: len(pair[1]))
+        assert len(segments) >= 4
+
+        provider = MockLLMProvider()
+
+        def _always_empty(_messages: object, _model: str) -> str:
+            # Exact failure shape from the user's bug: helper returns
+            # empty visible content. The parser raises
+            # ``extractor response was empty`` for every chunk.
+            return ""
+
+        provider.set_responder(_always_empty)
+
+        with caplog.at_level(logging.WARNING, logger="epublate.core.extractor"):
+            summary = run_pre_pass(
+                engine=project.engine,
+                project_id=project.project_id,
+                source_lang="en",
+                target_lang="pt",
+                provider=provider,
+                options=IntakeOptions(
+                    model="gpt-oss-20b",
+                    chunk_max_tokens=5,
+                    failure_streak_limit=2,
+                ),
+                segments=segments,
+            )
+
+        assert provider.call_count == 2
+        assert summary.failed_chunks >= 2
+        assert summary.failed_chunks >= len(segments) // 2
+        kinds = [ev.kind for ev in repo.list_events(project.engine, project.project_id)]
+        assert "batch.pre_pass_aborted" in kinds
+        assert "batch.pre_pass_completed" not in kinds
+        aborted = next(
+            ev
+            for ev in repo.list_events(project.engine, project.project_id)
+            if ev.kind == "batch.pre_pass_aborted"
+        )
+        assert aborted.payload["failure_streak"] == 2
+        assert "empty" in aborted.payload["last_error"]
+        warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if "pre-pass aborted" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert "non-reasoning helper" in warnings[0]
+        assert "$EPUBLATE_LLM_HELPER_MODEL" in warnings[0]
+    finally:
+        project.close()
+
+
+def test_run_pre_pass_breaker_streak_resets_on_success(
+    tiny_epub_factory: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """A successful chunk in between two failure runs resets the
+    streak so a flaky endpoint doesn't trip the breaker prematurely."""
+
+    paragraphs = "".join(f"<p>Paragraph {i} of the mixed run.</p>" for i in range(6))
+    src = tiny_epub_factory(chapters=[("Mixed", "<h1>Mixed</h1>" + paragraphs)])
+    project = Project.create(
+        src, out_dir=tmp_path / "mixed", source_lang="en", target_lang="pt"
+    )
+    try:
+        all_chapters = repo.list_chapters(project.engine, project.project_id)
+        per_chapter = [
+            (c, repo.list_segments(project.engine, c.id)) for c in all_chapters
+        ]
+        _chapter, segments = max(per_chapter, key=lambda pair: len(pair[1]))
+
+        provider = MockLLMProvider()
+        # fail, fail, success, fail, fail, fail → trips on the second 3-streak
+        provider.queue_responses(
+            [
+                "",
+                "",
+                _extractor_response({"type": "place", "source": "Vale Verde"}),
+                "",
+                "",
+                "",
+            ]
+        )
+
+        summary = run_pre_pass(
+            engine=project.engine,
+            project_id=project.project_id,
+            source_lang="en",
+            target_lang="pt",
+            provider=provider,
+            options=IntakeOptions(
+                model="gpt-mock",
+                chunk_max_tokens=5,
+                failure_streak_limit=3,
+            ),
+            segments=segments,
+        )
+
+        # 6 calls: two fail, one succeeds (streak resets), three fail
+        # in a row → breaker trips after the third post-reset failure.
+        assert provider.call_count == 6
+        assert summary.chunks == 1
+        assert summary.proposed_count >= 1
+        kinds = [ev.kind for ev in repo.list_events(project.engine, project.project_id)]
+        assert "batch.pre_pass_aborted" in kinds
+    finally:
+        project.close()
+
+
+def test_run_pre_pass_breaker_disabled_when_limit_zero(
+    fixture_project: Project,
+) -> None:
+    """Setting ``failure_streak_limit=0`` reverts to legacy "best-effort,
+    never abort" semantics — useful for tests that need every audit row
+    even when every chunk fails by design."""
+
+    project = fixture_project
+    try:
+        all_chapters = repo.list_chapters(project.engine, project.project_id)
+        per_chapter = [
+            (c, repo.list_segments(project.engine, c.id)) for c in all_chapters
+        ]
+        _chapter, segments = max(per_chapter, key=lambda pair: len(pair[1]))
+
+        provider = MockLLMProvider()
+
+        def _always_empty(_messages: object, _model: str) -> str:
+            return ""
+
+        provider.set_responder(_always_empty)
+
+        summary = run_pre_pass(
+            engine=project.engine,
+            project_id=project.project_id,
+            source_lang="en",
+            target_lang="pt",
+            provider=provider,
+            options=IntakeOptions(
+                model="gpt-mock",
+                chunk_max_tokens=5,
+                failure_streak_limit=0,
+            ),
+            segments=segments,
+        )
+
+        # Every segment got its own call; no abort.
+        assert provider.call_count == len(segments)
+        assert summary.failed_chunks == len(segments)
+        kinds = [ev.kind for ev in repo.list_events(project.engine, project.project_id)]
+        assert "batch.pre_pass_completed" in kinds
+        assert "batch.pre_pass_aborted" not in kinds
+    finally:
+        project.close()
+
+
+def test_run_book_intake_trips_circuit_breaker_after_consecutive_failures(
+    tiny_epub_factory: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """``run_book_intake`` mirrors ``run_pre_pass`` for the breaker —
+    same root cause (broken helper endpoint) needs the same protection
+    on the New-Project intake path so a curator with a bad helper
+    model (``$EPUBLATE_LLM_HELPER_MODEL`` or the project override)
+    doesn't burn the entire intake budget."""
+
+    paragraphs = "".join(f"<p>Paragraph {i} of the intake.</p>" for i in range(8))
+    src = tiny_epub_factory(
+        chapters=[("Intake loop", "<h1>Intake loop</h1>" + paragraphs)]
+    )
+    project = Project.create(
+        src, out_dir=tmp_path / "intake-loop", source_lang="en", target_lang="pt"
+    )
+    try:
+        provider = MockLLMProvider()
+
+        def _always_empty(_messages: object, _model: str) -> str:
+            return ""
+
+        provider.set_responder(_always_empty)
+
+        summary = run_book_intake(
+            engine=project.engine,
+            project_id=project.project_id,
+            source_lang="en",
+            target_lang="pt",
+            provider=provider,
+            options=IntakeOptions(
+                model="gpt-oss-20b",
+                max_segments=20,
+                chunk_max_tokens=5,
+                failure_streak_limit=2,
+            ),
+        )
+
+        assert provider.call_count == 2
+        assert summary.failed_chunks >= 2
+        kinds = [ev.kind for ev in repo.list_events(project.engine, project.project_id)]
+        assert "intake.aborted" in kinds
+        assert "intake.completed" not in kinds
     finally:
         project.close()
 

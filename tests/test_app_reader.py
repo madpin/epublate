@@ -650,6 +650,67 @@ async def test_reader_translate_chapter_via_b_keystroke(
 
 
 @pytest.mark.asyncio
+async def test_reader_translate_chapter_enables_pre_pass_by_default(
+    tiny_epub_factory: Callable[..., Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pressing ``b`` in the Reader fires a chapter batch with the
+    helper-LLM pre-pass on (PRD §4.2 phase 3 / M5).
+
+    The Reader's chapter-translate is a "batch of one chapter". To keep
+    its glossary-growth story aligned with the Dashboard's batch (which
+    defaults to pre-pass on), we wire ``pre_pass=True`` directly on the
+    options the Reader hands to ``run_batch`` — the path has no modal
+    so there's nothing to toggle. We also resolve the helper model
+    via :func:`resolve_helper_model` so the project's ``helper_model``
+    override (and, downstream, ``$EPUBLATE_LLM_HELPER_MODEL``) is
+    honored.
+    """
+
+    from epublate.app.screens import reader as reader_module
+    from epublate.core.batch import BatchOptions
+
+    project = _make_two_chapter_project(tiny_epub_factory, tmp_path)
+    try:
+        repo.set_llm_overrides(
+            project.engine,
+            project_id=project.project_id,
+            overrides={"helper_model": "gpt-cheap-helper"},
+        )
+
+        provider = MockLLMProvider()
+        provider.set_responder(_placeholder_safe_responder())
+        screen = ReaderScreen(project, provider_factory=lambda: provider)
+
+        captured_options: list[BatchOptions] = []
+
+        def _capture_run_batch(**kwargs: object) -> BatchSummary:
+            options = kwargs["options"]
+            assert isinstance(options, BatchOptions)
+            captured_options.append(options)
+            return BatchSummary()
+
+        monkeypatch.setattr(reader_module, "run_batch", _capture_run_batch)
+
+        app = EpublateApp(initial_screen=screen)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            current = pilot.app.screen
+            assert isinstance(current, ReaderScreen)
+            await pilot.press("b")
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert len(captured_options) == 1
+            options = captured_options[0]
+            assert options.pre_pass is True
+            assert options.helper_model == "gpt-cheap-helper"
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
 async def test_reader_translate_chapter_button_click(
     tiny_epub_factory: Callable[..., Path], tmp_path: Path
 ) -> None:

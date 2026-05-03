@@ -236,6 +236,202 @@ def test_pipeline_records_mentions(
         project.close()
 
 
+def test_auto_propose_records_first_occurrence_mention(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """Auto-proposed entries record an ``entity_mention`` against the birthing segment.
+
+    Without this, the Glossary "Uses" column reads ``0`` for an
+    entry whose ``first_seen_segment_id`` clearly points at a real
+    segment (PRD F-LB-6). We record the mention with proper spans
+    when the matcher can find them, so the Occurrences modal's
+    ``«…»`` highlight works on the very first listing.
+    """
+
+    project = _basic_project(tiny_epub_factory, tmp_path)
+    try:
+        provider = MockLLMProvider()
+        provider.set_response(
+            json.dumps(
+                {
+                    "target": "PT::Élise smiled at Hugo.",
+                    "new_entities": [
+                        {
+                            "type": "character",
+                            "source": "Élise",
+                            "target": "Elisa",
+                            "evidence": "first appearance",
+                        },
+                    ],
+                }
+            )
+        )
+        seg = _segment_containing(project, "Élise")
+        outcome = translate_segment(
+            engine=project.engine,
+            project_id=project.project_id,
+            source_lang="en",
+            target_lang="pt",
+            style_guide=None,
+            segment=seg,
+            provider=provider,
+            options=TranslateOptions(model="gpt-mock"),
+        )
+        assert len(outcome.proposed_entry_ids) == 1
+        new_id = outcome.proposed_entry_ids[0]
+        # The freshly-proposed entry must have a mention for THIS segment.
+        mentions = repo.list_mentions(
+            project.engine, segment_id=seg.id, entry_id=new_id
+        )
+        assert len(mentions) == 1
+        m = mentions[0]
+        # The matcher found "Élise" in the source text — span is real.
+        assert m.source_span_start is not None
+        assert m.source_span_end is not None
+        assert seg.source_text[m.source_span_start : m.source_span_end] == "Élise"
+        # The outcome's mention_entry_ids surfaces the new entry too.
+        assert new_id in outcome.mention_entry_ids
+    finally:
+        project.close()
+
+
+def test_auto_propose_records_span_less_mention_when_matcher_misses(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """Lemma-stripped source terms still get a mention, just span-less.
+
+    When the auto-proposer normalizes ``"the Senate"`` down to
+    ``"Senate"`` for the canonical source_term, the matcher *does*
+    still hit because of the word-boundary regex. But a degenerate
+    case — the LLM hallucinating a surface form that doesn't appear
+    verbatim — leaves ``match_source`` empty. We fall back to a
+    span-less ``(entry_id, None, None)`` row so the segment still
+    appears in the Occurrences modal (PRD F-LB-6), just without
+    the ``«…»`` highlight.
+    """
+
+    project = _basic_project(tiny_epub_factory, tmp_path)
+    try:
+        provider = MockLLMProvider()
+        # ``Mira`` is *not* in the source text — the LLM has invented
+        # a surface form. Auto-propose still creates the entry; we
+        # want the birthing-segment mention recorded even with no
+        # span (the LLM said it saw it).
+        provider.set_response(
+            json.dumps(
+                {
+                    "target": "PT::Élise smiled at Hugo.",
+                    "new_entities": [
+                        {
+                            "type": "character",
+                            "source": "Mira",
+                            "target": "Mira",
+                        },
+                    ],
+                }
+            )
+        )
+        seg = _segment_containing(project, "Élise")
+        outcome = translate_segment(
+            engine=project.engine,
+            project_id=project.project_id,
+            source_lang="en",
+            target_lang="pt",
+            style_guide=None,
+            segment=seg,
+            provider=provider,
+            options=TranslateOptions(model="gpt-mock"),
+        )
+        assert len(outcome.proposed_entry_ids) == 1
+        new_id = outcome.proposed_entry_ids[0]
+        mentions = repo.list_mentions(
+            project.engine, segment_id=seg.id, entry_id=new_id
+        )
+        assert len(mentions) == 1
+        m = mentions[0]
+        # No span — the matcher couldn't find ``Mira`` in the source.
+        assert m.source_span_start is None
+        assert m.source_span_end is None
+    finally:
+        project.close()
+
+
+def test_auto_propose_first_occurrence_persists_through_cache_replay(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """A cached translate_segment call still records first-occurrence mentions.
+
+    The cache replay path runs auto-propose too (the trace might
+    introduce new entries on first sight even when the LLM call is
+    a cache hit). Mentions must be recorded the same way.
+    """
+
+    project = _basic_project(tiny_epub_factory, tmp_path)
+    try:
+        provider = MockLLMProvider()
+        provider.set_response(
+            json.dumps(
+                {
+                    "target": "PT::Élise smiled at Hugo.",
+                    "new_entities": [
+                        {
+                            "type": "character",
+                            "source": "Élise",
+                            "target": "Elisa",
+                        },
+                    ],
+                }
+            )
+        )
+        seg = _segment_containing(project, "Élise")
+        # First call — miss path, records the mention.
+        first = translate_segment(
+            engine=project.engine,
+            project_id=project.project_id,
+            source_lang="en",
+            target_lang="pt",
+            style_guide=None,
+            segment=seg,
+            provider=provider,
+            options=TranslateOptions(model="gpt-mock"),
+        )
+        assert first.cache_hit is False
+        # Wipe the proposed entries so the cached replay has fresh
+        # ``new_entities`` to land in the DB. (Curators may reject
+        # an LLM proposal; the next cache hit should re-propose it
+        # and re-record the mention.)
+        repo.delete_glossary_entry(project.engine, entry_id=first.proposed_entry_ids[0])
+        # Reset the segment so the pipeline doesn't short-circuit.
+        with project.engine.begin() as conn:
+            repo.update_segment_translation(
+                conn,
+                segment_id=seg.id,
+                target_text=None,
+                status=SegmentStatus.PENDING,
+            )
+            repo.record_mentions(conn, segment_id=seg.id, mentions=[])
+        replay = translate_segment(
+            engine=project.engine,
+            project_id=project.project_id,
+            source_lang="en",
+            target_lang="pt",
+            style_guide=None,
+            segment=seg,
+            provider=provider,
+            options=TranslateOptions(model="gpt-mock"),
+        )
+        assert replay.cache_hit is True
+        assert len(replay.proposed_entry_ids) == 1
+        new_id = replay.proposed_entry_ids[0]
+        mentions = repo.list_mentions(
+            project.engine, segment_id=seg.id, entry_id=new_id
+        )
+        assert len(mentions) == 1
+        assert mentions[0].source_span_start is not None
+    finally:
+        project.close()
+
+
 def _glossary_entry_lines(system_prompt: str) -> list[str]:
     """Extract the rendered ``- [type] source → target`` lines.
 

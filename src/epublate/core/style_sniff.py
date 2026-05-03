@@ -51,7 +51,11 @@ from epublate.errors import EpublateError, FormatError, LLMResponseError
 from epublate.formats.base import Segment
 from epublate.formats.epub import EpubAdapter
 from epublate.llm.base import LLMProvider
+from epublate.llm.json_mode import chat_with_json_fallback
 from epublate.llm.pricing import estimate_cost
+from epublate.llm.prompts.extractor import (
+    DEFAULT_RESPONSE_FORMAT as DEFAULT_EXTRACTOR_RESPONSE_FORMAT,
+)
 from epublate.llm.prompts.extractor import (
     build_extractor_messages,
     parse_extractor_response,
@@ -164,9 +168,19 @@ def sniff_tone(
         glossary=(),
     )
 
-    chat = provider.chat(
+    # JSON mode mirrors the extractor / pre-pass default — reasoning
+    # helpers (``gpt-oss-*``) otherwise spend their visible-channel
+    # budget on reasoning tokens and return empty content, which the
+    # parser treats as "extractor response was empty" and the modal
+    # would surface as "no suggestion". Endpoints that can't honor
+    # ``response_format`` (e.g. Groq returning ``json_validate_failed``
+    # when the model emits no visible content) get a one-shot retry
+    # without it via :func:`chat_with_json_fallback`.
+    chat = chat_with_json_fallback(
+        provider,
         messages,
         model=helper_model,
+        response_format=DEFAULT_EXTRACTOR_RESPONSE_FORMAT,
         temperature=0.0,
         seed=7,
     )

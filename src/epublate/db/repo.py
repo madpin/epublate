@@ -15,7 +15,7 @@ from collections.abc import Iterable, Sequence
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import delete, insert, select, update
+from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.engine import Connection, Engine
 
 from epublate.db import schema
@@ -1574,6 +1574,166 @@ def list_mentions(
     ]
 
 
+class MentionCounts(BaseModel):
+    """Aggregate counts a glossary entry's mention rows expand to.
+
+    ``mentions`` is the total :class:`EntityMention` row count for the
+    entry — multiple matches in the same segment count separately so
+    the curator can see how often a term actually fires. ``segments``
+    is the count of distinct segments those rows reach, which is the
+    more useful "spread" number when a single segment hits a term ten
+    times. The Glossary screen surfaces ``mentions`` in the table column
+    and both numbers in the detail pane.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    mentions: int = 0
+    segments: int = 0
+
+
+def count_mentions_per_entry(
+    engine_or_conn: Engine | Connection, project_id: str
+) -> dict[str, MentionCounts]:
+    """Per-entry mention totals for a whole project, in one query.
+
+    Returns ``{entry_id: MentionCounts(mentions, segments)}``. We aggregate
+    in SQL (``COUNT(*)`` for total, ``COUNT(DISTINCT segment_id)`` for
+    spread) and join through ``segment → chapter`` to scope by project so
+    a Lore Book editor never sees mentions from a sibling translation
+    project. Entries with zero mentions are omitted; callers should
+    treat a missing key as ``MentionCounts()``.
+    """
+
+    stmt = (
+        select(
+            schema.entity_mention.c.entry_id,
+            func.count().label("mentions"),
+            func.count(func.distinct(schema.entity_mention.c.segment_id)).label(
+                "segments"
+            ),
+        )
+        .join(
+            schema.segment,
+            schema.segment.c.id == schema.entity_mention.c.segment_id,
+        )
+        .join(
+            schema.chapter,
+            schema.chapter.c.id == schema.segment.c.chapter_id,
+        )
+        .where(schema.chapter.c.project_id == project_id)
+        .group_by(schema.entity_mention.c.entry_id)
+    )
+    with _begin(engine_or_conn) as conn:
+        rows = conn.execute(stmt).mappings().all()
+    return {
+        str(r["entry_id"]): MentionCounts(
+            mentions=int(r["mentions"]),
+            segments=int(r["segments"]),
+        )
+        for r in rows
+    }
+
+
+class OccurrenceRow(BaseModel):
+    """One observed use of a glossary entry, with enough context to navigate.
+
+    Joins :class:`EntityMention` with ``segment`` and ``chapter`` so the
+    Glossary "Show occurrences" modal can render a navigable list
+    (chapter title + spine_idx, segment idx, source/target snippets,
+    matched span) without a per-row N+1. Sorted by ``spine_idx`` →
+    ``segment.idx`` → ``source_span_start`` so the curator sees uses
+    in book order.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    mention_id: str
+    segment_id: str
+    segment_idx: int
+    chapter_id: str
+    chapter_spine_idx: int
+    chapter_title: str | None
+    source_text: str
+    target_text: str | None
+    source_span_start: int | None
+    source_span_end: int | None
+
+
+def list_occurrences(
+    engine_or_conn: Engine | Connection,
+    *,
+    project_id: str,
+    entry_id: str,
+) -> list[OccurrenceRow]:
+    """All :class:`EntityMention` rows for ``entry_id`` with segment context.
+
+    A Lore Book project has no chapters/segments so this always returns
+    ``[]`` for those entries — that's fine; the modal renders an empty
+    state. Project-scoped via the ``chapter.project_id`` join so a
+    cross-project mention (theoretically possible if a curator ran
+    ``record_mentions`` against the wrong project) cannot leak into
+    another project's view.
+    """
+
+    stmt = (
+        select(
+            schema.entity_mention.c.id.label("mention_id"),
+            schema.entity_mention.c.source_span_start,
+            schema.entity_mention.c.source_span_end,
+            schema.segment.c.id.label("segment_id"),
+            schema.segment.c.idx.label("segment_idx"),
+            schema.segment.c.source_text,
+            schema.segment.c.target_text,
+            schema.chapter.c.id.label("chapter_id"),
+            schema.chapter.c.spine_idx.label("chapter_spine_idx"),
+            schema.chapter.c.title.label("chapter_title"),
+        )
+        .join(
+            schema.segment,
+            schema.segment.c.id == schema.entity_mention.c.segment_id,
+        )
+        .join(
+            schema.chapter,
+            schema.chapter.c.id == schema.segment.c.chapter_id,
+        )
+        .where(schema.entity_mention.c.entry_id == entry_id)
+        .where(schema.chapter.c.project_id == project_id)
+        .order_by(
+            schema.chapter.c.spine_idx.asc(),
+            schema.segment.c.idx.asc(),
+            schema.entity_mention.c.source_span_start.asc().nulls_last(),
+        )
+    )
+    with _begin(engine_or_conn) as conn:
+        rows = conn.execute(stmt).mappings().all()
+    return [
+        OccurrenceRow(
+            mention_id=str(r["mention_id"]),
+            segment_id=str(r["segment_id"]),
+            segment_idx=int(r["segment_idx"]),
+            chapter_id=str(r["chapter_id"]),
+            chapter_spine_idx=int(r["chapter_spine_idx"]),
+            chapter_title=(
+                str(r["chapter_title"]) if r["chapter_title"] is not None else None
+            ),
+            source_text=str(r["source_text"]),
+            target_text=(
+                str(r["target_text"]) if r["target_text"] is not None else None
+            ),
+            source_span_start=(
+                int(r["source_span_start"])
+                if r["source_span_start"] is not None
+                else None
+            ),
+            source_span_end=(
+                int(r["source_span_end"]) if r["source_span_end"] is not None else None
+            ),
+        )
+        for r in rows
+    ]
+
+
 def list_segments_by_status(
     engine_or_conn: Engine | Connection,
     *,
@@ -1920,11 +2080,14 @@ __all__ = [
     "ChapterRow",
     "EventRow",
     "LLMCallRow",
+    "MentionCounts",
+    "OccurrenceRow",
     "ProjectRow",
     "SegmentRow",
     "append_event",
     "bulk_insert_chapters",
     "bulk_insert_segments",
+    "count_mentions_per_entry",
     "create_glossary_entry",
     "create_project",
     "delete_glossary_entry",
@@ -1943,6 +2106,7 @@ __all__ = [
     "list_glossary_revisions",
     "list_llm_calls",
     "list_mentions",
+    "list_occurrences",
     "list_projects",
     "list_segments",
     "list_segments_by_status",

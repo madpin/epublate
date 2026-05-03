@@ -36,6 +36,7 @@ from epublate.glossary.models import (
     GlossaryEntryWithAliases,
     GlossaryStatusLiteral,
 )
+from epublate.glossary.normalize import normalize_term
 
 GLOSSARY_FORMAT_VERSION = 2
 """Current on-disk format. v1 stays readable via a compat shim."""
@@ -242,6 +243,8 @@ def upsert_proposed(
     notes: str | None = None,
     first_seen_segment_id: str | None = None,
     target_term: str | None = None,
+    source_lang: str | None = None,
+    target_lang: str | None = None,
 ) -> tuple[str, bool]:
     """Insert a ``proposed`` entry if no row exists yet for this source term.
 
@@ -272,6 +275,18 @@ def upsert_proposed(
       backfill the target so the lore bible records what the
       translator actually used. Mirrors the pre-existing
       ``Julius Caesar`` cold-start fix.
+    * **Lemma-form normalization** (PRD F-LB-3 / glossary-invariants
+      §1). When ``source_lang`` / ``target_lang`` are provided, both
+      sides are stripped of a single leading article / preposition /
+      contraction *before* the dedupe lookup. The helper LLM keeps
+      proposing ``Europe → na Europa`` style asymmetric pairs that
+      explode into ``"na na Europa"`` at translation time; the safe
+      default for the auto-proposer is therefore lemma form on both
+      sides. A curator who genuinely wants ``the USA → os EUA``
+      (symmetric, both with articles) can author it manually via
+      :func:`repo.create_glossary_entry` — the curator path is
+      validated separately in :class:`EntryEditScreen` (symmetry
+      required, lemma not enforced).
 
     Anything else (``target_term`` ``None``, empty, or equal to
     ``source_term``) keeps the placeholder behavior of the
@@ -279,7 +294,15 @@ def upsert_proposed(
     promoted/edited are never touched.
     """
 
+    if source_lang is not None:
+        source_norm = normalize_term(source_term, lang=source_lang)
+        if source_norm.particle is not None and source_norm.stripped:
+            source_term = source_norm.stripped
     cleaned_target = (target_term or "").strip() or None
+    if cleaned_target is not None and target_lang is not None:
+        target_norm = normalize_term(cleaned_target, lang=target_lang)
+        if target_norm.particle is not None and target_norm.stripped:
+            cleaned_target = target_norm.stripped
     if cleaned_target is not None and cleaned_target == source_term:
         cleaned_target = None
 

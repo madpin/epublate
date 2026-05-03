@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from epublate.app.preview import has_translatable_text, render_preview
+from epublate.app.preview import (
+    compact_preview,
+    has_translatable_text,
+    render_preview,
+)
 from epublate.formats.base import InlineToken
 
 
@@ -98,3 +102,31 @@ def test_has_translatable_text_keeps_real_content() -> None:
 
 def test_has_translatable_text_empty_string() -> None:
     assert not has_translatable_text("")
+
+
+def test_compact_preview_strips_placeholders() -> None:
+    out = compact_preview(
+        "[[T0]][[T1]]Figure 3.2[[/T1]] looks at the risk for democracy.",
+    )
+    assert "[[" not in out
+    assert "[/T" not in out
+    assert out.startswith("Figure 3.2 looks at")
+
+
+def test_compact_preview_collapses_whitespace_and_truncates() -> None:
+    out = compact_preview("a\nb   c\t\td   e", width=8)
+    assert out == "a b c d…"
+    assert len(out) == 8
+
+
+def test_compact_preview_returns_empty_when_only_placeholders() -> None:
+    assert compact_preview("[[T0]][[/T0]]") == ""
+    assert compact_preview("   [[T0]]   [[/T0]]\n") == ""
+
+
+def test_compact_preview_short_text_unchanged() -> None:
+    assert compact_preview("Hello") == "Hello"
+
+
+def test_compact_preview_handles_empty_input() -> None:
+    assert compact_preview("") == ""

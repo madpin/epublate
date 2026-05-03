@@ -23,6 +23,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import ClassVar, Literal
 
+from rich.markup import escape as escape_markup
 from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
@@ -31,6 +32,7 @@ from textual.reactive import reactive
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Static
 
+from epublate.app.preview import compact_preview
 from epublate.app.widgets import BatchStatusBar
 from epublate.app.widgets.cost_meter import CostMeter
 from epublate.core.project import Project
@@ -157,7 +159,12 @@ class InboxScreen(Screen[None]):
         for seg in flagged_segments(
             self._project.engine, project_id=self._project.project_id
         ):
-            preview = _truncate(seg.source_text)
+            # Segment source text is placeholder-bearing
+            # (``[[T0]][[/T0]]``); strip those before the curator sees
+            # them so the preview is readable AND so the table cell
+            # can never feed a stray ``[/T0]`` into Rich's markup
+            # parser (which would crash ``DataTable``).
+            preview = compact_preview(seg.source_text, width=_PREVIEW_LEN)
             rows.append(
                 InboxRow(
                     kind="flagged",
@@ -213,11 +220,17 @@ class InboxScreen(Screen[None]):
         visible = [r for r in self._rows if self._matches_filter(r)]
         for i, row in enumerate(visible):
             when = _fmt_ts(row.timestamp)
+            # Cells flow through ``Text.from_markup`` inside
+            # ``DataTable``; user-authored data (glossary terms,
+            # alert payloads, segment previews) may legitimately
+            # carry literal ``[...]`` runs that would derail the
+            # markup parser. Escape defensively at the render
+            # boundary so no row can crash the table.
             row_key = table.add_row(
                 row.kind,
                 when,
-                row.label,
-                row.detail,
+                escape_markup(row.label),
+                escape_markup(row.detail),
                 key=f"{row.kind}:{row.payload_id}:{i}",
             )
             self._row_index[str(row_key)] = i
@@ -423,6 +436,22 @@ def _summarize_event(ev: repo.EventRow) -> str:
             f"pre-pass done: {payload.get('chunks', 0)} chunks, "
             f"{payload.get('proposed_count', 0)} proposed"
         )
+    if ev.kind == "batch.pre_pass_cancelled":
+        return (
+            f"pre-pass cancelled: {payload.get('chunks', 0)} chunks done, "
+            f"{payload.get('proposed_count', 0)} proposed"
+        )
+    if ev.kind == "batch.pre_pass_aborted":
+        return (
+            f"pre-pass aborted after {payload.get('failure_streak', 0)} "
+            f"consecutive failures: {payload.get('last_error', 'unknown')}"
+        )
+    if ev.kind == "batch.pre_pass_rate_limited":
+        msg = str(payload.get("provider_message", "rate limit hit"))
+        wait = payload.get("retry_after_seconds")
+        if isinstance(wait, int | float) and wait > 0:
+            return f"pre-pass rate-limited (resets in ~{int(wait)}s): {msg}"
+        return f"pre-pass rate-limited: {msg}"
     if ev.kind == "entity.extracted":
         return (
             f"extractor: {payload.get('entities', 0)} entities, "

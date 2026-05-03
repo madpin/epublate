@@ -165,3 +165,96 @@ async def test_inbox_refresh_picks_up_new_alerts(
             assert new_alert_count == initial_alert_count + 1
     finally:
         project.close()
+
+
+@pytest.mark.asyncio
+async def test_inbox_renders_flagged_segment_with_placeholders(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """Regression: flagged segments whose source text contains opaque
+    inline-tag placeholders (``[[T0]]``, ``[[/T0]]``) used to crash
+    Rich's markup parser when ``DataTable`` rendered the preview cell
+    (``MarkupError: closing tag '[/T0]' doesn't match any open tag``).
+    The Inbox now strips placeholders before the table sees them.
+    """
+
+    src = tiny_epub_factory(
+        chapters=[
+            (
+                "Solo",
+                "<h1>Solo</h1>"
+                "<p><em>Figure 3.2</em> looks at the risk for democracy.</p>",
+            )
+        ]
+    )
+    project = Project.create(
+        src, out_dir=tmp_path / "proj", source_lang="en", target_lang="pt"
+    )
+    try:
+        target: repo.SegmentRow | None = None
+        for chap in repo.list_chapters(project.engine, project.project_id):
+            for seg in repo.list_segments(project.engine, chap.id):
+                if "[[T" in seg.source_text and "Figure" in seg.source_text:
+                    target = seg
+                    break
+            if target is not None:
+                break
+        assert target is not None, "expected a placeholder-bearing segment"
+        repo.update_segment_translation(
+            project.engine,
+            segment_id=target.id,
+            target_text="bad",
+            status=SegmentStatus.FLAGGED,
+        )
+
+        provider = MockLLMProvider()
+        screen = InboxScreen(project, provider_factory=lambda: provider)
+        app = EpublateApp(initial_screen=screen)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            current = pilot.app.screen
+            assert isinstance(current, InboxScreen)
+            flagged = [r for r in current.rows if r.kind == "flagged"]
+            assert flagged, "expected flagged-segment row in the inbox"
+            # The placeholder runs are stripped at preview time so the
+            # curator never sees `[[T0]]`/`[[/T0]]` and Rich can't
+            # mistake `[/T0]` for a closing markup tag.
+            assert "[[" not in flagged[0].detail
+            assert "[/T" not in flagged[0].detail
+            assert "Figure 3.2" in flagged[0].detail
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
+async def test_inbox_renders_proposed_entry_with_bracket_terms(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """Defence-in-depth: a glossary term that legitimately contains a
+    Rich-markup-shaped substring (``[Council]``) must not crash the
+    Inbox table either. We escape every user-derived cell at the
+    render boundary."""
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    try:
+        repo.create_glossary_entry(
+            project.engine,
+            project_id=project.project_id,
+            source_term="The [Council]",
+            target_term="O [Conselho]",
+            type="organization",
+            status="proposed",
+        )
+
+        provider = MockLLMProvider()
+        screen = InboxScreen(project, provider_factory=lambda: provider)
+        app = EpublateApp(initial_screen=screen)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            current = pilot.app.screen
+            assert isinstance(current, InboxScreen)
+            proposed = [r for r in current.rows if r.kind == "proposed"]
+            assert proposed
+            assert proposed[0].label == "The [Council]"
+    finally:
+        project.close()

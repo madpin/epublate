@@ -31,8 +31,18 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from epublate.errors import LLMResponseError
-from epublate.llm.base import Message
+from epublate.llm.base import Message, ResponseFormat
 from epublate.llm.prompts.translator import GlossaryConstraint
+
+DEFAULT_RESPONSE_FORMAT: ResponseFormat = ResponseFormat(type="json_object")
+"""Default ``response_format`` for the target-language extractor.
+
+Same rationale as :data:`epublate.llm.prompts.extractor.DEFAULT_RESPONSE_FORMAT`:
+the prompt mandates JSON-only output, so we ask the endpoint to
+constrain decoding to a JSON object. Reasoning helpers
+(``gpt-oss-20b`` and friends) otherwise consume the visible-channel
+budget on reasoning tokens and return empty content.
+"""
 
 EntityTypeLiteral = Literal[
     "character",
@@ -281,6 +291,7 @@ def _normalize_entity(raw: Any) -> TargetExtractedEntity | None:
 
 
 __all__ = [
+    "DEFAULT_RESPONSE_FORMAT",
     "EntityTypeLiteral",
     "TargetExtractedEntity",
     "TargetExtractorTrace",

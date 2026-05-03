@@ -246,7 +246,39 @@ def has_translatable_text(text: str) -> bool:
     return bool(stripped)
 
 
+def compact_preview(text: str, *, width: int = 60) -> str:
+    """Strip placeholders and collapse whitespace for compact UI cells.
+
+    The Inbox and similar dense views show a short preview of segment
+    text alongside each row. Raw segment text contains opaque
+    placeholders (``[[T0]]``, ``[[/T0]]``) which (a) clutter the
+    preview, and (b) collide with Rich's markup parser when surfaced
+    through ``DataTable``: a closing placeholder like ``[[/T0]]``
+    is parsed as ``[/T0]`` and crashes the renderer with
+    ``MarkupError: closing tag '[/T0]' doesn't match any open tag``.
+
+    This helper drops every placeholder, collapses internal
+    whitespace to single spaces, and tail-truncates with ``…`` so the
+    output fits ``width`` characters. The returned string is plain
+    text (no Rich markup); callers that surface it through a
+    markup-aware renderer should still pass it through
+    ``rich.markup.escape`` to neutralise any user-authored
+    ``[..]`` chunks that survived stripping.
+    """
+
+    if not text:
+        return ""
+    stripped = PLACEHOLDER_RE.sub("", text)
+    flat = " ".join(stripped.split())
+    if not flat:
+        return ""
+    if len(flat) > width:
+        flat = flat[: width - 1] + "…"
+    return flat
+
+
 __all__ = [
+    "compact_preview",
     "has_translatable_text",
     "render_preview",
 ]

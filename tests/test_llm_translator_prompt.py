@@ -114,6 +114,27 @@ def test_glossary_block_renders_gender_when_present() -> None:
     assert "same sense as the entry" in system.content
 
 
+def test_translator_prompt_carries_particle_symmetry_rule() -> None:
+    """Hard rule about article/preposition symmetry must travel in the prompt.
+
+    When a glossary entry like ``Europe → Europa`` has no leading
+    article, the model is responsible for inflecting "in Europe" to
+    "na Europa" and NOT producing "na na Europa". The rule must
+    appear verbatim so we can audit prompt drift.
+    """
+
+    [system, _] = build_translator_messages(
+        source_lang="en",
+        target_lang="pt",
+        source_text="In Europe, the Senate voted yes.",
+        glossary=[],
+    )
+    assert "balanced shape" in system.content
+    # Anti-doubling clause is the actionable bit.
+    assert "na na Europa" in system.content
+    assert "the the Senate" in system.content
+
+
 def test_glossary_block_skips_unspecified_gender() -> None:
     """``unspecified`` is the schema default for "no opinion".
 

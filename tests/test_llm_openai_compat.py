@@ -14,7 +14,7 @@ from collections.abc import Iterator
 import httpx
 import pytest
 
-from epublate.errors import LLMResponseError, LLMTransportError
+from epublate.errors import LLMRateLimitError, LLMResponseError, LLMTransportError
 from epublate.llm import LLMProvider
 from epublate.llm.base import Message, ResponseFormat
 from epublate.llm.openai_compat import OpenAICompatProvider, RetryPolicy
@@ -55,6 +55,7 @@ def _make_provider(
     *,
     captured: list[httpx.Request],
     retries: int = 0,
+    reasoning_effort: str | None = None,
 ) -> OpenAICompatProvider:
     """Build a provider whose http client routes through ``handler``."""
 
@@ -73,6 +74,7 @@ def _make_provider(
         ),
         http_client=client,
         sleep=lambda _s: None,
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -227,6 +229,72 @@ def test_empty_messages_rejected() -> None:
     assert captured == []
 
 
+def test_reasoning_effort_attached_when_set(
+    captured_requests: list[httpx.Request],
+) -> None:
+    """Setting ``reasoning_effort`` on the provider attaches the same
+    field to every chat-completions request body. This is the standard
+    OpenAI knob (``minimal | low | medium | high``) for reasoning
+    models — gpt-5/o1/o3 honor it directly, OpenRouter forwards it to
+    upstream, and non-reasoning models on most endpoints just ignore
+    it. Lowering effort is the cheapest single fix for "reasoning
+    helper is too slow" complaints (PRD §4.2 phase 3 / M5)."""
+
+    transport = httpx.MockTransport(
+        lambda _r: httpx.Response(200, json=_completion_body("ok"))
+    )
+    provider = _make_provider(
+        transport, captured=captured_requests, reasoning_effort="low"
+    )
+    provider.chat([_msg("user", "hi")], model="gpt-mock")
+    body = json.loads(captured_requests[0].content.decode("utf-8"))
+    assert body["reasoning_effort"] == "low"
+
+
+def test_reasoning_effort_omitted_when_unset(
+    captured_requests: list[httpx.Request],
+) -> None:
+    """When ``reasoning_effort`` is ``None`` (the default), the field
+    is *omitted* from the request body — non-reasoning models on
+    stricter endpoints would otherwise reject the unknown parameter."""
+
+    transport = httpx.MockTransport(
+        lambda _r: httpx.Response(200, json=_completion_body("ok"))
+    )
+    provider = _make_provider(transport, captured=captured_requests)
+    provider.chat([_msg("user", "hi")], model="gpt-mock")
+    body = json.loads(captured_requests[0].content.decode("utf-8"))
+    assert "reasoning_effort" not in body
+
+
+@pytest.mark.parametrize("value", ["minimal", "low", "medium", "high"])
+def test_reasoning_effort_accepts_valid_values(value: str) -> None:
+    """The four standard OpenAI reasoning-effort settings are all
+    allowed; any other string raises at construction time so a typo
+    in ``$EPUBLATE_LLM_REASONING_EFFORT`` fails fast instead of
+    surfacing as a 400 from the endpoint mid-batch."""
+
+    transport = httpx.MockTransport(
+        lambda _r: httpx.Response(200, json=_completion_body("ok"))
+    )
+    captured: list[httpx.Request] = []
+    provider = _make_provider(transport, captured=captured, reasoning_effort=value)
+    assert provider.reasoning_effort == value
+
+
+def test_reasoning_effort_invalid_value_raises() -> None:
+    """A typo in the env var should fail at provider build time, not
+    after the first chat() call hits the wire."""
+
+    with pytest.raises(LLMResponseError, match="reasoning_effort"):
+        OpenAICompatProvider(
+            base_url="http://mocked/v1",
+            api_key="test-key",
+            default_model="gpt-mock",
+            reasoning_effort="aggressive",
+        )
+
+
 def test_unknown_response_format_type_rejected() -> None:
     transport = httpx.MockTransport(
         lambda _r: httpx.Response(200, json=_completion_body("never"))
@@ -241,3 +309,139 @@ def test_unknown_response_format_type_rejected() -> None:
                 type="bogus"
             ),
         )
+
+
+def test_429_with_long_x_ratelimit_reset_raises_rate_limit_error(
+    captured_requests: list[httpx.Request],
+) -> None:
+    """OpenRouter free-tier "free-models-per-day" quota lifts out cleanly.
+
+    The depleted-quota response carries ``X-RateLimit-Reset`` set to the
+    millisecond epoch when the quota refills (typically UTC midnight).
+    When the implied wait is longer than the per-call retry budget can
+    absorb (``> 120s``) we must raise ``LLMRateLimitError`` immediately
+    so the orchestrator pauses cleanly instead of burning the rest of
+    the queue on the same 429.
+    """
+
+    import time
+
+    # Reset 1 hour from now, well above the 120s short-wait cap.
+    reset_ms = int((time.time() + 3600) * 1000)
+    transport = httpx.MockTransport(
+        lambda _r: httpx.Response(
+            429,
+            json={
+                "error": {
+                    "message": (
+                        "Rate limit exceeded: free-models-per-day. "
+                        "Add 6.55 credits to unlock 1000 free model "
+                        "requests per day"
+                    )
+                }
+            },
+            headers={
+                "X-RateLimit-Limit": "50",
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": str(reset_ms),
+            },
+        )
+    )
+    provider = _make_provider(transport, captured=captured_requests, retries=4)
+    with pytest.raises(LLMRateLimitError) as exc_info:
+        provider.chat([_msg("user", "x")], model="gpt-mock")
+    err = exc_info.value
+    assert err.retry_after_seconds is not None
+    assert err.retry_after_seconds > 120  # minutes-to-hours
+    assert "free-models-per-day" in (err.provider_message or "")
+    # The first call surfaced the error — no per-call retries burned.
+    assert len(captured_requests) == 1
+
+
+def test_429_with_short_retry_after_sleeps_and_retries(
+    captured_requests: list[httpx.Request],
+) -> None:
+    """A burst rate limit with ``Retry-After: 5`` sleeps that long and retries.
+
+    The OpenAI canonical 429-with-Retry-After case (server hints "wait
+    5s and try again") should not pause the batch; we honor the server
+    hint, retry within the per-call budget, and succeed on the second
+    response.
+    """
+
+    responses: Iterator[httpx.Response] = iter(
+        [
+            httpx.Response(
+                429,
+                json={"error": {"message": "slow down"}},
+                headers={"Retry-After": "5"},
+            ),
+            httpx.Response(200, json=_completion_body("ok")),
+        ]
+    )
+    sleeps: list[float] = []
+
+    def _instrument(request: httpx.Request) -> httpx.Response:
+        captured_requests.append(request)
+        return next(responses)
+
+    transport = httpx.MockTransport(_instrument)
+    client = httpx.Client(transport=transport, base_url="http://mocked")
+    provider = OpenAICompatProvider(
+        base_url="http://mocked/v1",
+        api_key="test-key",
+        default_model="gpt-mock",
+        retry_policy=RetryPolicy(max_retries=2, initial=0.0, maximum=0.0, jitter=False),
+        http_client=client,
+        sleep=sleeps.append,
+    )
+    result = provider.chat([_msg("user", "x")], model="gpt-mock")
+    assert result.content == "ok"
+    assert len(captured_requests) == 2
+    # The 5s Retry-After hint was passed to ``sleep``.
+    assert 5.0 in sleeps
+
+
+def test_429_without_headers_falls_through_to_existing_retry(
+    captured_requests: list[httpx.Request],
+) -> None:
+    """A header-less 429 keeps the legacy "retry per policy" behavior.
+
+    Without a ``Retry-After`` or ``X-RateLimit-Reset`` we can't tell if
+    the wait is one second or one day. The conservative default is to
+    retry per the existing exponential backoff so a transient 429 burst
+    (no headers) doesn't pause the batch.
+    """
+
+    responses: Iterator[httpx.Response] = iter(
+        [
+            httpx.Response(429, json={"error": {"message": "slow down"}}),
+            httpx.Response(200, json=_completion_body("ok")),
+        ]
+    )
+    transport = httpx.MockTransport(lambda _r: next(responses))
+    provider = _make_provider(transport, captured=captured_requests, retries=2)
+    result = provider.chat([_msg("user", "x")], model="gpt-mock")
+    assert result.content == "ok"
+    assert len(captured_requests) == 2
+
+
+def test_429_exhausting_retries_surfaces_rate_limit_error(
+    captured_requests: list[httpx.Request],
+) -> None:
+    """When retries don't recover, the typed rate-limit error wins.
+
+    Before this fix every helper-LLM 429 surfaced as a generic
+    :class:`LLMResponseError`; the batch worker treated it as an opaque
+    per-segment failure and burned the rest of the queue on the same
+    rate limit. Surfacing the typed error lets the orchestrator pause.
+    """
+
+    transport = httpx.MockTransport(
+        lambda _r: httpx.Response(429, json={"error": {"message": "still busy"}})
+    )
+    provider = _make_provider(transport, captured=captured_requests, retries=2)
+    with pytest.raises(LLMRateLimitError):
+        provider.chat([_msg("user", "x")], model="gpt-mock")
+    # initial + 2 retries = 3 requests
+    assert len(captured_requests) == 3

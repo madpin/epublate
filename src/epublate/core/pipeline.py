@@ -42,11 +42,12 @@ from epublate.glossary.enforcer import (
     build_constraints,
     build_target_only_constraints,
     find_mentions,
+    find_target_doubled_particles,
     glossary_hash,
-    has_locked_violation,
+    has_flagging_violation,
     validate_target,
 )
-from epublate.glossary.matcher import match_source
+from epublate.glossary.matcher import Match, match_source
 from epublate.glossary.models import EntityType, GlossaryEntryWithAliases
 from epublate.llm.base import LLMProvider, ResponseFormat
 from epublate.llm.pricing import estimate_cost
@@ -261,6 +262,8 @@ def translate_segment(
                 options=options,
                 entries=project_entries,
                 glossary_view=glossary_view,
+                source_lang=source_lang,
+                target_lang=target_lang,
             )
             glossary_view.close()
             return outcome
@@ -297,12 +300,17 @@ def translate_segment(
     spliced = _splice_target(segment, target=trace.target)
     validate_segment_placeholders(spliced)
 
-    violations = validate_target(
-        source_text=segment.source_text,
-        target_text=trace.target,
-        entries=project_entries,
+    violations = list(
+        validate_target(
+            source_text=segment.source_text,
+            target_text=trace.target,
+            entries=project_entries,
+        )
     )
-    flagged = has_locked_violation(violations)
+    violations.extend(
+        find_target_doubled_particles(trace.target, target_lang=target_lang)
+    )
+    flagged = has_flagging_violation(violations)
     final_status = (
         schema.SegmentStatus.FLAGGED if flagged else schema.SegmentStatus.TRANSLATED
     )
@@ -335,7 +343,36 @@ def translate_segment(
             target_text=trace.target,
             status=final_status,
         )
-        repo.record_mentions(conn, segment_id=segment.id, mentions=mention_payload)
+        # Auto-propose runs BEFORE ``record_mentions`` so the freshly
+        # created entries can register a first-occurrence mention
+        # against this segment in the same transaction (PRD F-LB-6:
+        # an entry's first mention is the segment that birthed it).
+        # ``record_mentions`` is destructive — it replaces all rows
+        # for the segment in one shot — so we accumulate the union
+        # here and call it once below.
+        proposed_first_mentions: list[tuple[str, int | None, int | None]] = []
+        if options.auto_propose and glossary_view.writable_lore_engine is None:
+            new_ids = _auto_propose_entities(
+                conn,
+                project_id=project_id,
+                segment_id=segment.id,
+                trace=trace,
+                source_lang=source_lang,
+                target_lang=target_lang,
+            )
+            proposed_ids.extend(new_ids)
+            proposed_first_mentions = _spans_for_new_entries(
+                conn,
+                entry_ids=new_ids,
+                source_text=segment.source_text,
+            )
+        all_mentions = list(mention_payload) + proposed_first_mentions
+        repo.record_mentions(conn, segment_id=segment.id, mentions=all_mentions)
+        full_mention_entry_ids = tuple(
+            dict.fromkeys(
+                list(mention_entry_ids) + [eid for eid, *_ in proposed_first_mentions]
+            )
+        )
         repo.insert_llm_call(
             conn,
             repo.LLMCallRow(
@@ -365,7 +402,7 @@ def translate_segment(
                 "cost_usd": cost,
                 "cache_hit": False,
                 "llm_call_id": llm_call_id,
-                "mention_entry_ids": list(mention_entry_ids),
+                "mention_entry_ids": list(full_mention_entry_ids),
                 "flagged": flagged,
             },
         )
@@ -379,15 +416,6 @@ def translate_segment(
                     "violations": [_violation_to_payload(v) for v in violations],
                 },
             )
-        if options.auto_propose and glossary_view.writable_lore_engine is None:
-            proposed_ids.extend(
-                _auto_propose_entities(
-                    conn,
-                    project_id=project_id,
-                    segment_id=segment.id,
-                    trace=trace,
-                )
-            )
     if options.auto_propose and glossary_view.writable_lore_engine is not None:
         # Run write-back AFTER the project transaction commits so a
         # lore-book write failure can never roll back the segment write.
@@ -397,6 +425,8 @@ def translate_segment(
                 project_id=project_id,
                 segment_id=segment.id,
                 trace=trace,
+                source_lang=source_lang,
+                target_lang=target_lang,
                 write_back_engine=glossary_view.writable_lore_engine,
                 write_back_project_id=glossary_view.writable_lore_project_id,
             )
@@ -424,7 +454,7 @@ def translate_segment(
         cache_key=key,
         violations=tuple(violations),
         flagged=flagged,
-        mention_entry_ids=mention_entry_ids,
+        mention_entry_ids=full_mention_entry_ids,
         proposed_entry_ids=tuple(proposed_ids),
     )
 
@@ -440,6 +470,8 @@ def _replay_from_cache(
     options: TranslateOptions,
     entries: Sequence[GlossaryEntryWithAliases],
     glossary_view: _GlossaryView | None = None,
+    source_lang: str | None = None,
+    target_lang: str | None = None,
 ) -> TranslateOutcome:
     """Hydrate a translation from a cached ``llm_call`` row.
 
@@ -471,12 +503,17 @@ def _replay_from_cache(
     spliced = _splice_target(segment, target=trace.target)
     validate_segment_placeholders(spliced)
 
-    violations = validate_target(
-        source_text=segment.source_text,
-        target_text=trace.target,
-        entries=entries,
+    violations = list(
+        validate_target(
+            source_text=segment.source_text,
+            target_text=trace.target,
+            entries=entries,
+        )
     )
-    flagged = has_locked_violation(violations)
+    violations.extend(
+        find_target_doubled_particles(trace.target, target_lang=target_lang)
+    )
+    flagged = has_flagging_violation(violations)
     final_status = (
         schema.SegmentStatus.FLAGGED if flagged else schema.SegmentStatus.TRANSLATED
     )
@@ -506,7 +543,34 @@ def _replay_from_cache(
             target_text=trace.target,
             status=final_status,
         )
-        repo.record_mentions(conn, segment_id=segment.id, mentions=mention_payload)
+        # Auto-propose runs BEFORE ``record_mentions`` so the freshly
+        # created entries can register a first-occurrence mention
+        # against this segment in the same transaction (PRD F-LB-6).
+        proposed_first_mentions: list[tuple[str, int | None, int | None]] = []
+        if options.auto_propose and (
+            glossary_view is None or glossary_view.writable_lore_engine is None
+        ):
+            new_ids = _auto_propose_entities(
+                conn,
+                project_id=project_id,
+                segment_id=segment.id,
+                trace=trace,
+                source_lang=source_lang,
+                target_lang=target_lang,
+            )
+            proposed_ids.extend(new_ids)
+            proposed_first_mentions = _spans_for_new_entries(
+                conn,
+                entry_ids=new_ids,
+                source_text=segment.source_text,
+            )
+        all_mentions = list(mention_payload) + proposed_first_mentions
+        repo.record_mentions(conn, segment_id=segment.id, mentions=all_mentions)
+        full_mention_entry_ids = tuple(
+            dict.fromkeys(
+                list(mention_entry_ids) + [eid for eid, *_ in proposed_first_mentions]
+            )
+        )
         repo.insert_llm_call(
             conn,
             repo.LLMCallRow(
@@ -533,7 +597,7 @@ def _replay_from_cache(
                 "model": hit.model,
                 "cache_hit": True,
                 "llm_call_id": new_id,
-                "mention_entry_ids": list(mention_entry_ids),
+                "mention_entry_ids": list(full_mention_entry_ids),
                 "flagged": flagged,
             },
         )
@@ -547,17 +611,6 @@ def _replay_from_cache(
                     "violations": [_violation_to_payload(v) for v in violations],
                 },
             )
-        if options.auto_propose and (
-            glossary_view is None or glossary_view.writable_lore_engine is None
-        ):
-            proposed_ids.extend(
-                _auto_propose_entities(
-                    conn,
-                    project_id=project_id,
-                    segment_id=segment.id,
-                    trace=trace,
-                )
-            )
     if (
         options.auto_propose
         and glossary_view is not None
@@ -569,6 +622,8 @@ def _replay_from_cache(
                 project_id=project_id,
                 segment_id=segment.id,
                 trace=trace,
+                source_lang=source_lang,
+                target_lang=target_lang,
                 write_back_engine=glossary_view.writable_lore_engine,
                 write_back_project_id=glossary_view.writable_lore_project_id,
             )
@@ -586,7 +641,7 @@ def _replay_from_cache(
         cache_key=key,
         violations=tuple(violations),
         flagged=flagged,
-        mention_entry_ids=mention_entry_ids,
+        mention_entry_ids=full_mention_entry_ids,
         proposed_entry_ids=tuple(proposed_ids),
     )
 
@@ -920,6 +975,69 @@ def _load_glossary_view(engine: Any, *, project_id: str) -> _GlossaryView:
     )
 
 
+def _spans_for_new_entries(
+    conn: Any,
+    *,
+    entry_ids: Sequence[str],
+    source_text: str,
+) -> list[tuple[str, int | None, int | None]]:
+    """First-occurrence mention spans for freshly-proposed glossary entries.
+
+    A glossary entry's first mention is, by definition, the segment
+    that birthed it (PRD F-LB-6 / glossary-invariants §3): the
+    auto-proposer fires *because* the LLM saw the term in this
+    segment. Without a corresponding ``entity_mention`` row the
+    Glossary screen's Uses column reads ``0`` for an entry whose
+    ``first_seen_segment_id`` clearly points at a real segment.
+
+    Algorithm:
+
+    1. Re-fetch each newly-created entry so we have its canonical
+       (post-normalization) ``source_term`` plus aliases.
+    2. Run :func:`match_source` against ``source_text`` for the
+       fetched entries. This produces the same Unicode-aware
+       word-boundary spans the matcher uses everywhere else, so the
+       Occurrences modal can render an accurate ``«…»`` highlight.
+    3. If the matcher finds zero spans for an entry — usually because
+       lemma normalization stripped a particle the source text still
+       carries (``"in Europe"`` source vs. ``Europe`` stored), or
+       because the helper LLM hallucinated the surface form — fall
+       back to a span-less ``(entry_id, None, None)`` tuple. The
+       Occurrences modal still lists the segment, just without a
+       per-character highlight.
+
+    Returning the tuples lets the caller union them with the regular
+    ``mention_payload`` and call :func:`repo.record_mentions` once
+    per segment write (the helper is destructive — it deletes all
+    rows for the segment first — so a single call is the only safe
+    pattern).
+    """
+
+    if not entry_ids:
+        return []
+
+    fetched: list[GlossaryEntryWithAliases] = []
+    for entry_id in entry_ids:
+        ent = repo.get_glossary_entry(conn, entry_id)
+        if ent is not None:
+            fetched.append(ent)
+    if not fetched:
+        return []
+
+    hits_by_entry: dict[str, list[Match]] = {}
+    for hit in match_source(source_text, fetched):
+        hits_by_entry.setdefault(hit.entry_id, []).append(hit)
+
+    out: list[tuple[str, int | None, int | None]] = []
+    for ent in fetched:
+        hits = hits_by_entry.get(ent.id, [])
+        if hits:
+            out.extend((ent.id, h.start, h.end) for h in hits)
+        else:
+            out.append((ent.id, None, None))
+    return out
+
+
 def _violation_to_payload(violation: Violation) -> dict[str, Any]:
     return {
         "entry_id": violation.entry_id,
@@ -928,6 +1046,7 @@ def _violation_to_payload(violation: Violation) -> dict[str, Any]:
         "matched_source": violation.matched_source,
         "severity": violation.severity,
         "message": violation.message,
+        "kind": violation.kind,
     }
 
 
@@ -937,6 +1056,8 @@ def _auto_propose_entities(
     project_id: str,
     segment_id: str,
     trace: TranslatorTrace,
+    source_lang: str | None = None,
+    target_lang: str | None = None,
     write_back_engine: Any | None = None,
     write_back_project_id: str | None = None,
 ) -> list[str]:
@@ -979,6 +1100,8 @@ def _auto_propose_entities(
                         first_seen_segment_id=None,
                         notes=None,
                         target_term=target_term,
+                        source_lang=source_lang,
+                        target_lang=target_lang,
                     )
                     if not created:
                         continue
@@ -1016,6 +1139,8 @@ def _auto_propose_entities(
             first_seen_segment_id=segment_id,
             notes=None,
             target_term=target_term,
+            source_lang=source_lang,
+            target_lang=target_lang,
         )
         if not created:
             continue
@@ -1226,6 +1351,8 @@ def translate_segments_grouped(
                     options=options,
                     entries=project_entries,
                     glossary_view=glossary_view,
+                    source_lang=source_lang,
+                    target_lang=target_lang,
                 )
                 continue
 
@@ -1430,6 +1557,8 @@ def translate_segments_grouped(
             entries=project_entries,
             options=options,
             glossary_view=glossary_view,
+            source_lang=source_lang,
+            target_lang=target_lang,
         )
 
     assert all(o is not None for o in outcomes), "group fill left a hole"
@@ -1489,6 +1618,8 @@ def _commit_group_item(
     entries: Sequence[GlossaryEntryWithAliases],
     options: TranslateOptions,
     glossary_view: _GlossaryView | None = None,
+    source_lang: str | None = None,
+    target_lang: str | None = None,
 ) -> TranslateOutcome:
     """Persist one item from a successful group call.
 
@@ -1502,12 +1633,17 @@ def _commit_group_item(
     configured (PRD F-LB-10 phase 3).
     """
 
-    violations = validate_target(
-        source_text=segment.source_text,
-        target_text=trace.target,
-        entries=entries,
+    violations = list(
+        validate_target(
+            source_text=segment.source_text,
+            target_text=trace.target,
+            entries=entries,
+        )
     )
-    flagged = has_locked_violation(violations)
+    violations.extend(
+        find_target_doubled_particles(trace.target, target_lang=target_lang)
+    )
+    flagged = has_flagging_violation(violations)
     final_status = (
         schema.SegmentStatus.FLAGGED if flagged else schema.SegmentStatus.TRANSLATED
     )
@@ -1532,7 +1668,34 @@ def _commit_group_item(
             target_text=trace.target,
             status=final_status,
         )
-        repo.record_mentions(conn, segment_id=segment.id, mentions=mention_payload)
+        # Auto-propose runs BEFORE ``record_mentions`` so the freshly
+        # created entries can register a first-occurrence mention
+        # against this segment in the same transaction (PRD F-LB-6).
+        proposed_first_mentions: list[tuple[str, int | None, int | None]] = []
+        if options.auto_propose and (
+            glossary_view is None or glossary_view.writable_lore_engine is None
+        ):
+            new_ids = _auto_propose_entities(
+                conn,
+                project_id=project_id,
+                segment_id=segment.id,
+                trace=trace,
+                source_lang=source_lang,
+                target_lang=target_lang,
+            )
+            proposed_ids.extend(new_ids)
+            proposed_first_mentions = _spans_for_new_entries(
+                conn,
+                entry_ids=new_ids,
+                source_text=segment.source_text,
+            )
+        all_mentions = list(mention_payload) + proposed_first_mentions
+        repo.record_mentions(conn, segment_id=segment.id, mentions=all_mentions)
+        full_mention_entry_ids = tuple(
+            dict.fromkeys(
+                list(mention_entry_ids) + [eid for eid, *_ in proposed_first_mentions]
+            )
+        )
         repo.insert_llm_call(
             conn,
             repo.LLMCallRow(
@@ -1562,7 +1725,7 @@ def _commit_group_item(
                 "cost_usd": cost,
                 "cache_hit": False,
                 "llm_call_id": llm_call_id,
-                "mention_entry_ids": list(mention_entry_ids),
+                "mention_entry_ids": list(full_mention_entry_ids),
                 "flagged": flagged,
                 "grouped": True,
             },
@@ -1577,17 +1740,6 @@ def _commit_group_item(
                     "violations": [_violation_to_payload(v) for v in violations],
                 },
             )
-        if options.auto_propose and (
-            glossary_view is None or glossary_view.writable_lore_engine is None
-        ):
-            proposed_ids.extend(
-                _auto_propose_entities(
-                    conn,
-                    project_id=project_id,
-                    segment_id=segment.id,
-                    trace=trace,
-                )
-            )
     if (
         options.auto_propose
         and glossary_view is not None
@@ -1599,6 +1751,8 @@ def _commit_group_item(
                 project_id=project_id,
                 segment_id=segment.id,
                 trace=trace,
+                source_lang=source_lang,
+                target_lang=target_lang,
                 write_back_engine=glossary_view.writable_lore_engine,
                 write_back_project_id=glossary_view.writable_lore_project_id,
             )
@@ -1624,7 +1778,7 @@ def _commit_group_item(
         cache_key=key,
         violations=tuple(violations),
         flagged=flagged,
-        mention_entry_ids=mention_entry_ids,
+        mention_entry_ids=full_mention_entry_ids,
         proposed_entry_ids=tuple(proposed_ids),
         extra={"grouped": True},
     )

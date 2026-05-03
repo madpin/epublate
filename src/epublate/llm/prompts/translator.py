@@ -168,6 +168,17 @@ Hard rules — these are not negotiable:
    ``o Senhor`` / ``do Senhor`` for masculine).
    When the source uses an article with a glossary term, your
    translation MUST keep the article and inflect it correctly.
+7. Glossary entries are recorded in a balanced shape: either both
+   the source term and the target term carry a leading article /
+   preposition (e.g. ``the USA → os EUA``), or neither does
+   (``Europe → Europa``, ``USA → EUA``). When the entry has NO
+   leading article, you MUST inflect the surrounding article /
+   preposition / contraction yourself based on the source: render
+   ``"in Europe"`` as ``"na Europa"``, ``"the Senate voted"`` as
+   ``"o Senado votou"``, etc. — and never emit doubled function
+   words like ``"na na Europa"`` or ``"the the Senate"``. When the
+   entry HAS a leading article on both sides, treat the article as
+   part of the canonical spelling and do not add another one.
 
 {style_guide_block}{glossary_block}{target_only_block}\
 Respond with a single JSON object and nothing else:
@@ -229,7 +240,18 @@ Hard rules — these are not negotiable:
    contractions. When the source uses an article with a glossary
    term, your translation MUST keep the article and inflect it
    correctly.
-7. Inline formatting in each item's source is encoded as opaque
+7. Glossary entries are recorded in a balanced shape: either both
+   the source term and the target term carry a leading article /
+   preposition (``the USA → os EUA``), or neither does
+   (``Europe → Europa``). When the entry has NO leading article,
+   inflect the surrounding article / preposition / contraction
+   yourself based on the source ("in Europe" → "na Europa", "the
+   Senate voted" → "o Senado votou") and never emit doubled
+   function words like ``"na na Europa"`` or ``"the the Senate"``.
+   When the entry HAS a leading article on both sides, treat the
+   article as part of the canonical spelling and do not add another
+   one.
+8. Inline formatting in each item's source is encoded as opaque
    placeholders of the form ``[[T0]]``, ``[[/T0]]``, ``[[T1]]``, etc.
    For each item, every placeholder that appears in that item's
    source MUST appear exactly once in that item's target, in the same

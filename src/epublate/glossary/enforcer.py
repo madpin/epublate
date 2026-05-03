@@ -38,9 +38,11 @@ from epublate.glossary.models import (
     GlossaryEntryWithAliases,
     GlossaryStatusLiteral,
 )
+from epublate.glossary.normalize import find_doubled_particles
 from epublate.llm.prompts.translator import GlossaryConstraint, TargetOnlyConstraint
 
 ViolationSeverity = Literal["error", "warning"]
+ViolationKind = Literal["missing_locked_term", "doubled_particle"]
 
 
 @dataclass(slots=True, frozen=True)
@@ -50,6 +52,15 @@ class Violation:
     ``severity`` is ``"error"`` for locked entries (the segment must be
     flagged) and ``"warning"`` for confirmed entries (the curator is
     informed but the translation is still considered valid).
+
+    ``kind`` distinguishes *missing-term* violations (the historical
+    behaviour: a locked source term appears in source but its target
+    is missing) from *doubled-particle* warnings (PRD F-LB-3): the
+    LLM emitted ``"na na Europa"`` style runs, typically because the
+    glossary or the surrounding prose pushed it that way. Doubled
+    particles always flag the segment for human review even though
+    their severity is ``"warning"`` — see
+    :func:`has_flagging_violation`.
     """
 
     entry_id: str
@@ -58,6 +69,7 @@ class Violation:
     matched_source: str
     severity: ViolationSeverity
     message: str
+    kind: ViolationKind = "missing_locked_term"
 
 
 # Statuses that the LLM ever sees. Order matters: the prompt sorts
@@ -220,6 +232,64 @@ def has_locked_violation(violations: Iterable[Violation]) -> bool:
     return any(v.severity == "error" for v in violations)
 
 
+def has_flagging_violation(violations: Iterable[Violation]) -> bool:
+    """True if any violation should flip the segment to ``flagged``.
+
+    The pipeline's flag rule is "anything that should land on the
+    curator's Inbox" — that's locked errors *plus* the
+    ``doubled_particle`` warnings introduced by PRD F-LB-3. A
+    confirmed-entry warning still does not flag (it just decorates
+    the segment for the curator's review screen).
+    """
+
+    seen = list(violations)
+    return any(v.severity == "error" for v in seen) or any(
+        v.kind == "doubled_particle" for v in seen
+    )
+
+
+def find_target_doubled_particles(
+    target_text: str,
+    *,
+    target_lang: str | None,
+) -> list[Violation]:
+    """Soft-warn when the LLM's target repeats a function word.
+
+    Examples we want to catch (Portuguese):
+
+    * ``"Na na Europa, há…"`` — symmetry-violating glossary entry
+      ``Europe → na Europa`` doubled the preposition + article when
+      the source said ``"In Europe, there is…"``.
+    * ``"da da Câmara"`` — a similar collision around contractions.
+
+    English equivalents (``"the the X"``, ``"a a X"``) are also
+    flagged. Each violation is severity ``"warning"`` but ``kind``
+    ``"doubled_particle"``, so :func:`has_flagging_violation` flips
+    the segment to ``flagged`` even though no locked term was
+    missing — the curator should look at the output.
+    """
+
+    out: list[Violation] = []
+    for particle, offset in find_doubled_particles(target_text, lang=target_lang):
+        out.append(
+            Violation(
+                entry_id="",
+                source_term="",
+                target_term=particle,
+                matched_source="",
+                severity="warning",
+                kind="doubled_particle",
+                message=(
+                    f"target repeats the function word {particle!r} at "
+                    f"char {offset} (e.g. '{particle} {particle}…') — "
+                    "likely a glossary particle-symmetry mismatch "
+                    "(PRD F-LB-3)."
+                ),
+            )
+        )
+    return out
+
+
 def glossary_hash(entries: Iterable[GlossaryEntryWithAliases]) -> str:
     """Deterministic hash of the LLM-visible glossary state.
 
@@ -286,11 +356,14 @@ def _entries_with_source_match(
 
 __all__ = [
     "Violation",
+    "ViolationKind",
     "ViolationSeverity",
     "build_constraints",
     "build_target_only_constraints",
     "find_mentions",
+    "find_target_doubled_particles",
     "glossary_hash",
+    "has_flagging_violation",
     "has_locked_violation",
     "validate_target",
 ]

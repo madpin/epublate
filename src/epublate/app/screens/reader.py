@@ -67,7 +67,7 @@ from epublate.db import repo
 from epublate.db.schema import SegmentStatus
 from epublate.formats.base import InlineToken
 from epublate.llm.base import LLMProvider
-from epublate.llm.factory import build_provider
+from epublate.llm.factory import build_provider, resolve_helper_model
 
 if TYPE_CHECKING:
     from epublate.app.main import BatchProgress
@@ -1532,11 +1532,33 @@ class ReaderScreen(Screen[None]):
     @work(exclusive=False, group="reader-chapter-batch", thread=True)
     def _chapter_batch_worker(self, *, chapter_id: str) -> None:
         provider = self._provider_factory()
+        # Chapter translate from the Reader is a "batch of one chapter".
+        # We turn the helper-LLM pre-pass on by default so the curator's
+        # iterative per-chapter workflow grows the lore bible the same
+        # way a full ``b`` batch does (PRD §4.2 phase 3 / M5). If a
+        # cheaper helper isn't configured, ``run_batch`` falls back to
+        # the translator model itself (per ``BatchOptions`` docs);
+        # we resolve up-front so the project's ``helper_model``
+        # override and ``$EPUBLATE_LLM_HELPER_MODEL`` actually win.
+        try:
+            project_overrides = repo.get_llm_overrides(
+                self._project.engine, self._project.project_id
+            )
+        except Exception:
+            project_overrides = {}
+        try:
+            helper_model: str | None = resolve_helper_model(
+                self._model, project_overrides=project_overrides
+            )
+        except Exception:
+            helper_model = self._model
         options = BatchOptions(
             model=self._model,
             concurrency=1,
             chapter_ids=(chapter_id,),
             bypass_cache=False,
+            pre_pass=True,
+            helper_model=helper_model,
         )
         try:
             summary = run_batch(
@@ -1605,18 +1627,40 @@ class ReaderScreen(Screen[None]):
         self._refresh_state()
         self._render_segment_panes()
         self._refresh_chapter_cards()
-        self._set_status(
-            f"Chapter batch {kind} for [b]{escape(chap_label)}[/b]: "
-            f"translated={s.translated}, cached={s.cached}, "
-            f"flagged={s.flagged}, failed={s.failed}, "
-            f"cost=${s.cost_usd:.4f}"
-        )
-        if message.paused or not self._chapter_queue:
+        if message.paused and s.paused_reason:
+            # Surface the pause reason verbatim so the curator sees the
+            # actionable hint (rate-limit reset window, budget cap dollar
+            # value, etc.) without having to dig through the Inbox.
+            self._set_status(
+                f"Chapter batch paused for [b]{escape(chap_label)}[/b]: "
+                f"{escape(s.paused_reason)}"
+            )
+        else:
+            self._set_status(
+                f"Chapter batch {kind} for [b]{escape(chap_label)}[/b]: "
+                f"translated={s.translated}, cached={s.cached}, "
+                f"flagged={s.flagged}, failed={s.failed}, "
+                f"cost=${s.cost_usd:.4f}"
+            )
+        if message.paused:
+            # A pause means the next chapter would hit the same wall
+            # (budget cap, rate limit, ...). Clear the queue so we don't
+            # silently fail-and-pause-again across the rest of the run.
+            self._chapter_queue.clear()
             self._publish_batch_progress(
                 active=False,
                 summary=s,
                 total=self._active_batch_total,
-                paused=message.paused,
+                paused=True,
+            )
+            self._sync_batch_meter()
+            return
+        if not self._chapter_queue:
+            self._publish_batch_progress(
+                active=False,
+                summary=s,
+                total=self._active_batch_total,
+                paused=False,
             )
             self._sync_batch_meter()
             return

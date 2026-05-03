@@ -39,6 +39,7 @@ ENV_API_KEY = "EPUBLATE_LLM_API_KEY"
 ENV_MODEL = "EPUBLATE_LLM_MODEL"
 ENV_HELPER_MODEL = "EPUBLATE_LLM_HELPER_MODEL"
 ENV_ORG = "EPUBLATE_LLM_ORG"
+ENV_REASONING_EFFORT = "EPUBLATE_LLM_REASONING_EFFORT"
 
 
 def _override_str(overrides: Mapping[str, object] | None, key: str) -> str | None:
@@ -92,11 +93,18 @@ def build_provider(
             "or pass --mock-llm to use the deterministic mock provider"
         )
 
+    reasoning_effort = (
+        _override_str(overrides, "reasoning_effort")
+        or os.environ.get(ENV_REASONING_EFFORT, "").strip()
+        or None
+    )
+
     return OpenAICompatProvider(
         base_url=base_url or None,
         api_key=os.environ.get(ENV_API_KEY, ""),
         default_model=model,
         organization=os.environ.get(ENV_ORG) or None,
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -173,6 +181,7 @@ __all__ = [
     "ENV_MODEL",
     "ENV_ORG",
     "ENV_PROVIDER",
+    "ENV_REASONING_EFFORT",
     "build_provider",
     "resolve_helper_model",
     "resolve_translator_model",

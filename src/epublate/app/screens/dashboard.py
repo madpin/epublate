@@ -48,7 +48,7 @@ from textual.widgets import (
 
 from epublate.app.branding import ICON_ARROW
 from epublate.app.config import UIConfig
-from epublate.app.messages import BatchFinished, BatchTick
+from epublate.app.messages import BatchFinished, BatchPrePassTick, BatchTick
 from epublate.app.widgets import BatchProgressMeter, BatchSnapshot, CostMeter
 from epublate.core.batch import (
     BatchOptions,
@@ -105,6 +105,16 @@ class BatchRequest:
     # of one round-trip per segment. See ``BatchOptions`` for details.
     group_small_segments: bool = True
     group_max_items: int = 50
+    # Helper-LLM pre-pass (PRD §4.2 phase 3 / M5): scan each chapter
+    # for fresh proper-noun candidates before the translator futures
+    # fire. On by default in the UI so curators get glossary growth
+    # without remembering a flag; the modal exposes a toggle for the
+    # rare case where it isn't wanted (e.g. expensive helper, very
+    # mature lore). ``helper_model`` is resolved by the Dashboard on
+    # dispatch via :func:`resolve_helper_model` so the precedence
+    # chain (project override → env → translator) stays centralized.
+    pre_pass: bool = True
+    helper_model: str | None = None
 
 
 class BatchModal(ModalScreen[BatchRequest | None]):
@@ -210,6 +220,9 @@ class BatchModal(ModalScreen[BatchRequest | None]):
             with Horizontal(classes="row"):
                 yield Label("Force retranslate cached [y/n]:")
                 yield Input(value="n", id="batch-bypass-cache")
+            with Horizontal(classes="row"):
+                yield Label("Helper pre-pass [y/n]:")
+                yield Input(value="y", id="batch-pre-pass")
             yield Static(
                 "Press [b]Ctrl+S[/b] to start, [b]Escape[/b] to cancel. "
                 "Use [b]*[/b] for all chapters, [b]N[/b] for one, "
@@ -219,6 +232,12 @@ class BatchModal(ModalScreen[BatchRequest | None]):
                 "[b]Force retranslate[/b] re-runs every segment even if a cached "
                 "translation exists — the default [b]n[/b] keeps cache hits "
                 "(fastest, free) and is what the curator usually wants. "
+                "[b]Helper pre-pass[/b] runs the cheap helper model over each "
+                "chapter first to surface fresh proper-noun candidates as "
+                "[i]proposed[/i] glossary entries, so the translator's prompt "
+                "sees them before it fires (PRD \u00a74.2 phase 3). The helper "
+                "model is resolved from the project override, then "
+                "$EPUBLATE_LLM_HELPER_MODEL, then the translator model. "
                 "Open the [b]Reader[/b] (key [b]o[/b]) once the batch starts "
                 "to watch segments translate live.",
                 id="batch-help",
@@ -295,6 +314,7 @@ class BatchModal(ModalScreen[BatchRequest | None]):
         group_raw = self.query_one("#batch-group", Input).value.strip().lower()
         group_size_raw = self.query_one("#batch-group-size", Input).value.strip()
         bypass_raw = self.query_one("#batch-bypass-cache", Input).value.strip().lower()
+        pre_pass_raw = self.query_one("#batch-pre-pass", Input).value.strip().lower()
 
         try:
             concurrency = max(1, int(concurrency_raw or "1"))
@@ -322,6 +342,11 @@ class BatchModal(ModalScreen[BatchRequest | None]):
         # tokens and changes nothing in the common case. The curator
         # opts in by typing "y".
         bypass_cache = bypass_raw in {"y", "yes", "true", "1", "on"}
+        # Default for pre-pass is *on*: it surfaces fresh proper-noun
+        # candidates so the translator's prompt is glossary-aware on
+        # the first attempt. Curators who don't want a helper-LLM
+        # round-trip per chapter type "n".
+        pre_pass = pre_pass_raw in {"", "y", "yes", "true", "1", "on"}
         try:
             group_size = int(group_size_raw or "50")
         except ValueError:
@@ -338,6 +363,7 @@ class BatchModal(ModalScreen[BatchRequest | None]):
                 bypass_cache=bypass_cache,
                 group_small_segments=group_enabled,
                 group_max_items=group_size,
+                pre_pass=pre_pass,
             )
         )
 
@@ -1494,6 +1520,25 @@ class DashboardScreen(Screen[None]):
             )
         if ev.kind == "batch.pre_pass_started":
             return f"started ({ev.payload.get('chunk_count', '?')} chunks)"
+        if ev.kind == "batch.pre_pass_cancelled":
+            payload = ev.payload
+            return (
+                f"cancelled after {payload.get('chunks', 0)} chunks "
+                f"(proposed={payload.get('proposed_count', 0)})"
+            )
+        if ev.kind == "batch.pre_pass_aborted":
+            payload = ev.payload
+            return (
+                f"aborted after {payload.get('failure_streak', 0)} failures "
+                f"(last error: {payload.get('last_error', 'unknown')})"
+            )
+        if ev.kind == "batch.pre_pass_rate_limited":
+            payload = ev.payload
+            msg = str(payload.get("provider_message", "rate limit hit"))
+            wait = payload.get("retry_after_seconds")
+            if isinstance(wait, int | float) and wait > 0:
+                return f"rate-limited (resets in ~{int(wait)}s): {msg}"
+            return f"rate-limited: {msg}"
         if ev.kind == "entity.extract_failed":
             return f"extractor failed (model={ev.payload.get('model', '?')})"
         if ev.kind == "entity.extracted":
@@ -1660,6 +1705,16 @@ class DashboardScreen(Screen[None]):
         total_pending = self._count_pending_segments(chapter_ids)
         chapter_count = self._count_pending_chapters(chapter_ids)
         starting_spend = self._stats.spend_usd if self._stats is not None else 0.0
+        # The pre-pass uses the cheap helper model; the translator uses
+        # ``result.model``. We resolve the helper here (instead of letting
+        # ``run_batch`` fall back to ``options.model``) so the project's
+        # ``helper_model`` override and ``$EPUBLATE_LLM_HELPER_MODEL``
+        # actually win. Resolution failures shouldn't block the batch:
+        # if we can't pick a helper, we fall back to the translator
+        # model — which is what ``run_batch`` would have done anyway.
+        helper_model = (
+            self._resolve_batch_helper_model(result.model) if result.pre_pass else None
+        )
         options = BatchOptions(
             model=result.model,
             concurrency=result.concurrency,
@@ -1668,6 +1723,8 @@ class DashboardScreen(Screen[None]):
             bypass_cache=result.bypass_cache,
             group_small_segments=result.group_small_segments,
             group_max_items=result.group_max_items,
+            pre_pass=result.pre_pass,
+            helper_model=helper_model,
         )
         app = self.app
         if not isinstance(app, EpublateApp):
@@ -1692,9 +1749,15 @@ class DashboardScreen(Screen[None]):
             return
         self._batch_running = True
         self._show_batch_panel(total=total_pending, chapter_count=chapter_count)
+        pre_pass_note = (
+            f", pre-pass=on (helper={helper_model or result.model})"
+            if result.pre_pass
+            else ", pre-pass=off"
+        )
         self._set_status(
             f"Batch dispatched: chapters={result.chapters}, "
             f"concurrency={result.concurrency}, model={result.model}"
+            f"{pre_pass_note}"
         )
 
     def action_cancel_batch(self) -> None:
@@ -1754,6 +1817,34 @@ class DashboardScreen(Screen[None]):
         panel.remove_class("-visible")
         meter = self.query_one("#dashboard-batch-meter", BatchProgressMeter)
         meter.update_snapshot(None)
+
+    def _resolve_batch_helper_model(self, translator_model: str) -> str:
+        """Pick the helper model for the batch pre-pass.
+
+        Mirrors :func:`epublate.llm.factory.resolve_helper_model` but
+        with batch-specific fallback: if every source is empty (no
+        project override, no env var, no translator model), we return
+        ``translator_model`` rather than raising — the batch already
+        has a translator wired and we'd rather pre-pass against the
+        same model than abort the run. The Settings → Intake helper
+        override is intentionally *not* consulted here: batch and
+        intake are separate flows (PRD §4.6) and the curator may want
+        a richer model for batch pre-pass than for first-look intake.
+        """
+
+        try:
+            project_overrides = repo.get_llm_overrides(
+                self._project.engine, self._project.project_id
+            )
+        except Exception:
+            project_overrides = {}
+        try:
+            return resolve_helper_model(
+                translator_model,
+                project_overrides=project_overrides,
+            )
+        except Exception:
+            return translator_model
 
     def _resolve_chapter_range(self, expr: str) -> tuple[tuple[str, ...] | None, bool]:
         """Translate ``*`` / ``N`` / ``A-B`` into ``(chapter_ids, ok)``.
@@ -1847,6 +1938,33 @@ class DashboardScreen(Screen[None]):
             f"flagged={ev.summary.flagged}, failed={ev.summary.failed}, "
             f"this batch ${ev.summary.cost_usd:.4f} · "
             f"project total ${(starting_spend + ev.summary.cost_usd):.4f}"
+        )
+
+    @on(BatchPrePassTick)
+    def _handle_pre_pass_tick(self, message: BatchPrePassTick) -> None:
+        """Surface a per-chunk pre-pass tick on the status line.
+
+        Helper-LLM calls don't move the segment-count meter (they
+        don't translate segments) but a slow helper used to make the
+        meter sit at ``0 / N`` for minutes. Showing
+        "pre-pass: ch X/Y chunk A/B" reassures the curator that
+        progress is happening *and* makes Cancel feel responsive
+        (the cancel-event check inside ``run_pre_pass`` drops out of
+        the chunk loop on the next tick).
+        """
+
+        ev = message.event
+        outcome = "ok" if ev.success else f"failed ({ev.error or 'unknown'})"
+        if ev.success and ev.cache_hit:
+            outcome = "cached"
+        proposed = (
+            f", proposed={ev.proposed_count}"
+            if ev.success and ev.proposed_count
+            else ""
+        )
+        self._set_status(
+            f"Pre-pass: ch {ev.chapter_index}/{ev.chapter_count} "
+            f"chunk {ev.chunk_index + 1}/{ev.chunk_count} {outcome}{proposed}"
         )
 
     @on(BatchFinished)

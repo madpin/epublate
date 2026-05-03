@@ -200,6 +200,199 @@ async def test_dashboard_batch_keystroke_opens_modal(
 
 
 @pytest.mark.asyncio
+async def test_dashboard_batch_modal_pre_pass_default_on(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """Submitting the BatchModal with the default form returns ``pre_pass=True``.
+
+    The helper-LLM pre-pass is the cheap proper-noun extractor pass
+    that runs before the translator futures; the UI default is *on*
+    (PRD §4.2 phase 3 / M5) so curators get glossary growth without
+    needing to remember the toggle.
+    """
+
+    from textual.widgets import Input
+
+    from epublate.app.screens.dashboard import BatchModal, BatchRequest
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    try:
+        provider = MockLLMProvider()
+        screen = DashboardScreen(
+            project,
+            provider_factory=lambda: provider,
+            default_model="gpt-mock",
+        )
+        app = EpublateApp(initial_screen=screen)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("b")
+            await pilot.pause()
+            modal = pilot.app.screen
+            assert isinstance(modal, BatchModal)
+            # The toggle must exist and default to "y" so leaving the
+            # form alone enables the pre-pass.
+            toggle = modal.query_one("#batch-pre-pass", Input)
+            assert toggle.value == "y"
+
+            captured: list[BatchRequest | None] = []
+            modal.dismiss = captured.append  # type: ignore[method-assign]
+            modal.action_submit()
+            assert len(captured) == 1
+            request = captured[0]
+            assert request is not None
+            assert request.pre_pass is True
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_batch_modal_pre_pass_can_be_disabled(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """Typing ``n`` in the pre-pass row forwards ``pre_pass=False``."""
+
+    from textual.widgets import Input
+
+    from epublate.app.screens.dashboard import BatchModal, BatchRequest
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    try:
+        provider = MockLLMProvider()
+        screen = DashboardScreen(
+            project,
+            provider_factory=lambda: provider,
+            default_model="gpt-mock",
+        )
+        app = EpublateApp(initial_screen=screen)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("b")
+            await pilot.pause()
+            modal = pilot.app.screen
+            assert isinstance(modal, BatchModal)
+            modal.query_one("#batch-pre-pass", Input).value = "n"
+
+            captured: list[BatchRequest | None] = []
+            modal.dismiss = captured.append  # type: ignore[method-assign]
+            modal.action_submit()
+            request = captured[0]
+            assert request is not None
+            assert request.pre_pass is False
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_batch_dispatch_resolves_helper_model_from_project_override(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """``_on_batch_chosen`` resolves the helper model from the project's
+    LLM overrides and threads it onto :class:`BatchOptions` so the
+    pre-pass actually targets the cheap model the curator configured."""
+
+    from epublate.app.screens.dashboard import BatchRequest
+    from epublate.core.batch import BatchOptions
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    try:
+        repo.set_llm_overrides(
+            project.engine,
+            project_id=project.project_id,
+            overrides={"helper_model": "gpt-cheap-helper"},
+        )
+        provider = MockLLMProvider()
+        provider.set_responder(_placeholder_responder())
+        screen = DashboardScreen(
+            project,
+            provider_factory=lambda: provider,
+            default_model="gpt-mock",
+        )
+        app = EpublateApp(initial_screen=screen)
+
+        captured_options: list[BatchOptions] = []
+
+        def _capture_start_batch(*, options: BatchOptions, **_: object) -> bool:
+            captured_options.append(options)
+            return False  # Skip the actual worker; we only care about wiring.
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            current = pilot.app.screen
+            assert isinstance(current, DashboardScreen)
+            pilot.app.start_batch = _capture_start_batch  # type: ignore[method-assign]
+            current._on_batch_chosen(  # type: ignore[reportPrivateUsage]
+                BatchRequest(
+                    chapters="*",
+                    concurrency=1,
+                    model="gpt-mock",
+                    budget_usd=None,
+                    bypass_cache=False,
+                    pre_pass=True,
+                )
+            )
+            await pilot.pause()
+            assert len(captured_options) == 1
+            options = captured_options[0]
+            assert options.pre_pass is True
+            assert options.helper_model == "gpt-cheap-helper"
+            assert options.model == "gpt-mock"
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_batch_dispatch_pre_pass_off_skips_helper_resolution(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """When the curator opts the pre-pass off, the dispatch leaves
+    ``helper_model=None`` so :func:`run_batch` has no helper config to
+    apply (and the no-op pre-pass branch is the cheapest possible)."""
+
+    from epublate.app.screens.dashboard import BatchRequest
+    from epublate.core.batch import BatchOptions
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    try:
+        provider = MockLLMProvider()
+        provider.set_responder(_placeholder_responder())
+        screen = DashboardScreen(
+            project,
+            provider_factory=lambda: provider,
+            default_model="gpt-mock",
+        )
+        app = EpublateApp(initial_screen=screen)
+
+        captured_options: list[BatchOptions] = []
+
+        def _capture_start_batch(*, options: BatchOptions, **_: object) -> bool:
+            captured_options.append(options)
+            return False
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            current = pilot.app.screen
+            assert isinstance(current, DashboardScreen)
+            pilot.app.start_batch = _capture_start_batch  # type: ignore[method-assign]
+            current._on_batch_chosen(  # type: ignore[reportPrivateUsage]
+                BatchRequest(
+                    chapters="*",
+                    concurrency=1,
+                    model="gpt-mock",
+                    budget_usd=None,
+                    bypass_cache=False,
+                    pre_pass=False,
+                )
+            )
+            await pilot.pause()
+            options = captured_options[0]
+            assert options.pre_pass is False
+            assert options.helper_model is None
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
 async def test_dashboard_batch_modal_renders_project_stats(
     tiny_epub_factory: Callable[..., Path], tmp_path: Path
 ) -> None:

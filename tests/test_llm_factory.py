@@ -11,6 +11,7 @@ from epublate.llm.factory import (
     ENV_HELPER_MODEL,
     ENV_MODEL,
     ENV_PROVIDER,
+    ENV_REASONING_EFFORT,
     build_provider,
     resolve_helper_model,
 )
@@ -20,7 +21,14 @@ from epublate.llm.openai_compat import OpenAICompatProvider
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for var in (ENV_PROVIDER, ENV_BASE_URL, ENV_API_KEY, ENV_MODEL, ENV_HELPER_MODEL):
+    for var in (
+        ENV_PROVIDER,
+        ENV_BASE_URL,
+        ENV_API_KEY,
+        ENV_MODEL,
+        ENV_HELPER_MODEL,
+        ENV_REASONING_EFFORT,
+    ):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -49,6 +57,39 @@ def test_real_provider_built_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert isinstance(provider, OpenAICompatProvider)
     assert provider.default_model == "gpt-5-mini"
     assert provider.api_key == "sk-test"
+    assert provider.reasoning_effort is None
+
+
+def test_real_provider_picks_up_reasoning_effort_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``EPUBLATE_LLM_REASONING_EFFORT`` lets curators tune reasoning
+    models for speed without code changes — the factory plumbs it
+    onto the provider so every chat call carries the field."""
+
+    monkeypatch.setenv(ENV_BASE_URL, "https://example.invalid/v1")
+    monkeypatch.setenv(ENV_API_KEY, "sk-test")
+    monkeypatch.setenv(ENV_MODEL, "gpt-oss-20b")
+    monkeypatch.setenv(ENV_REASONING_EFFORT, "low")
+    provider = build_provider()
+    assert isinstance(provider, OpenAICompatProvider)
+    assert provider.reasoning_effort == "low"
+
+
+def test_project_override_beats_env_for_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-project overrides win over the env var so a curator can run
+    one project on ``high`` (translation quality matters) while
+    another runs on ``low`` (speed matters), using the same env."""
+
+    monkeypatch.setenv(ENV_BASE_URL, "https://example.invalid/v1")
+    monkeypatch.setenv(ENV_API_KEY, "sk-test")
+    monkeypatch.setenv(ENV_MODEL, "gpt-oss-20b")
+    monkeypatch.setenv(ENV_REASONING_EFFORT, "low")
+    provider = build_provider(overrides={"reasoning_effort": "high"})
+    assert isinstance(provider, OpenAICompatProvider)
+    assert provider.reasoning_effort == "high"
 
 
 def test_resolve_helper_model_explicit_override_wins(

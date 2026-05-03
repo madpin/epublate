@@ -5,7 +5,9 @@ from __future__ import annotations
 from epublate.glossary.enforcer import (
     build_constraints,
     build_target_only_constraints,
+    find_target_doubled_particles,
     glossary_hash,
+    has_flagging_violation,
     has_locked_violation,
     validate_target,
 )
@@ -259,3 +261,37 @@ def test_build_target_only_constraints_threads_gender_through() -> None:
     out = build_target_only_constraints(entries)
     assert len(out) == 1
     assert out[0].gender == "feminine"
+
+
+def test_find_target_doubled_particles_warns_and_flags() -> None:
+    """Doubled-particle violations soft-flag the segment (PRD F-LB-3).
+
+    They land on the curator's review pile (segment ``flagged``) but
+    don't trigger the retry budget the way a locked-term miss does.
+    """
+
+    violations = find_target_doubled_particles(
+        "Estavam na na Europa em férias.",
+        target_lang="pt",
+    )
+    assert len(violations) == 1
+    v = violations[0]
+    assert v.severity == "warning"
+    assert v.kind == "doubled_particle"
+    assert v.target_term == "na"
+    # ``has_flagging_violation`` flips the segment to ``flagged`` even
+    # though severity is "warning" — that's the soft-warn contract.
+    assert has_flagging_violation([v])
+    # ``has_locked_violation`` keeps its narrower meaning so existing
+    # callers see the same semantics.
+    assert not has_locked_violation([v])
+
+
+def test_find_target_doubled_particles_quiet_when_clean() -> None:
+    """A well-translated paragraph emits no doubled-particle warnings."""
+
+    violations = find_target_doubled_particles(
+        "Os senadores votaram na Câmara dos Lordes hoje.",
+        target_lang="pt",
+    )
+    assert violations == []

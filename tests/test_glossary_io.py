@@ -403,3 +403,98 @@ def test_read_payload_validates(tmp_path: Path) -> None:
     p.write_text("{not json", encoding="utf-8")
     with pytest.raises(ConfigurationError):
         glossary_io.read_payload(p)
+
+
+def test_upsert_proposed_strips_target_leading_particle(project_db: Engine) -> None:
+    """``Europe → na Europa`` is auto-stripped to lemma form ``Europa``.
+
+    The helper LLM that drives auto-proposal regularly emits
+    asymmetric pairs where the target carries a contracted
+    preposition + article. Storing them verbatim produces
+    ``"na na Europa"`` doubling at translation time
+    (PRD F-LB-3 / glossary-invariants §1).
+    """
+
+    pid = _project(project_db)
+    eid, created = glossary_io.upsert_proposed(
+        project_db,
+        project_id=pid,
+        source_term="Europe",
+        type="place",
+        target_term="na Europa",
+        source_lang="en",
+        target_lang="pt",
+    )
+    assert created is True
+    entry = repo.get_glossary_entry(project_db, eid)
+    assert entry is not None
+    assert entry.source_term == "Europe"
+    assert entry.target_term == "Europa"
+
+
+def test_upsert_proposed_strips_source_leading_particle(project_db: Engine) -> None:
+    """The mirror case: source has ``the``, target doesn't."""
+
+    pid = _project(project_db)
+    eid, _ = glossary_io.upsert_proposed(
+        project_db,
+        project_id=pid,
+        source_term="the USA",
+        type="organization",
+        target_term="EUA",
+        source_lang="en",
+        target_lang="pt",
+    )
+    entry = repo.get_glossary_entry(project_db, eid)
+    assert entry is not None
+    assert entry.source_term == "USA"
+    assert entry.target_term == "EUA"
+
+
+def test_upsert_proposed_strips_both_articles_for_balanced_pair(
+    project_db: Engine,
+) -> None:
+    """Lemma-form is the safer floor even for already-symmetric pairs.
+
+    The auto-proposer can't tell whether ``the USA → os EUA`` is a
+    deliberate symmetric pair or accidental fallout from a noisy
+    extractor. Lemma form is the unambiguous winner: a curator who
+    actually wants the article version can author it manually.
+    """
+
+    pid = _project(project_db)
+    eid, _ = glossary_io.upsert_proposed(
+        project_db,
+        project_id=pid,
+        source_term="the USA",
+        type="organization",
+        target_term="os EUA",
+        source_lang="en",
+        target_lang="pt",
+    )
+    entry = repo.get_glossary_entry(project_db, eid)
+    assert entry is not None
+    assert entry.source_term == "USA"
+    assert entry.target_term == "EUA"
+
+
+def test_upsert_proposed_no_lang_skips_normalization(project_db: Engine) -> None:
+    """Legacy callers (no langs) must keep the previous behaviour.
+
+    Some tests / external integrations call :func:`upsert_proposed`
+    without passing langs (it's an optional kwarg). The auto-strip
+    must be opt-in to avoid silently rewriting data the caller has
+    already cleaned.
+    """
+
+    pid = _project(project_db)
+    eid, _ = glossary_io.upsert_proposed(
+        project_db,
+        project_id=pid,
+        source_term="Europe",
+        type="place",
+        target_term="na Europa",
+    )
+    entry = repo.get_glossary_entry(project_db, eid)
+    assert entry is not None
+    assert entry.target_term == "na Europa"

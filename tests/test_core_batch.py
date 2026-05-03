@@ -13,6 +13,7 @@ from epublate.core.batch import (
     BatchCancelled,
     BatchOptions,
     BatchPaused,
+    BatchPrePassProgress,
     BatchProgressEvent,
     run_batch,
 )
@@ -20,7 +21,7 @@ from epublate.core.project import Project
 from epublate.core.stats import pending_segments
 from epublate.db import repo
 from epublate.db.schema import SegmentStatus
-from epublate.errors import LLMResponseError
+from epublate.errors import LLMRateLimitError, LLMResponseError
 from epublate.llm.mock import MockLLMProvider
 
 
@@ -513,5 +514,416 @@ def test_run_batch_pre_pass_seeds_glossary_before_translating(
             project.engine, project.project_id, status="proposed"
         )
         assert any(p.source_term == "FreshName" for p in proposed)
+    finally:
+        project.close()
+
+
+def test_run_batch_pre_pass_interleaves_with_translation_per_chapter(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """First chapter's translation runs *before* second chapter's pre-pass.
+
+    Reproduces the bug that motivated the per-chapter interleave: with
+    the old all-pre-pass-first ordering the translator pool didn't
+    start until every chapter's helper extractor had finished, so on a
+    slow helper the meter sat at ``0 / N`` for minutes and looked like
+    a deadlock. Records the *order* of LLM calls (extract vs translate)
+    and asserts at least one ``translate`` call lands before the second
+    ``extract`` call (the chapter-2 pre-pass).
+    """
+
+    project = _make_project(tiny_epub_factory, tmp_path, multi=True)
+    try:
+        provider = MockLLMProvider()
+
+        call_order: list[tuple[str, str]] = []
+
+        def _responder(messages: list[object], _model: str) -> str:
+            system = getattr(messages[0], "content", "")
+            user = getattr(messages[-1], "content", "")
+            if "Existing glossary" in system:
+                call_order.append(("extract", user[:24]))
+                return json.dumps(
+                    {
+                        "entities": [{"type": "character", "source": "Alice"}],
+                        "pov": "third_limited",
+                    }
+                )
+            call_order.append(("translate", user[:24]))
+            return json.dumps(
+                {
+                    "target": f"PT::{user}",
+                    "used_entries": [],
+                    "new_entities": [],
+                }
+            )
+
+        provider.set_responder(_responder)
+
+        summary = run_batch(
+            engine=project.engine,
+            project_id=project.project_id,
+            source_lang=project.source_lang,
+            target_lang=project.target_lang,
+            provider=provider,
+            options=BatchOptions(
+                model="gpt-mock",
+                pre_pass=True,
+                helper_model="gpt-mock-helper",
+            ),
+        )
+
+        assert summary.failed == 0
+        assert summary.translated > 0
+        assert summary.pre_pass is not None
+        assert summary.pre_pass.chunks >= 2  # two chapters → two pre-passes
+
+        # Find indices of the two extract calls and the first translate.
+        extract_indices = [i for i, (k, _) in enumerate(call_order) if k == "extract"]
+        translate_indices = [
+            i for i, (k, _) in enumerate(call_order) if k == "translate"
+        ]
+        assert len(extract_indices) >= 2, "expected one pre-pass call per chapter"
+        assert translate_indices, "expected at least one translation"
+        # A translate call must appear between the first and second extract:
+        # i.e. chapter 1's segments translate before chapter 2's pre-pass runs.
+        first_translate = translate_indices[0]
+        second_extract = extract_indices[1]
+        assert first_translate < second_extract, (
+            "expected interleave: chapter 1 translate before chapter 2 pre-pass; "
+            f"call_order={call_order}"
+        )
+    finally:
+        project.close()
+
+
+def test_run_batch_pre_pass_cancels_promptly(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """Setting ``cancel_event`` during pre-pass aborts before next chapter.
+
+    Without this fix, ``cancel_event`` was only honored inside the
+    translator dispatch loop, so a curator pressing Cancel while the
+    helper LLM was running had to wait until *every* chapter's pre-pass
+    completed before translation even started — and Cancel did nothing
+    in the meantime.
+    """
+
+    project = _make_project(tiny_epub_factory, tmp_path, multi=True)
+    try:
+        provider = MockLLMProvider()
+        cancel_event = threading.Event()
+
+        def _responder(messages: list[object], _model: str) -> str:
+            system = getattr(messages[0], "content", "")
+            user = getattr(messages[-1], "content", "")
+            if "Existing glossary" in system:
+                # Trip cancel inside the first chunk's call so the
+                # next chunk / chapter trips out of the loop.
+                cancel_event.set()
+                return json.dumps(
+                    {
+                        "entities": [{"type": "character", "source": "Alice"}],
+                        "pov": "third_limited",
+                    }
+                )
+            return json.dumps(
+                {
+                    "target": f"PT::{user}",
+                    "used_entries": [],
+                    "new_entities": [],
+                }
+            )
+
+        provider.set_responder(_responder)
+
+        with pytest.raises(BatchCancelled):
+            run_batch(
+                engine=project.engine,
+                project_id=project.project_id,
+                source_lang=project.source_lang,
+                target_lang=project.target_lang,
+                provider=provider,
+                options=BatchOptions(
+                    model="gpt-mock",
+                    pre_pass=True,
+                    helper_model="gpt-mock-helper",
+                ),
+                cancel_event=cancel_event,
+            )
+
+        events = [e.kind for e in repo.list_events(project.engine, project.project_id)]
+        assert "batch.cancelled" in events
+        assert "batch.completed" not in events
+        # The first chapter's pre-pass either completed or was cancelled
+        # before chapter 2 ran; either way no translation is required to
+        # land for the cancel to take effect.
+    finally:
+        project.close()
+
+
+def test_run_batch_pre_pass_budget_cap_pauses_before_translation(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """A tiny budget cap pauses the run inside the helper loop.
+
+    Without folding helper spend into ``summary.cost_usd`` *between*
+    chapters, a runaway helper could blow through the budget cap and
+    the pause check wouldn't fire until the (much later) translator
+    pool started. The cap-while-pre-pass test pins this down so the
+    interleave can't regress.
+    """
+
+    from epublate.llm.pricing import ModelPrice, reset_prices, set_price
+
+    project = _make_project(tiny_epub_factory, tmp_path, multi=True)
+    try:
+        # Force a non-zero per-call cost on the helper so the cap can trip.
+        set_price(
+            "gpt-mock-helper",
+            ModelPrice(input_per_mtok=1000.0, output_per_mtok=1000.0),
+        )
+        provider = MockLLMProvider()
+
+        def _responder(messages: list[object], _model: str) -> str:
+            system = getattr(messages[0], "content", "")
+            user = getattr(messages[-1], "content", "")
+            if "Existing glossary" in system:
+                return json.dumps(
+                    {
+                        "entities": [{"type": "character", "source": "Alice"}],
+                        "pov": "third_limited",
+                    }
+                )
+            return json.dumps(
+                {
+                    "target": f"PT::{user}",
+                    "used_entries": [],
+                    "new_entities": [],
+                }
+            )
+
+        provider.set_responder(_responder)
+
+        with pytest.raises(BatchPaused) as exc_info:
+            run_batch(
+                engine=project.engine,
+                project_id=project.project_id,
+                source_lang=project.source_lang,
+                target_lang=project.target_lang,
+                provider=provider,
+                options=BatchOptions(
+                    model="gpt-mock",
+                    pre_pass=True,
+                    helper_model="gpt-mock-helper",
+                    budget_usd=0.0001,
+                ),
+            )
+        summary = exc_info.value.summary
+        assert summary.paused_reason is not None
+        assert "budget cap" in summary.paused_reason
+        # The pause must happen before the (much later) translator phase,
+        # i.e. no segments should have been translated when the helper
+        # already blew the cap on chapter 1.
+        assert summary.translated == 0
+
+        events = [e.kind for e in repo.list_events(project.engine, project.project_id)]
+        assert "batch.paused" in events
+        assert "batch.completed" not in events
+    finally:
+        reset_prices()
+        project.close()
+
+
+def test_run_batch_pre_pass_emits_progress_callback(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """``on_pre_pass_progress`` fires once per chunk per chapter.
+
+    The dashboard's "pre-pass: ch X/Y chunk A/B" status line is built
+    from these ticks. Without the callback the meter would sit at
+    ``0 / N`` for the whole pre-pass, which is the failure mode that
+    led to the "translation never starts" bug report.
+    """
+
+    project = _make_project(tiny_epub_factory, tmp_path, multi=True)
+    try:
+        provider = MockLLMProvider()
+
+        def _responder(messages: list[object], _model: str) -> str:
+            system = getattr(messages[0], "content", "")
+            user = getattr(messages[-1], "content", "")
+            if "Existing glossary" in system:
+                return json.dumps(
+                    {
+                        "entities": [{"type": "character", "source": "Bob"}],
+                        "pov": "third_limited",
+                    }
+                )
+            return json.dumps(
+                {
+                    "target": f"PT::{user}",
+                    "used_entries": [],
+                    "new_entities": [],
+                }
+            )
+
+        provider.set_responder(_responder)
+        ticks: list[BatchPrePassProgress] = []
+
+        run_batch(
+            engine=project.engine,
+            project_id=project.project_id,
+            source_lang=project.source_lang,
+            target_lang=project.target_lang,
+            provider=provider,
+            options=BatchOptions(
+                model="gpt-mock",
+                pre_pass=True,
+                helper_model="gpt-mock-helper",
+            ),
+            on_pre_pass_progress=ticks.append,
+        )
+
+        assert len(ticks) >= 2, (
+            "expected at least one tick per chapter (multi-chapter project)"
+        )
+        # All ticks should carry the chapter_count for the run.
+        chapter_counts = {t.chapter_count for t in ticks}
+        assert chapter_counts == {len(set(t.chapter_id for t in ticks))}
+        # chapter_index is 1-based and each chunk_index is 0-based but
+        # bounded by chunk_count.
+        assert all(t.chapter_index >= 1 for t in ticks)
+        assert all(0 <= t.chunk_index < t.chunk_count for t in ticks)
+        # First chapter's ticks come strictly before the second's.
+        order = [t.chapter_index for t in ticks]
+        assert order == sorted(order), (
+            f"expected per-chapter ordering of pre-pass ticks; got {order}"
+        )
+    finally:
+        project.close()
+
+
+def test_run_batch_pauses_on_translator_rate_limit(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """A 429 from the translator pauses the batch with a clear message.
+
+    Reproduces the OpenRouter free-tier "free-models-per-day" failure
+    mode: a depleted daily quota would otherwise return 429 for every
+    pending segment in the run, and each was being recorded as an
+    opaque per-segment failure. Surfacing as ``BatchPaused`` lets the
+    curator switch model / wait / add credits and resume — pending
+    segments stay ``pending``.
+    """
+
+    project = _make_project(tiny_epub_factory, tmp_path, multi=False)
+    try:
+        provider = MockLLMProvider()
+
+        # Trip a rate-limit error on the first translator call. Subsequent
+        # calls won't fire because the dispatcher pauses on the first
+        # rate-limit error.
+        def _responder(_messages: list[object], _model: str) -> str:
+            raise LLMRateLimitError(
+                "OpenAI API status 429: Rate limit exceeded: free-models-per-day. "
+                "Add 6.55 credits to unlock 1000 free model requests per day",
+                retry_after_seconds=3600.0,
+                provider_message=(
+                    "Rate limit exceeded: free-models-per-day. Add 6.55 credits "
+                    "to unlock 1000 free model requests per day"
+                ),
+            )
+
+        provider.set_responder(_responder)
+
+        with pytest.raises(BatchPaused) as exc_info:
+            run_batch(
+                engine=project.engine,
+                project_id=project.project_id,
+                source_lang=project.source_lang,
+                target_lang=project.target_lang,
+                provider=provider,
+                options=BatchOptions(model="gpt-mock", concurrency=1),
+            )
+
+        summary = exc_info.value.summary
+        # No segment was recorded as failed — the rate-limit error didn't
+        # land in summary.failures, it lifted out as a pause.
+        assert summary.failed == 0
+        assert summary.translated == 0
+        assert summary.paused_reason is not None
+        assert "rate limit" in summary.paused_reason.lower()
+        assert "free-models-per-day" in summary.paused_reason
+
+        events = [e.kind for e in repo.list_events(project.engine, project.project_id)]
+        assert "batch.paused" in events
+        assert "batch.completed" not in events
+        # Pending segments stay pending so the run is fully resumable
+        # once the curator addresses the rate-limit cause.
+        remaining = pending_segments(project.engine, project_id=project.project_id)
+        assert len(remaining) >= 1
+    finally:
+        project.close()
+
+
+def test_run_batch_pauses_on_pre_pass_rate_limit(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """A 429 during the helper pre-pass pauses the run before translation.
+
+    Without this fix the rate-limit error landed inside ``run_pre_pass``,
+    got swallowed as a per-chunk failure, the circuit breaker tripped
+    after 3 in a row, the chapter aborted, and run_batch moved on to
+    the translator phase — which then immediately hit the same 429 for
+    every segment. Surfacing the error from run_pre_pass and pausing
+    the batch is the right unified behavior.
+    """
+
+    project = _make_project(tiny_epub_factory, tmp_path, multi=False)
+    try:
+        provider = MockLLMProvider()
+
+        # Helper extractor calls have an "Existing glossary" system
+        # prompt; trip rate limit on those, succeed elsewhere (though
+        # the pause should mean translator never runs).
+        def _responder(messages: list[object], _model: str) -> str:
+            system = getattr(messages[0], "content", "")
+            if "Existing glossary" in system:
+                raise LLMRateLimitError(
+                    "OpenAI API status 429: helper quota depleted",
+                    retry_after_seconds=600.0,
+                    provider_message="helper quota depleted",
+                )
+            return json.dumps(
+                {"target": "should not run", "used_entries": [], "new_entities": []}
+            )
+
+        provider.set_responder(_responder)
+
+        with pytest.raises(BatchPaused) as exc_info:
+            run_batch(
+                engine=project.engine,
+                project_id=project.project_id,
+                source_lang=project.source_lang,
+                target_lang=project.target_lang,
+                provider=provider,
+                options=BatchOptions(
+                    model="gpt-mock",
+                    pre_pass=True,
+                    helper_model="gpt-mock-helper",
+                ),
+            )
+
+        summary = exc_info.value.summary
+        # No translation happened — the helper hit the cap first.
+        assert summary.translated == 0
+        assert summary.paused_reason is not None
+        assert "rate limit" in summary.paused_reason.lower()
+
+        events = [e.kind for e in repo.list_events(project.engine, project.project_id)]
+        assert "batch.pre_pass_rate_limited" in events
+        assert "batch.paused" in events
+        assert "batch.completed" not in events
     finally:
         project.close()

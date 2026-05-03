@@ -16,10 +16,13 @@ from epublate.glossary.cascade import (
 )
 from epublate.glossary.enforcer import (
     Violation,
+    ViolationKind,
     ViolationSeverity,
     build_constraints,
     find_mentions,
+    find_target_doubled_particles,
     glossary_hash,
+    has_flagging_violation,
     has_locked_violation,
     validate_target,
 )
@@ -36,6 +39,14 @@ from epublate.glossary.models import (
     GlossaryStatus,
     GlossaryStatusLiteral,
 )
+from epublate.glossary.normalize import (
+    NormalizedTerm,
+    ParticleSymmetry,
+    analyze_pair,
+    find_doubled_particles,
+    leading_particle,
+    normalize_term,
+)
 
 __all__ = [
     "AliasSide",
@@ -50,16 +61,25 @@ __all__ = [
     "GlossaryStatus",
     "GlossaryStatusLiteral",
     "Match",
+    "NormalizedTerm",
+    "ParticleSymmetry",
     "Violation",
+    "ViolationKind",
     "ViolationSeverity",
+    "analyze_pair",
     "build_constraints",
     "cascade_retranslate",
     "compute_affected",
+    "find_doubled_particles",
     "find_mentions",
+    "find_target_doubled_particles",
     "glossary_hash",
+    "has_flagging_violation",
     "has_locked_violation",
+    "leading_particle",
     "make_pattern",
     "match_source",
+    "normalize_term",
     "target_uses",
     "validate_target",
 ]

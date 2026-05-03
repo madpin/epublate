@@ -16,13 +16,28 @@ from __future__ import annotations
 
 from textual.message import Message
 
-from epublate.core.batch import BatchProgressEvent, BatchSummary
+from epublate.core.batch import BatchPrePassProgress, BatchProgressEvent, BatchSummary
 
 
 class BatchTick(Message):
     """One per-segment progress tick, posted from the App's batch worker."""
 
     def __init__(self, event: BatchProgressEvent) -> None:
+        super().__init__()
+        self.event = event
+
+
+class BatchPrePassTick(Message):
+    """One per-chunk pre-pass progress tick.
+
+    The dashboard's status line uses these to show
+    "pre-pass: ch 1/3 chunk 2/2" while the helper LLM is grinding —
+    without this signal a slow helper makes the meter sit at
+    ``0 / N`` for minutes and looks like a deadlock. The Reader /
+    Inbox don't subscribe; they read the audit-log events instead.
+    """
+
+    def __init__(self, event: BatchPrePassProgress) -> None:
         super().__init__()
         self.event = event
 
@@ -52,4 +67,4 @@ class BatchFinished(Message):
         self.project_id = project_id
 
 
-__all__ = ["BatchFinished", "BatchTick"]
+__all__ = ["BatchFinished", "BatchPrePassTick", "BatchTick"]

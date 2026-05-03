@@ -39,8 +39,9 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import uuid
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -49,12 +50,16 @@ from sqlalchemy.engine import Engine
 from epublate.core.cache import cache_key_for_messages
 from epublate.core.style import suggest_style_profile
 from epublate.db import repo
-from epublate.errors import EpublateError, LLMResponseError
+from epublate.errors import EpublateError, LLMRateLimitError, LLMResponseError
 from epublate.glossary import io as glossary_io
 from epublate.glossary.enforcer import build_constraints, glossary_hash
 from epublate.glossary.models import EntityType, GlossaryEntryWithAliases
 from epublate.llm.base import LLMProvider, ResponseFormat
+from epublate.llm.json_mode import chat_with_json_fallback
 from epublate.llm.pricing import estimate_cost
+from epublate.llm.prompts.extractor import (
+    DEFAULT_RESPONSE_FORMAT as DEFAULT_EXTRACTOR_RESPONSE_FORMAT,
+)
 from epublate.llm.prompts.extractor import (
     ExtractedEntity,
     ExtractorTrace,
@@ -69,6 +74,19 @@ PURPOSE_EXTRACT = "extract"
 
 DEFAULT_INTAKE_MAX_SEGMENTS = 30
 DEFAULT_CHUNK_MAX_TOKENS = 1500
+DEFAULT_FAILURE_STREAK_LIMIT = 3
+"""Default number of consecutive helper-LLM failures that aborts a loop.
+
+When the helper endpoint is fundamentally broken for the curator's
+configuration (e.g. a reasoning helper on Groq that returns empty
+visible content because reasoning tokens consume the entire
+visible-channel budget), the per-chunk error handler in
+``run_book_intake`` / ``run_pre_pass`` would otherwise burn through
+every chunk, flooding the Inbox and the curator's terminal with the
+same error. Three consecutive failures is generous enough to absorb
+a transient glitch and tight enough to give up quickly on a systemic
+problem.
+"""
 """Soft per-call source-token budget for one extractor message.
 
 The helper model typically has a generous context window, but we cap the
@@ -95,14 +113,23 @@ class ExtractOptions:
     """Per-call knobs for one :func:`extract_entities` invocation.
 
     Defaults pin ``temperature=0.0`` / ``seed=7`` so reproducible runs
-    against deterministic-supporting endpoints stay stable (NFR-5).
+    against deterministic-supporting endpoints stay stable (NFR-5), and
+    ``response_format`` to ``json_object`` so the helper actually
+    produces parseable JSON instead of empty content (the failure mode
+    we hit with reasoning helpers like ``gpt-oss-20b`` that consume the
+    visible-channel budget on reasoning tokens). Pass
+    ``ResponseFormat(type="text")`` here on the rare endpoint that
+    rejects ``response_format``; the prompt's "respond with JSON only"
+    instruction still applies, just unconstrained.
     """
 
     model: str
     temperature: float | None = 0.0
     seed: int | None = 7
     bypass_cache: bool = False
-    response_format: ResponseFormat | None = None
+    response_format: ResponseFormat | None = field(
+        default_factory=lambda: DEFAULT_EXTRACTOR_RESPONSE_FORMAT
+    )
     auto_propose: bool = True
 
 
@@ -136,6 +163,40 @@ class IntakeOptions:
     chunk_max_tokens: int = DEFAULT_CHUNK_MAX_TOKENS
     bypass_cache: bool = False
     auto_propose: bool = True
+    failure_streak_limit: int = DEFAULT_FAILURE_STREAK_LIMIT
+    """Abort the chunk loop after this many *consecutive* failed chunks.
+
+    Defaults to :data:`DEFAULT_FAILURE_STREAK_LIMIT` (3). Set to ``0``
+    to disable the circuit breaker and keep the legacy "best-effort,
+    never abort" behavior — useful in tests where every chunk fails
+    by design and we still want the per-chunk audit rows.
+    """
+
+
+@dataclass(slots=True, frozen=True)
+class PrePassChunkEvent:
+    """One per-chunk progress tick fired by :func:`run_pre_pass`.
+
+    The orchestrator (:func:`epublate.core.batch.run_batch`) forwards
+    these to the UI so the dashboard meter can show "pre-pass: chapter
+    1/3 chunk 2/2" while the helper LLM is grinding — without this
+    callback the meter sits at ``0 / N`` for the whole pre-pass and
+    looks frozen on slow helper endpoints (PRD §4.6 / batch UI).
+
+    ``error`` is set when the chunk failed; in that case ``success`` is
+    ``False`` and the chunk's contribution to the running summary is
+    a bumped ``failed_chunks`` counter (no entities, no cost).
+    """
+
+    chunk_index: int
+    chunk_count: int
+    success: bool
+    error: str | None
+    proposed_count: int
+    cache_hit: bool
+
+
+PrePassChunkCallback = Callable[[PrePassChunkEvent], None]
 
 
 @dataclass(slots=True)
@@ -242,10 +303,13 @@ def extract_entities(
                 request_json=request_json,
                 options=options,
                 first_seen_segment_id=first_seen_segment_id,
+                source_lang=source_lang,
+                target_lang=target_lang,
             )
             return outcome
 
-    chat_result = provider.chat(
+    chat_result = chat_with_json_fallback(
+        provider,
         messages,
         model=options.model,
         response_format=options.response_format,
@@ -309,6 +373,8 @@ def extract_entities(
                     project_id=project_id,
                     trace=trace,
                     first_seen_segment_id=first_seen_segment_id,
+                    source_lang=source_lang,
+                    target_lang=target_lang,
                 )
             )
         repo.append_event(
@@ -358,6 +424,8 @@ def _replay_extract_from_cache(
     request_json: str,
     options: ExtractOptions,
     first_seen_segment_id: str | None,
+    source_lang: str | None = None,
+    target_lang: str | None = None,
 ) -> ExtractOutcome:
     """Hydrate a helper-call outcome from a cached ``llm_call`` row.
 
@@ -412,6 +480,8 @@ def _replay_extract_from_cache(
                     project_id=project_id,
                     trace=trace,
                     first_seen_segment_id=first_seen_segment_id,
+                    source_lang=source_lang,
+                    target_lang=target_lang,
                 )
             )
         repo.append_event(
@@ -489,6 +559,8 @@ def _auto_propose(
     project_id: str,
     trace: ExtractorTrace,
     first_seen_segment_id: str | None,
+    source_lang: str | None = None,
+    target_lang: str | None = None,
 ) -> list[str]:
     """Upsert ``trace.entities`` candidates as ``proposed`` glossary rows.
 
@@ -496,6 +568,12 @@ def _auto_propose(
     extractor and translator paths share the same dedup semantics:
     ``(source_term, type)`` keys, an ``entity.proposed`` event per new
     row, and a no-op for entries the curator already promoted/edited.
+
+    ``source_lang`` / ``target_lang`` are passed through to
+    :func:`upsert_proposed` so leading articles / prepositions are
+    stripped down to lemma form on insert (PRD F-LB-3) — the helper
+    LLM still loves to propose ``Europe → na Europa``-style asymmetric
+    pairs.
     """
 
     created_ids: list[str] = []
@@ -512,6 +590,8 @@ def _auto_propose(
             first_seen_segment_id=first_seen_segment_id,
             notes=notes,
             target_term=target_term,
+            source_lang=source_lang,
+            target_lang=target_lang,
         )
         if not created:
             continue
@@ -621,7 +701,10 @@ def run_book_intake(
         auto_propose=options.auto_propose,
     )
 
-    for chunk in chunks:
+    streak = 0
+    last_error: str | None = None
+    aborted = False
+    for idx, chunk in enumerate(chunks):
         try:
             outcome = extract_entities(
                 engine=engine,
@@ -637,8 +720,28 @@ def run_book_intake(
         except Exception as exc:  # helper boundary — never abort the intake
             _logger.warning("intake chunk failed: %s", exc)
             summary.failed_chunks += 1
+            streak += 1
+            last_error = _short_error(exc)
+            if _should_trip_breaker(streak, options.failure_streak_limit):
+                remaining = len(chunks) - (idx + 1)
+                summary.failed_chunks += remaining
+                aborted = True
+                _logger.warning(
+                    "intake aborted after %d consecutive failed chunks "
+                    "(skipping %d remaining). Last error: %s. If you're "
+                    "using a reasoning-style helper (gpt-oss-*, "
+                    "deepseek-r1, ...), it may be returning empty visible "
+                    "content because reasoning tokens consume the entire "
+                    "visible-channel budget. Try a non-reasoning helper "
+                    "via $EPUBLATE_LLM_HELPER_MODEL or the project override.",
+                    streak,
+                    remaining,
+                    last_error,
+                )
+                break
             continue
 
+        streak = 0
         _accumulate_chunk(summary, outcome)
 
         # The glossary changed under our feet; refresh so the next
@@ -650,12 +753,24 @@ def run_book_intake(
     summary.suggested_style_profile = suggest_style_profile(
         register=summary.register, audience=summary.audience
     )
-    repo.append_event(
-        engine,
-        project_id=project_id,
-        kind="intake.completed",
-        payload=_intake_payload(summary),
-    )
+    if aborted:
+        repo.append_event(
+            engine,
+            project_id=project_id,
+            kind="intake.aborted",
+            payload={
+                **_intake_payload(summary),
+                "failure_streak": streak,
+                "last_error": last_error,
+            },
+        )
+    else:
+        repo.append_event(
+            engine,
+            project_id=project_id,
+            kind="intake.completed",
+            payload=_intake_payload(summary),
+        )
     return summary
 
 
@@ -668,6 +783,8 @@ def run_pre_pass(
     provider: LLMProvider,
     options: IntakeOptions,
     segments: Sequence[repo.SegmentRow],
+    cancel_event: threading.Event | None = None,
+    on_chunk: PrePassChunkCallback | None = None,
 ) -> IntakeSummary:
     """Run the helper extractor over an explicit segment list.
 
@@ -675,6 +792,15 @@ def run_pre_pass(
     "first ~N segments" selection — the caller decides which segments
     are in scope (typically a chapter's pending ones during batch).
     Emits ``batch.pre_pass_completed`` so the Inbox surfaces the run.
+
+    ``cancel_event`` is checked between chunks; when set we stop early,
+    emit ``batch.pre_pass_cancelled`` (so the audit log can distinguish
+    a curator Cancel from a circuit-breaker abort), and return the
+    partial summary. ``on_chunk`` fires once per chunk (success or
+    failure) so the orchestrator can surface "pre-pass: chunk X / Y"
+    progress to the dashboard meter — without it the meter sits at
+    ``0 / N`` for the whole pre-pass and looks frozen on slow helper
+    endpoints.
     """
 
     summary = IntakeSummary()
@@ -711,7 +837,14 @@ def run_pre_pass(
         },
     )
 
-    for chunk in chunks:
+    streak = 0
+    last_error: str | None = None
+    aborted = False
+    cancelled = False
+    for idx, chunk in enumerate(chunks):
+        if cancel_event is not None and cancel_event.is_set():
+            cancelled = True
+            break
         try:
             outcome = extract_entities(
                 engine=engine,
@@ -724,24 +857,118 @@ def run_pre_pass(
                 first_seen_segment_id=chunk.first_segment_id,
                 glossary=project_entries,
             )
+        except LLMRateLimitError as exc:
+            # Endpoint is depleted (free-tier daily quota, monthly cap,
+            # …). Don't burn the rest of the chapter's chunks on the
+            # same 429 — surface the error so the orchestrator (the
+            # batch runner) can pause cleanly. Emit a marker event so
+            # the audit log distinguishes "we stopped because the
+            # endpoint refused us" from "we stopped because the curator
+            # cancelled" or "we tripped the empty-content breaker".
+            _logger.warning("pre-pass rate-limited; aborting helper loop: %s", exc)
+            if on_chunk is not None:
+                _emit_chunk_event(
+                    on_chunk,
+                    chunk_index=idx,
+                    chunk_count=len(chunks),
+                    success=False,
+                    error=_short_error(exc),
+                    proposed_count=0,
+                    cache_hit=False,
+                )
+            summary.suggested_style_profile = suggest_style_profile(
+                register=summary.register, audience=summary.audience
+            )
+            payload = {
+                **_intake_payload(summary),
+                "provider_message": exc.provider_message or str(exc),
+            }
+            if exc.retry_after_seconds is not None:
+                payload["retry_after_seconds"] = exc.retry_after_seconds
+            repo.append_event(
+                engine,
+                project_id=project_id,
+                kind="batch.pre_pass_rate_limited",
+                payload=payload,
+            )
+            raise
         except Exception as exc:
             _logger.warning("pre-pass chunk failed: %s", exc)
             summary.failed_chunks += 1
+            streak += 1
+            last_error = _short_error(exc)
+            if on_chunk is not None:
+                _emit_chunk_event(
+                    on_chunk,
+                    chunk_index=idx,
+                    chunk_count=len(chunks),
+                    success=False,
+                    error=last_error,
+                    proposed_count=0,
+                    cache_hit=False,
+                )
+            if _should_trip_breaker(streak, options.failure_streak_limit):
+                remaining = len(chunks) - (idx + 1)
+                summary.failed_chunks += remaining
+                aborted = True
+                _logger.warning(
+                    "pre-pass aborted after %d consecutive failed chunks "
+                    "(skipping %d remaining). Last error: %s. If you're "
+                    "using a reasoning-style helper (gpt-oss-*, "
+                    "deepseek-r1, ...), it may be returning empty visible "
+                    "content because reasoning tokens consume the entire "
+                    "visible-channel budget. Try a non-reasoning helper "
+                    "via $EPUBLATE_LLM_HELPER_MODEL or the project override.",
+                    streak,
+                    remaining,
+                    last_error,
+                )
+                break
             continue
 
+        streak = 0
         _accumulate_chunk(summary, outcome)
         if outcome.proposed_entry_ids:
             project_entries = list(repo.list_glossary_entries(engine, project_id))
+        if on_chunk is not None:
+            _emit_chunk_event(
+                on_chunk,
+                chunk_index=idx,
+                chunk_count=len(chunks),
+                success=True,
+                error=None,
+                proposed_count=len(outcome.proposed_entry_ids),
+                cache_hit=outcome.cache_hit,
+            )
 
     summary.suggested_style_profile = suggest_style_profile(
         register=summary.register, audience=summary.audience
     )
-    repo.append_event(
-        engine,
-        project_id=project_id,
-        kind="batch.pre_pass_completed",
-        payload=_intake_payload(summary),
-    )
+    if cancelled:
+        repo.append_event(
+            engine,
+            project_id=project_id,
+            kind="batch.pre_pass_cancelled",
+            payload=_intake_payload(summary),
+        )
+    elif aborted:
+        repo.append_event(
+            engine,
+            project_id=project_id,
+            kind="batch.pre_pass_aborted",
+            payload={
+                **_intake_payload(summary),
+                "failure_streak": streak,
+                "last_error": last_error,
+            },
+        )
+    else:
+        repo.append_event(
+            engine,
+            project_id=project_id,
+            kind="batch.pre_pass_completed",
+            payload=_intake_payload(summary),
+        )
     return summary
 
 
@@ -777,6 +1004,68 @@ def _accumulate_chunk(summary: IntakeSummary, outcome: ExtractOutcome) -> None:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+_ERROR_MESSAGE_TRUNCATION = 240
+
+
+def _should_trip_breaker(streak: int, limit: int) -> bool:
+    """Whether the failure streak crossed the configured circuit-breaker limit.
+
+    ``limit <= 0`` disables the breaker entirely (legacy "best-effort,
+    never abort" behavior, useful in tests where every chunk fails by
+    design and we still want every audit row recorded).
+    """
+
+    return limit > 0 and streak >= limit
+
+
+def _short_error(exc: BaseException) -> str:
+    """Render an exception for an event payload / log line, truncated.
+
+    Some upstream providers (LiteLLM, OpenAI gateways) attach long
+    fallback / diagnostic blobs to the exception message. Truncating
+    keeps the Inbox readable; the full exception is still in the
+    structured-logging stream if the curator needs it.
+    """
+
+    text = str(exc)
+    if len(text) <= _ERROR_MESSAGE_TRUNCATION:
+        return text
+    return text[: _ERROR_MESSAGE_TRUNCATION - 1] + "\u2026"
+
+
+def _emit_chunk_event(
+    callback: PrePassChunkCallback,
+    *,
+    chunk_index: int,
+    chunk_count: int,
+    success: bool,
+    error: str | None,
+    proposed_count: int,
+    cache_hit: bool,
+) -> None:
+    """Build a :class:`PrePassChunkEvent` and hand it to ``callback``.
+
+    Wraps the construction in a try/except so a misbehaving listener
+    can't take down the helper loop — the pre-pass is best-effort by
+    design and the chunk has already been persisted by the time we
+    fire this event.
+    """
+
+    try:
+        callback(
+            PrePassChunkEvent(
+                chunk_index=chunk_index,
+                chunk_count=chunk_count,
+                success=success,
+                error=error,
+                proposed_count=proposed_count,
+                cache_hit=cache_hit,
+            )
+        )
+    except Exception:  # pragma: no cover — defensive
+        _logger.debug("pre-pass progress callback raised; ignoring")
 
 
 @dataclass(slots=True, frozen=True)

@@ -20,6 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import ClassVar, Protocol, cast
 
+from rich.markup import escape as escape_markup
 from sqlalchemy.engine import Engine
 from textual import on, work
 from textual.app import ComposeResult
@@ -41,11 +42,13 @@ from textual.widgets import (
 
 from epublate.app.widgets import BatchStatusBar
 from epublate.core.project import Project
+from epublate.core.segmentation import PLACEHOLDER_RE
 from epublate.db import repo
 from epublate.db.schema import GlossaryStatus
 from epublate.glossary import (
     CascadeCandidate,
     GlossaryEntryWithAliases,
+    analyze_pair,
     cascade_retranslate,
     compute_affected,
 )
@@ -182,6 +185,11 @@ class EntryEditScreen(ModalScreen[_EntryDraftResult | None]):
         height: 1;
         color: $text-muted;
     }
+    EntryEditScreen #entry-error {
+        height: auto;
+        min-height: 1;
+        color: $error;
+    }
     """
 
     def __init__(
@@ -190,11 +198,22 @@ class EntryEditScreen(ModalScreen[_EntryDraftResult | None]):
         *,
         title: str,
         source_term_required: bool = True,
+        source_lang: str | None = None,
+        target_lang: str | None = None,
     ) -> None:
         super().__init__()
         self._draft = draft
         self._title = title
         self._source_term_required = source_term_required
+        # Stored so :meth:`action_save` can run the particle-symmetry
+        # check (PRD F-LB-3): a glossary entry whose source has a
+        # leading article/preposition while the target doesn't (or
+        # vice versa) explodes into ``"na na Europa"`` style doubling
+        # at translation time. ``None`` skips the check, which is what
+        # legacy callers (and Lore Book editors with no project lang
+        # context) get implicitly.
+        self._source_lang = source_lang
+        self._target_lang = target_lang
 
     def compose(self) -> ComposeResult:
         with Vertical(id="entry-box"):
@@ -245,6 +264,7 @@ class EntryEditScreen(ModalScreen[_EntryDraftResult | None]):
                 )
             yield Label("Notes:")
             yield TextArea(self._draft.notes, id="entry-notes")
+            yield Static("", id="entry-error", markup=False)
             yield Static(
                 "Ctrl+S to save, Escape to cancel.",
                 id="entry-help",
@@ -258,11 +278,34 @@ class EntryEditScreen(ModalScreen[_EntryDraftResult | None]):
         source_term = self.query_one("#entry-source", Input).value.strip()
         target_term = self.query_one("#entry-target", Input).value.strip()
         if not target_term:
+            self._set_error("Target term is required.")
             self.app.bell()
             return
         if self._source_term_required and not source_term:
+            self._set_error(
+                "Source term is required for project-scoped glossary entries."
+            )
             self.app.bell()
             return
+        # Particle-symmetry check (PRD F-LB-3 / glossary-invariants §1).
+        # A glossary entry whose source has a leading article /
+        # preposition while the target doesn't (or vice versa) makes
+        # the translator double up function words (``"na na Europa"``
+        # for ``Europe → na Europa``). Refuse the save with a
+        # curator-friendly message so they can choose between lemma
+        # form (drop both) or symmetric form (add the missing
+        # particle).
+        if self._source_lang is not None or self._target_lang is not None:
+            symmetry = analyze_pair(
+                source_term=source_term or None,
+                target_term=target_term,
+                source_lang=self._source_lang,
+                target_lang=self._target_lang,
+            )
+            if not symmetry.symmetric:
+                self._set_error(symmetry.message)
+                self.app.bell()
+                return
         type_value = self.query_one("#entry-type", Select).value
         status_value = self.query_one("#entry-status", Select).value
         gender_select = self.query_one("#entry-gender", Select).value
@@ -285,6 +328,12 @@ class EntryEditScreen(ModalScreen[_EntryDraftResult | None]):
             target_aliases=tgt_aliases,
         )
         self.dismiss(_EntryDraftResult(draft=result))
+
+    def _set_error(self, message: str) -> None:
+        import contextlib
+
+        with contextlib.suppress(Exception):
+            self.query_one("#entry-error", Static).update(message)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -447,6 +496,153 @@ class MergeDuplicatesScreen(ModalScreen[int]):
 
 
 # ---------------------------------------------------------------------------
+# Show-occurrences modal
+# ---------------------------------------------------------------------------
+
+
+def _format_occurrence_snippet(
+    text: str,
+    *,
+    span_start: int | None,
+    span_end: int | None,
+    max_chars: int = 80,
+) -> str:
+    """Centre a snippet on the matched span and wrap it in ``«…»``.
+
+    Output length is guaranteed to be ≤ ``max_chars`` (except the
+    pathological case where the match itself is longer than the
+    budget, in which case we still emit the wrapped match so the
+    curator can see *what* matched). Whitespace inside the snippet
+    is collapsed so paragraph-level matches render on one row, and
+    ``«…»`` guillemets are pure ASCII-friendly so the snapshot
+    tests stay deterministic and Rich markup parsers don't have
+    to play.
+
+    Segment text carries opaque ``[[T0]]``/``[[/T0]]`` placeholders
+    for inline tags (PRD §6, format-handling rule §1). We strip
+    those *after* slicing so the curator sees clean prose and the
+    spans (computed against the placeholder-bearing original) stay
+    valid. The final string is also markup-escaped so any literal
+    ``[..]`` survivors can't trip Rich's parser when ``DataTable``
+    renders the cell.
+
+    When the span is missing (the target column has no spans, and
+    legacy mentions written before span tracking landed have
+    ``None`` for both ends) we just head-truncate the text.
+    """
+
+    flat = " ".join(PLACEHOLDER_RE.sub("", text).split())
+    if not flat:
+        return ""
+    if span_start is None or span_end is None or span_start >= span_end:
+        truncated = flat if len(flat) <= max_chars else flat[: max_chars - 1] + "…"
+        return escape_markup(truncated)
+
+    match = " ".join(PLACEHOLDER_RE.sub("", text[span_start:span_end]).split())
+    pre = " ".join(PLACEHOLDER_RE.sub("", text[:span_start]).split())
+    post = " ".join(PLACEHOLDER_RE.sub("", text[span_end:]).split())
+
+    decorated = f"«{match}»"
+    pre_sep = " " if pre else ""
+    post_sep = " " if post else ""
+    budget = max_chars - len(decorated) - len(pre_sep) - len(post_sep)
+    if budget <= 0:
+        clipped = decorated[:max_chars] if len(decorated) > max_chars else decorated
+        return escape_markup(clipped)
+
+    pre_budget = budget // 2
+    post_budget = budget - pre_budget
+    if len(pre) > pre_budget:
+        pre = "…" + pre[-(pre_budget - 1) :] if pre_budget > 1 else "…"
+    if len(post) > post_budget:
+        post = post[: post_budget - 1] + "…" if post_budget > 1 else "…"
+    return escape_markup(f"{pre}{pre_sep}{decorated}{post_sep}{post}")
+
+
+class OccurrencesScreen(ModalScreen[None]):
+    """Read-only list of every segment that referenced a glossary entry.
+
+    Rendered from :func:`epublate.db.repo.list_occurrences` (single
+    join, no per-row queries) so the modal opens instantly even on
+    long books. The ``Where`` column shows the chapter spine index
+    plus title, ``Seg`` is the in-chapter segment index, and the
+    snippet columns wrap the matched span in ``«…»``. Curators
+    typically use this to spot mis-applied entries: e.g. an entry
+    locked to a parliamentary "Câmara" sense that's also firing on
+    sentences about a residential ``house``.
+    """
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("q", "close", "Close", show=True),
+        Binding("escape", "close", "Close", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    OccurrencesScreen {
+        align: center middle;
+    }
+    OccurrencesScreen #occurrences-box {
+        width: 90%;
+        height: 80%;
+        border: round $primary;
+        padding: 1 2;
+        background: $surface;
+    }
+    OccurrencesScreen #occurrences-table {
+        height: 1fr;
+        margin: 1 0;
+    }
+    """
+
+    def __init__(
+        self,
+        *,
+        entry: GlossaryEntryWithAliases,
+        occurrences: list[repo.OccurrenceRow],
+    ) -> None:
+        super().__init__()
+        self._entry = entry
+        self._occurrences = occurrences
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="occurrences-box"):
+            label = self._entry.source_term or self._entry.target_term
+            segments = len({o.segment_id for o in self._occurrences})
+            yield Label(
+                f"Occurrences of [b]{label}[/b] → [b]{self._entry.target_term}[/b]: "
+                f"{len(self._occurrences)} mention(s) across {segments} segment(s).",
+                markup=True,
+            )
+            table: DataTable[str] = DataTable(
+                id="occurrences-table", zebra_stripes=True, cursor_type="row"
+            )
+            table.add_columns("Where", "Seg", "Source", "Target")
+            for occ in self._occurrences:
+                where = f"#{occ.chapter_spine_idx + 1}" + (
+                    f" {occ.chapter_title}" if occ.chapter_title else ""
+                )
+                src = _format_occurrence_snippet(
+                    occ.source_text,
+                    span_start=occ.source_span_start,
+                    span_end=occ.source_span_end,
+                )
+                tgt = _format_occurrence_snippet(
+                    occ.target_text or "",
+                    span_start=None,
+                    span_end=None,
+                )
+                table.add_row(where, str(occ.segment_idx + 1), src, tgt)
+            yield table
+            yield Static(
+                "Press [b]q[/b] / [b]Esc[/b] to close.",
+                markup=True,
+            )
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
+# ---------------------------------------------------------------------------
 # Delete confirm modal
 # ---------------------------------------------------------------------------
 
@@ -528,6 +724,7 @@ class GlossaryScreen(Screen[None]):
         Binding("p", "set_status_proposed", "Propose", show=True),
         Binding("r", "cascade", "Cascade", show=True),
         Binding("m", "merge_duplicates", "Merge dupes", show=True),
+        Binding("o", "show_occurrences", "Occurrences", show=True),
         Binding("f", "cycle_filter", "Filter", show=True),
         Binding("q", "app.pop_screen", "Back", show=True),
         # ``escape`` mirrors ``q`` so curators can back out with the
@@ -570,6 +767,10 @@ class GlossaryScreen(Screen[None]):
         self._project = source
         self._entries: list[GlossaryEntryWithAliases] = []
         self._row_to_entry: dict[str, str] = {}
+        # Cached batch counts so we don't N+1 the DB each render. Refreshed
+        # alongside ``_entries`` in :meth:`_refresh_entries`. Missing keys
+        # are treated as :class:`MentionCounts()` (zero / zero).
+        self._mention_counts: dict[str, repo.MentionCounts] = {}
         # Cascade only makes sense in a translation context (segments
         # in the DB). Lore Books carry no chapters, so we infer the
         # default from ``isinstance(source, Project)`` and let the
@@ -594,7 +795,9 @@ class GlossaryScreen(Screen[None]):
                 table: DataTable[str] = DataTable(
                     id="glossary-table", zebra_stripes=True, cursor_type="row"
                 )
-                table.add_columns("Type", "Status", "Source", "Target", "Aliases")
+                table.add_columns(
+                    "Type", "Status", "Source", "Target", "Aliases", "Uses"
+                )
                 yield table
                 yield Static("(select an entry)", id="glossary-detail", markup=True)
             yield Static("Ready.", id="glossary-status")
@@ -608,6 +811,12 @@ class GlossaryScreen(Screen[None]):
 
     def _refresh_entries(self) -> None:
         self._entries = repo.list_glossary_entries(
+            self._project.engine, self._project.project_id
+        )
+        # One aggregate query per refresh keeps the row render at O(N)
+        # in Python; without the batch we'd do a SELECT-per-row inside
+        # the table loop and stall on books with thousands of entries.
+        self._mention_counts = repo.count_mentions_per_entry(
             self._project.engine, self._project.project_id
         )
         self._render_table()
@@ -629,12 +838,17 @@ class GlossaryScreen(Screen[None]):
             # tag makes the row's lore-book provenance obvious without
             # forcing the curator to open the detail pane.
             source_label = ent.source_term or "(target-only)"
+            counts = self._mention_counts.get(ent.id, repo.MentionCounts())
+            uses_cell = (
+                f"{counts.mentions} ({counts.segments}s)" if counts.mentions else "—"
+            )
             row_key = table.add_row(
                 ent.entry.type,
                 ent.status,
                 source_label,
                 ent.target_term,
                 aliases,
+                uses_cell,
                 key=ent.id,
             )
             self._row_to_entry[str(row_key)] = ent.id
@@ -657,7 +871,13 @@ class GlossaryScreen(Screen[None]):
             )
             or "  (no revisions)"
         )
-        mentions = repo.list_mentions(self._project.engine, entry_id=ent.id)
+        counts = self._mention_counts.get(ent.id, repo.MentionCounts())
+        mentions_line = (
+            f"{counts.mentions} (across {counts.segments} segment"
+            f"{'' if counts.segments == 1 else 's'})"
+            if counts.mentions
+            else "0 — never used yet"
+        )
         notes = ent.entry.notes or ""
         source_label = ent.source_term or "[i](target-only)[/i]"
         body = "\n".join(
@@ -670,7 +890,8 @@ class GlossaryScreen(Screen[None]):
                 f"[b]Source aliases[/b]: {', '.join(ent.source_aliases) or '—'}",
                 f"[b]Target aliases[/b]: {', '.join(ent.target_aliases) or '—'}",
                 "",
-                f"[b]Mentions[/b]: {len(mentions)} segment(s)",
+                f"[b]Mentions[/b]: {mentions_line}    "
+                "(press [b]o[/b] to view occurrences)",
                 "",
                 "[b]Notes[/b]:",
                 f"  {notes or '—'}",
@@ -714,6 +935,8 @@ class GlossaryScreen(Screen[None]):
             _EntryDraft(),
             title="New glossary entry",
             source_term_required=self._source_term_required,
+            source_lang=self._project.source_lang,
+            target_lang=self._project.target_lang,
         )
         self.app.push_screen(modal, self._on_entry_created)
 
@@ -758,6 +981,8 @@ class GlossaryScreen(Screen[None]):
             _EntryDraft.from_entry(ent),
             title=f"Edit {(ent.source_term or ent.target_term)!r}",
             source_term_required=self._source_term_required,
+            source_lang=self._project.source_lang,
+            target_lang=self._project.target_lang,
         )
         self.app.push_screen(modal, _make_edit_callback(self, ent.id))
 
@@ -855,6 +1080,27 @@ class GlossaryScreen(Screen[None]):
         )
         self._refresh_entries()
         self._set_status(f"{label!r} → {status}.")
+
+    def action_show_occurrences(self) -> None:
+        ent = self._highlighted_entry()
+        if ent is None:
+            self._set_status("No entry highlighted.")
+            return
+        occurrences = repo.list_occurrences(
+            self._project.engine,
+            project_id=self._project.project_id,
+            entry_id=ent.id,
+        )
+        label = ent.source_term or ent.target_term
+        if not occurrences:
+            self._set_status(f"No recorded occurrences for {label!r}.")
+            return
+        modal = OccurrencesScreen(entry=ent, occurrences=occurrences)
+        self.app.push_screen(modal)
+        self._set_status(
+            f"{label!r}: {len(occurrences)} mention(s) "
+            f"in {len({o.segment_id for o in occurrences})} segment(s)."
+        )
 
     def action_merge_duplicates(self) -> None:
         groups = repo.find_duplicate_source_terms(
@@ -1031,4 +1277,5 @@ __all__ = [
     "EntryEditScreen",
     "GlossaryScreen",
     "MergeDuplicatesScreen",
+    "OccurrencesScreen",
 ]

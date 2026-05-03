@@ -214,7 +214,30 @@ For each segment, the pipeline runs these phases:
   timestamps, and a free-text rationale.
 - **F-LB-3.** **Locked** entries are non-negotiable: validator hard-fails
   any segment that violates them, and the LLM prompt presents them as
-  hard constraints.
+  hard constraints. **Particle symmetry contract.** Every glossary
+  entry — locked, confirmed, *or* proposed — must have *symmetric*
+  leading function words: either both `source_term` and `target_term`
+  carry a leading article / preposition (`the USA → os EUA`,
+  `the United States → os Estados Unidos`), or neither does
+  (`Europe → Europa`, `USA → EUA`). Asymmetric pairs like
+  `Europe → na Europa` are pathological: the translator dutifully
+  inserts the contracted preposition again on the next "in Europe"
+  encounter and emits `"na na Europa"`. The contract is enforced in
+  three places: (a) the helper-LLM auto-proposer (`upsert_proposed`)
+  strips a single leading particle from each side before insert, so
+  the noisy proposal path always lands lemma-form pairs;
+  (b) `EntryEditScreen` rejects asymmetric saves with a curator-
+  facing error so manual edits are forced into one of the two
+  acceptable shapes; (c) the runtime validator
+  `find_target_doubled_particles` scans the LLM's target text for
+  adjacent identical function words and soft-flags the segment for
+  curator review (severity `warning`, kind `doubled_particle`,
+  surfaced through `has_flagging_violation`). The translator system
+  prompt carries the rule in the hard-rules block. Per-language
+  particle sets are curated in `epublate.glossary.normalize` for
+  `en`, `pt`, `es`, `fr`, `it`, `de`; unknown languages fall back
+  to the English set (conservative — better to miss a stripping
+  opportunity than aggressively rewrite an unfamiliar tongue).
 - **F-LB-4.** **Confirmed** entries are strong defaults: validator warns
   on deviation; LLM prompt presents them as preferences.
 - **F-LB-5.** **Proposed** entries are LLM/NER-suggested and not yet
@@ -229,7 +252,16 @@ For each segment, the pipeline runs these phases:
   with a real translation backfills the placeholder. Curator-edited
   rows are never overwritten.
 - **F-LB-6.** **History.** Every change to a glossary entry is versioned
-  with reason and timestamp.
+  with reason and timestamp. The Glossary screen surfaces a per-entry
+  **usage trail** alongside the revision log: the table shows total
+  mention count and distinct segment count (`Uses` column), and `o`
+  on the highlighted row opens a "Show occurrences" modal that lists
+  every recorded use in book order with the matched span wrapped in
+  `«…»`. Both views are powered by the existing `entity_mention`
+  rows the pipeline writes for every translated segment, so the
+  count is exact (no per-row re-scanning of source text) and merges
+  preserve it because `entity_mention` rows are repointed to the
+  winner.
 - **F-LB-7.** **Cascade re-translation.** When a confirmed/locked entry
   changes, the app lists every previously translated segment containing
   the old term and offers bulk re-translation.

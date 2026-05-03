@@ -42,6 +42,7 @@ from epublate.core.extractor import (
     DEFAULT_CHUNK_MAX_TOKENS,
     IntakeOptions,
     IntakeSummary,
+    PrePassChunkEvent,
     run_pre_pass,
 )
 from epublate.core.pipeline import (
@@ -55,7 +56,7 @@ from epublate.core.pipeline import (
     translate_segments_grouped,
 )
 from epublate.db import repo
-from epublate.errors import EpublateError
+from epublate.errors import EpublateError, LLMRateLimitError
 from epublate.llm.base import LLMProvider
 
 _logger = logging.getLogger(__name__)
@@ -162,6 +163,33 @@ class BatchProgressEvent:
 ProgressCallback = Callable[[BatchProgressEvent], None]
 
 
+@dataclass(slots=True, frozen=True)
+class BatchPrePassProgress:
+    """One per-chunk pre-pass tick fired during interleaved batch runs.
+
+    Surfaced to the UI so the dashboard meter / status line can show
+    "pre-pass: chapter 1/30 chunk 2/3" while the helper LLM is
+    grinding. Without this signal a slow helper makes the meter sit
+    at ``0 / N`` for minutes and looks like a deadlock — the bug that
+    motivated the per-chapter interleave (see CHANGELOG entry under
+    M5 / batch UX). The dashboard binds this through
+    :meth:`epublate.app.main.EpublateApp.start_batch`.
+    """
+
+    chapter_id: str
+    chapter_index: int
+    chapter_count: int
+    chunk_index: int
+    chunk_count: int
+    success: bool
+    error: str | None
+    proposed_count: int
+    cache_hit: bool
+
+
+PrePassProgressCallback = Callable[[BatchPrePassProgress], None]
+
+
 class BatchPaused(EpublateError):
     """Batch stopped because the cumulative cost would cross the budget cap.
 
@@ -199,6 +227,7 @@ def run_batch(
     provider: LLMProvider,
     options: BatchOptions,
     on_progress: ProgressCallback | None = None,
+    on_pre_pass_progress: PrePassProgressCallback | None = None,
     segments: Sequence[repo.SegmentRow] | None = None,
     cancel_event: threading.Event | None = None,
 ) -> BatchSummary:
@@ -218,6 +247,17 @@ def run_batch(
     * Submits one Future per segment to a ``ThreadPoolExecutor``.
     * Drains futures as they complete; updates the running
       :class:`BatchSummary` after each.
+    * **Pre-pass interleave (PRD §4.2 phase 3 / M5).** When
+      ``options.pre_pass`` is on, the helper extractor runs *per
+      chapter* and that chapter's translations dispatch immediately
+      after — so the meter starts moving within ~30s on a fresh run
+      instead of after every chapter's pre-pass completes. The
+      trade-off is intentional: chapter N's translator only sees
+      ``proposed`` glossary entries discovered through chapter N
+      (book-wide consistency comes from the Lore Book / Book Intake,
+      not the pre-pass). Cancel and the budget cap are checked
+      between chapters and inside the per-chapter pre-pass chunk
+      loop, so a slow helper can be aborted promptly.
     * Stops accepting new work once cumulative ``cost_usd`` would
       exceed ``effective_budget`` (project budget if any, overridden
       by ``options.budget_usd``); raises :class:`BatchPaused` after
@@ -283,51 +323,6 @@ def run_batch(
         )
         return summary
 
-    if options.pre_pass:
-        helper_model = options.helper_model or options.model
-        pre_options = IntakeOptions(
-            model=helper_model,
-            chunk_max_tokens=options.pre_pass_chunk_max_tokens,
-            bypass_cache=options.bypass_cache,
-            auto_propose=options.auto_propose,
-        )
-        rolled = IntakeSummary()
-        # Walk pending segments grouped by chapter so each helper call sees
-        # one chapter's worth of context at a time (PRD §4.2 phase 3).
-        for chapter_id, chapter_segments in _group_by_chapter(pending):
-            chapter_summary = run_pre_pass(
-                engine=engine,
-                project_id=project_id,
-                source_lang=source_lang,
-                target_lang=target_lang,
-                provider=provider,
-                options=pre_options,
-                segments=chapter_segments,
-            )
-            del chapter_id  # used only for grouping order
-            rolled.chunks += chapter_summary.chunks
-            rolled.cached_chunks += chapter_summary.cached_chunks
-            rolled.proposed_count += chapter_summary.proposed_count
-            rolled.prompt_tokens += chapter_summary.prompt_tokens
-            rolled.completion_tokens += chapter_summary.completion_tokens
-            rolled.cost_usd += chapter_summary.cost_usd
-            rolled.failed_chunks += chapter_summary.failed_chunks
-            rolled.proposed_entry_ids.extend(chapter_summary.proposed_entry_ids)
-            if chapter_summary.pov and rolled.pov is None:
-                rolled.pov = chapter_summary.pov
-            if chapter_summary.tense and rolled.tense is None:
-                rolled.tense = chapter_summary.tense
-            if chapter_summary.notes:
-                rolled.notes.extend(chapter_summary.notes)
-
-        summary.pre_pass = rolled
-        # Helper spend counts against the same budget cap (PRD F-LLM-8 /
-        # F-LLM-7). Tokens are folded so the overall accounting matches
-        # what shows up in the audit table.
-        summary.prompt_tokens += rolled.prompt_tokens
-        summary.completion_tokens += rolled.completion_tokens
-        summary.cost_usd += rolled.cost_usd
-
     concurrency = max(1, options.concurrency)
     paused = False
     pause_reason: str | None = None
@@ -362,6 +357,12 @@ def run_batch(
                 ),
             )
             return [(seg, outcome, None)]
+        except LLMRateLimitError:
+            # Let it propagate so the dispatch loop can pause the whole
+            # batch — a depleted daily quota means every remaining
+            # segment will hit the same 429, so the right answer is to
+            # stop submitting new work, not to fail every segment.
+            raise
         except Exception as exc:  # worker boundary; surface, don't crash batch
             _logger.warning(
                 "batch worker failed on segment %s: %s",
@@ -390,6 +391,8 @@ def run_batch(
                 (seg, outcome, None)
                 for seg, outcome in zip(segs, outcomes, strict=True)
             ]
+        except LLMRateLimitError:
+            raise
         except Exception as exc:  # worker boundary; surface, don't crash batch
             _logger.warning(
                 "batch group worker failed on %d segments: %s",
@@ -399,14 +402,27 @@ def run_batch(
             err = str(exc)
             return [(seg, None, err) for seg in segs]
 
-    work_items = _build_work_items(pending, options=options)
-
     def _cancel_requested() -> bool:
         return cancel_event is not None and cancel_event.is_set()
 
-    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+    def _drain(
+        pool: ThreadPoolExecutor,
+        items: Sequence[list[repo.SegmentRow]],
+    ) -> None:
+        """Drain one batch of work items through ``pool``.
+
+        Mutates the enclosing ``paused``/``cancelled``/``pause_reason``
+        flags via ``nonlocal`` so the per-chapter loop can short-circuit
+        the remaining chapters when the budget trips or the curator
+        cancels mid-chapter. Returns when ``items`` plus all in-flight
+        futures have completed (or paused/cancelled).
+        """
+
+        nonlocal paused, pause_reason, cancelled
+        if not items:
+            return
         in_flight: set[Future[WorkerResult]] = set()
-        queue: list[list[repo.SegmentRow]] = list(work_items)
+        queue: list[list[repo.SegmentRow]] = list(items)
         # Prime the pool with up to ``concurrency`` tasks. After that
         # we submit one new task per completion (sliding window) so the
         # budget cap can short-circuit further submissions cleanly.
@@ -422,7 +438,20 @@ def run_batch(
             done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
             for fut in done:
                 in_flight.discard(fut)
-                results = fut.result()
+                try:
+                    results = fut.result()
+                except LLMRateLimitError as exc:
+                    # Endpoint depleted (free-tier daily quota, monthly
+                    # cap, etc.). Pause the batch with a clear message
+                    # rather than burning the rest of the queue on the
+                    # same 429 — the segment that triggered this stays
+                    # ``pending`` so the run can resume after the
+                    # curator switches model / adds credits / waits.
+                    if not paused:
+                        paused = True
+                        pause_reason = _format_rate_limit_pause(exc)
+                        queue.clear()
+                    continue
                 for seg, outcome, err in results:
                     with lock:
                         _apply_outcome(summary, outcome, err)
@@ -481,6 +510,126 @@ def run_batch(
                     _submit_work_item(pool, queue.pop(0), _worker_single, _worker_group)
                 )
 
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        if options.pre_pass:
+            helper_model = options.helper_model or options.model
+            pre_options = IntakeOptions(
+                model=helper_model,
+                chunk_max_tokens=options.pre_pass_chunk_max_tokens,
+                bypass_cache=options.bypass_cache,
+                auto_propose=options.auto_propose,
+            )
+            rolled = IntakeSummary()
+            chapter_buckets = list(_group_by_chapter(pending))
+            chapter_count = len(chapter_buckets)
+            for chapter_idx, (chapter_id, chapter_segments) in enumerate(
+                chapter_buckets
+            ):
+                if _cancel_requested():
+                    cancelled = True
+                    break
+                if paused:
+                    break
+                chapter_one_based = chapter_idx + 1
+
+                def _chunk_listener(
+                    ev: PrePassChunkEvent,
+                    *,
+                    _chapter_id: str = chapter_id,
+                    _chapter_one_based: int = chapter_one_based,
+                    _chapter_count: int = chapter_count,
+                ) -> None:
+                    if on_pre_pass_progress is None:
+                        return
+                    try:
+                        on_pre_pass_progress(
+                            BatchPrePassProgress(
+                                chapter_id=_chapter_id,
+                                chapter_index=_chapter_one_based,
+                                chapter_count=_chapter_count,
+                                chunk_index=ev.chunk_index,
+                                chunk_count=ev.chunk_count,
+                                success=ev.success,
+                                error=ev.error,
+                                proposed_count=ev.proposed_count,
+                                cache_hit=ev.cache_hit,
+                            )
+                        )
+                    except Exception:  # pragma: no cover — defensive
+                        _logger.debug("pre-pass progress listener raised; ignoring")
+
+                try:
+                    chapter_summary = run_pre_pass(
+                        engine=engine,
+                        project_id=project_id,
+                        source_lang=source_lang,
+                        target_lang=target_lang,
+                        provider=provider,
+                        options=pre_options,
+                        segments=chapter_segments,
+                        cancel_event=cancel_event,
+                        on_chunk=_chunk_listener,
+                    )
+                except LLMRateLimitError as exc:
+                    # Helper endpoint is depleted; the translator phase
+                    # would hit the same 429 anyway. Pause the batch so
+                    # the curator can switch model / wait / add credits
+                    # and resume — pending segments stay ``pending``.
+                    paused = True
+                    pause_reason = _format_rate_limit_pause(exc)
+                    summary.pre_pass = rolled
+                    break
+                # Roll into the rolling pre-pass summary, and fold helper
+                # spend into the batch's running totals so the budget cap
+                # is enforced *between chapters* — without this the helper
+                # could blow through the cap before the first translator
+                # call lands (PRD F-LLM-8 / F-LLM-7).
+                rolled.chunks += chapter_summary.chunks
+                rolled.cached_chunks += chapter_summary.cached_chunks
+                rolled.proposed_count += chapter_summary.proposed_count
+                rolled.prompt_tokens += chapter_summary.prompt_tokens
+                rolled.completion_tokens += chapter_summary.completion_tokens
+                rolled.cost_usd += chapter_summary.cost_usd
+                rolled.failed_chunks += chapter_summary.failed_chunks
+                rolled.proposed_entry_ids.extend(chapter_summary.proposed_entry_ids)
+                if chapter_summary.pov and rolled.pov is None:
+                    rolled.pov = chapter_summary.pov
+                if chapter_summary.tense and rolled.tense is None:
+                    rolled.tense = chapter_summary.tense
+                if chapter_summary.notes:
+                    rolled.notes.extend(chapter_summary.notes)
+                with lock:
+                    summary.prompt_tokens += chapter_summary.prompt_tokens
+                    summary.completion_tokens += chapter_summary.completion_tokens
+                    summary.cost_usd += chapter_summary.cost_usd
+                    over_budget_after_pre_pass = (
+                        effective_budget is not None
+                        and summary.cost_usd > effective_budget
+                    )
+
+                if _cancel_requested():
+                    cancelled = True
+                    break
+                if over_budget_after_pre_pass and not paused:
+                    paused = True
+                    pause_reason = (
+                        f"budget cap ${effective_budget:.4f} reached "
+                        f"at ${summary.cost_usd:.4f}"
+                    )
+                    break
+
+                # Submit and drain *just this chapter's* segments, so the
+                # next chapter's pre-pass sees the current chapter's
+                # auto-proposed entries (plus any locked/confirmed
+                # entries from the curator's promotions).
+                chapter_work = _build_work_items(chapter_segments, options=options)
+                _drain(pool, chapter_work)
+
+            summary.pre_pass = rolled
+        else:
+            flat_work = _build_work_items(pending, options=options)
+            _drain(pool, flat_work)
+
     summary.elapsed_s = time.monotonic() - started
 
     if paused:
@@ -520,6 +669,32 @@ def run_batch(
         payload=_summary_payload(summary),
     )
     return summary
+
+
+def _format_rate_limit_pause(exc: LLMRateLimitError) -> str:
+    """Build the pause-reason string for a rate-limit hit.
+
+    Includes the provider's own ``error.message`` (often the most
+    useful next step — OpenRouter's depleted-quota message names the
+    exact dollar amount that unlocks the higher tier) and a wall-clock
+    estimate when the headers tell us when the reset lands. Falls back
+    to a generic message when the endpoint didn't supply a hint.
+    """
+
+    base = exc.provider_message or str(exc)
+    if exc.retry_after_seconds is None or exc.retry_after_seconds <= 0:
+        return f"rate limit hit: {base} (switch model, add credits, or wait and resume)"
+    secs = exc.retry_after_seconds
+    if secs < 60:
+        wait = f"{secs:.0f}s"
+    elif secs < 3600:
+        wait = f"~{secs / 60:.0f} min"
+    else:
+        wait = f"~{secs / 3600:.1f} h"
+    return (
+        f"rate limit hit: {base} (resets in {wait}; "
+        "switch model, add credits, or wait and resume)"
+    )
 
 
 def _apply_outcome(

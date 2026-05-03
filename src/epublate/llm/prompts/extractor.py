@@ -36,8 +36,24 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from epublate.errors import LLMResponseError
-from epublate.llm.base import Message
+from epublate.llm.base import Message, ResponseFormat
 from epublate.llm.prompts.translator import GlossaryConstraint
+
+DEFAULT_RESPONSE_FORMAT: ResponseFormat = ResponseFormat(type="json_object")
+"""Default ``response_format`` for the helper-LLM extractor (PRD F-LLM-3).
+
+We pin ``json_object`` because the prompt asks for "a single JSON object
+and nothing else" and the parser refuses prose. Without an explicit
+structured-output hint, reasoning-style helpers (e.g. ``gpt-oss-20b``)
+can spend the entire visible-channel budget on reasoning tokens and
+return empty content; permissive endpoints can wrap the JSON in fences
+or commentary that defeats the recovery regex. JSON mode constrains
+decoding so the model has to emit a parseable object, eliminating both
+failure modes for the bulk of OpenAI-compatible providers (OpenAI,
+LiteLLM, vLLM, Ollama, llama.cpp). Endpoints that genuinely don't
+support it raise a clean 400 the operator can surface and override
+via ``ExtractOptions(response_format=ResponseFormat(type="text"))``.
+"""
 
 EntityTypeLiteral = Literal[
     "character",
@@ -384,6 +400,7 @@ def _normalize_entity(raw: Any) -> ExtractedEntity | None:
 
 
 __all__ = [
+    "DEFAULT_RESPONSE_FORMAT",
     "EntityTypeLiteral",
     "ExtractedEntity",
     "ExtractorTrace",
