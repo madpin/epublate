@@ -1,0 +1,59 @@
+# Mirror .gitignore for the build context so layers stay small and
+# cache-friendly. Anything that isn't part of the wheel/source has no
+# business inside the image.
+
+# Version control & editor metadata
+.git
+.gitignore
+.gitattributes
+.github
+.cursor
+.vscode
+.idea
+
+# Python build / test artifacts
+__pycache__
+*.py[codz]
+*.so
+*.egg-info
+build
+dist
+.eggs
+.venv
+venv
+.python-version
+
+# Tooling caches
+.mypy_cache
+.ruff_cache
+.pytest_cache
+.hypothesis
+.coverage
+.coverage.*
+htmlcov
+coverage.xml
+.tox
+.cache
+
+# Tests / docs / fixtures don't ship with the runtime image
+tests
+docs
+scripts
+snapshot_report.html
+CHANGELOG.md
+CONTRIBUTING.md
+AGENTS.md
+CLAUDE.md
+
+# Local secrets / per-developer config
+.env
+.env.*
+!.env.example
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Don't ship the existing image / data dirs back into the build
+Dockerfile
+.dockerignore

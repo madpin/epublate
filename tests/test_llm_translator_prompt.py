@@ -77,6 +77,73 @@ def test_empty_source_rejected() -> None:
         build_translator_messages(source_lang="en", target_lang="pt", source_text="")
 
 
+def test_glossary_block_renders_gender_when_present() -> None:
+    """Gender flows from the entry through the constraint to the prompt.
+
+    Regression test for the curator-reported article-disagreement
+    ("Câmara" rendered as ``o Câmara`` instead of ``a Câmara``). The
+    LLM never saw a hint about grammatical gender, so we surface it
+    inline next to the target term and a hard rule asks for matching
+    articles / agreement.
+    """
+
+    glossary = [
+        GlossaryConstraint(
+            source_term="House",
+            target_term="Câmara",
+            type="organization",
+            status="locked",
+            gender="feminine",
+            notes="parliament chamber, not a building",
+        ),
+    ]
+    [system, _] = build_translator_messages(
+        source_lang="en",
+        target_lang="pt",
+        source_text="The House voted yes.",
+        glossary=glossary,
+    )
+    assert "House → Câmara (gender: feminine)" in system.content
+    assert "parliament chamber" in system.content
+    # The article-agreement rule travels with the prompt template so
+    # the model has explicit instructions for gendered targets.
+    assert "MUST agree with that gender" in system.content
+    assert "MUST keep the article" in system.content
+    # The same-sense rule discourages applying ``House → Câmara`` to a
+    # plain "house in the woods".
+    assert "same sense as the entry" in system.content
+
+
+def test_glossary_block_skips_unspecified_gender() -> None:
+    """``unspecified`` is the schema default for "no opinion".
+
+    The block must not add noise for entries that haven't pinned a
+    gender (the gendered-target features still need an explicit
+    masculine/feminine to fire).
+    """
+
+    glossary = [
+        GlossaryConstraint(
+            source_term="Friend",
+            target_term="Amigo",
+            gender="unspecified",
+        ),
+    ]
+    [system, _] = build_translator_messages(
+        source_lang="en",
+        target_lang="pt",
+        source_text="x",
+        glossary=glossary,
+    )
+    # The hard-rules section quotes ``(gender: …)`` as an illustration
+    # of the marker shape, so we check only the rendered glossary
+    # entry line itself.
+    glossary_line = next(
+        line for line in system.content.splitlines() if "Friend" in line
+    )
+    assert "(gender:" not in glossary_line
+
+
 def test_target_only_block_renders_when_provided() -> None:
     target_only = [
         TargetOnlyConstraint(

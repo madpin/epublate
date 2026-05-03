@@ -359,6 +359,94 @@ class CascadeConfirmScreen(ModalScreen[bool]):
 
 
 # ---------------------------------------------------------------------------
+# Merge duplicates modal
+# ---------------------------------------------------------------------------
+
+
+class MergeDuplicatesScreen(ModalScreen[int]):
+    """Confirm + apply a "merge all duplicate source terms" pass.
+
+    Renders the duplicate groups returned by
+    :func:`epublate.db.repo.find_duplicate_source_terms` so the
+    curator can review the auto-picked winners before pressing
+    ``y`` to merge them all (status-priority winner, generic ``term``
+    rows folded in as alias). On ``y`` the dismiss value is the count
+    of groups merged; ``n`` / ``Esc`` dismisses with ``0``.
+
+    The merge itself runs in a Textual worker on the calling
+    :class:`GlossaryScreen` (TUI rule §1: never block the UI thread)
+    — this modal only collects the curator's intent.
+    """
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("y", "confirm", "Yes", show=True),
+        Binding("n", "cancel", "No", show=True),
+        Binding("escape", "cancel", "Cancel", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    MergeDuplicatesScreen {
+        align: center middle;
+    }
+    MergeDuplicatesScreen #merge-box {
+        width: 80%;
+        max-height: 80%;
+        border: round $primary;
+        padding: 1 2;
+        background: $surface;
+    }
+    MergeDuplicatesScreen #merge-list {
+        height: 1fr;
+        margin: 1 0;
+    }
+    """
+
+    def __init__(
+        self,
+        groups: list[list[GlossaryEntryWithAliases]],
+    ) -> None:
+        super().__init__()
+        self._groups = groups
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="merge-box"):
+            yield Label(
+                f"Found {len(self._groups)} duplicate source-term group(s). "
+                "Auto-merging keeps the winner shown first and folds the "
+                "other entries' source/target spellings in as aliases."
+            )
+            preview_lines: list[str] = []
+            for group in self._groups[:10]:
+                head = group[0]
+                losers = group[1:]
+                head_label = (
+                    f"  • [b]{head.source_term}[/b] → keep "
+                    f"[i]{head.target_term}[/i] "
+                    f"({head.entry.type}, {head.status})"
+                )
+                preview_lines.append(head_label)
+                for los in losers:
+                    preview_lines.append(
+                        f"      ↳ fold [i]{los.target_term}[/i] "
+                        f"({los.entry.type}, {los.status}) into aliases"
+                    )
+            if len(self._groups) > 10:
+                preview_lines.append(f"  … and {len(self._groups) - 10} more")
+            preview = "\n".join(preview_lines) or "  (no groups)"
+            yield Static(preview, id="merge-list", markup=True)
+            yield Static(
+                "Press [b]y[/b] to merge all groups, [b]n[/b] to cancel.",
+                markup=True,
+            )
+
+    def action_confirm(self) -> None:
+        self.dismiss(len(self._groups))
+
+    def action_cancel(self) -> None:
+        self.dismiss(0)
+
+
+# ---------------------------------------------------------------------------
 # Delete confirm modal
 # ---------------------------------------------------------------------------
 
@@ -439,6 +527,7 @@ class GlossaryScreen(Screen[None]):
         Binding("c", "set_status_confirmed", "Confirm", show=True),
         Binding("p", "set_status_proposed", "Propose", show=True),
         Binding("r", "cascade", "Cascade", show=True),
+        Binding("m", "merge_duplicates", "Merge dupes", show=True),
         Binding("f", "cycle_filter", "Filter", show=True),
         Binding("q", "app.pop_screen", "Back", show=True),
         # ``escape`` mirrors ``q`` so curators can back out with the
@@ -767,6 +856,47 @@ class GlossaryScreen(Screen[None]):
         self._refresh_entries()
         self._set_status(f"{label!r} → {status}.")
 
+    def action_merge_duplicates(self) -> None:
+        groups = repo.find_duplicate_source_terms(
+            self._project.engine, self._project.project_id
+        )
+        if not groups:
+            self._set_status("No duplicate source terms found.")
+            return
+        modal = MergeDuplicatesScreen(groups)
+        self.app.push_screen(modal, _make_merge_callback(self, groups))
+
+    def apply_merge(
+        self,
+        groups: list[list[GlossaryEntryWithAliases]],
+        confirmed_count: int | None,
+    ) -> None:
+        if not confirmed_count:
+            self._set_status("Merge cancelled.")
+            return
+        merged = 0
+        for group in groups:
+            if len(group) < 2:
+                continue
+            winner = group[0]
+            losers = [e.id for e in group[1:]]
+            merged += repo.merge_glossary_entries(
+                self._project.engine,
+                winner_id=winner.id,
+                loser_ids=losers,
+                reason="curator:merge_duplicates",
+            )
+        repo.append_event(
+            self._project.engine,
+            project_id=self._project.project_id,
+            kind="glossary.duplicates_merged",
+            payload={"groups": len(groups), "rows_removed": merged},
+        )
+        self._refresh_entries()
+        self._set_status(
+            f"Merged {len(groups)} duplicate group(s); removed {merged} row(s)."
+        )
+
     def action_cascade(self) -> None:
         ent = self._highlighted_entry()
         if ent is None:
@@ -883,6 +1013,16 @@ def _make_cascade_callback(
     return _cb
 
 
+def _make_merge_callback(
+    screen: GlossaryScreen,
+    groups: list[list[GlossaryEntryWithAliases]],
+) -> Callable[[int | None], None]:
+    def _cb(result: int | None) -> None:
+        screen.apply_merge(groups, result)
+
+    return _cb
+
+
 __all__ = [
     "CascadeConfirmScreen",
     "CascadeFailed",
@@ -890,4 +1030,5 @@ __all__ = [
     "DeleteConfirmScreen",
     "EntryEditScreen",
     "GlossaryScreen",
+    "MergeDuplicatesScreen",
 ]

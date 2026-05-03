@@ -102,6 +102,34 @@ uv run ruff check .               # lint
 uv run mypy src/epublate          # types
 ```
 
+### Run from Docker (no local Python needed)
+
+Each push to `main` and every release publishes a multi-arch image to
+GitHub Container Registry. The image bundles a JRE so the optional
+`epubcheck` validator works out of the box.
+
+```bash
+# Pull the latest image
+docker pull ghcr.io/madpin/epublate:latest
+
+# CLI commands work the same as the local install. Mount a host
+# directory at /data so projects, recents, and the UI config persist
+# across runs.
+docker run --rm -it \
+    -v "$PWD/epublate-data:/data" \
+    ghcr.io/madpin/epublate:latest --mock-llm new docs/Sample.epub \
+    --source-lang en --target-lang pt --out /data/projects/sample
+
+# The Textual TUI needs a real terminal — pass --tty (or -it):
+docker run --rm -it \
+    -v "$PWD/epublate-data:/data" \
+    ghcr.io/madpin/epublate:latest --mock-llm
+```
+
+Build the image yourself with `docker build -t epublate:dev .` from
+the repo root. The Dockerfile is a two-stage build powered by `uv`
+that resolves dependencies against `uv.lock` for reproducible images.
+
 ### Try it on the sample book
 
 The repo ships a real ePub at [`docs/Sample.epub`](docs/Sample.epub) so

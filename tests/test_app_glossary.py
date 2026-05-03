@@ -172,6 +172,79 @@ async def test_glossary_cascade_no_op_when_no_segments_match(
 
 
 @pytest.mark.asyncio
+async def test_glossary_merge_duplicates_no_op_when_none(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """Pressing ``m`` with no duplicates is a no-op (status update only)."""
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    try:
+        _seed_one_entry(project)
+        screen = GlossaryScreen(project)
+        app = EpublateApp(initial_screen=screen)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("m")
+            await pilot.pause()
+            # Still on the GlossaryScreen — no modal pushed.
+            assert isinstance(pilot.app.screen, GlossaryScreen)
+            entries = repo.list_glossary_entries(project.engine, project.project_id)
+            assert len(entries) == 1
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
+async def test_glossary_merge_duplicates_collapses_groups(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """Curator-confirmed merge folds losers into the winner's aliases.
+
+    The auto-proposer used to dedup by ``(source_term, type)`` so the
+    same proper noun could land twice. This test exercises the cleanup
+    flow on the Glossary screen: press ``m`` to surface the duplicate
+    group, ``y`` on the modal to confirm.
+    """
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    try:
+        repo.create_glossary_entry(
+            project.engine,
+            project_id=project.project_id,
+            source_term="House",
+            target_term="house",
+            type="term",
+            status="proposed",
+        )
+        repo.create_glossary_entry(
+            project.engine,
+            project_id=project.project_id,
+            source_term="House",
+            target_term="Câmara",
+            type="organization",
+            status="locked",
+        )
+        screen = GlossaryScreen(project)
+        app = EpublateApp(initial_screen=screen)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("m")
+            await pilot.pause()
+            await pilot.press("y")
+            await pilot.pause()
+            entries = repo.list_glossary_entries(project.engine, project.project_id)
+            assert len(entries) == 1
+            keep = entries[0]
+            # The locked / specific-typed row wins — it sits at the head
+            # of the sorted group.
+            assert keep.entry.type == "organization"
+            assert keep.target_term == "Câmara"
+            assert "house" in keep.target_aliases
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
 async def test_glossary_edit_modal_mounts_with_blank_gender(
     tiny_epub_factory: Callable[..., Path], tmp_path: Path
 ) -> None:

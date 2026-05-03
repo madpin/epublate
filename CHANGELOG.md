@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — Glossary applied per-segment, gender-aware, and dedup-safe
+
+This batch addresses three curator-reported regressions in how the
+lore bible flows into the translator prompt and how new entries land
+in the project DB. Together they make the glossary "use the term
+every time" promise actually hold without over-applying common-noun
+mappings (the "House → Câmara" surfaced on plain `house` bug).
+
+- **Per-segment glossary filter** (PRD F-LB-3 / glossary-invariants
+  §1). The translator prompt used to ship the *whole* project glossary
+  as constraints to every segment, which (a) drowned locked entries
+  in noise once the lore bible grew and (b) over-applied common-noun
+  entries — the validator would hard-fail "the small house in the
+  woods" because the locked `House → Câmara` (a parliamentary
+  chamber) source term technically matched. The pipeline now runs
+  `match_source` on each segment first and only renders entries with
+  an actual word-boundary hit. Cache invalidation still folds the
+  full project glossary so a curator edit / cascade clears stale
+  translations downstream. The grouped-translator path uses the
+  union of relevant entries across the surviving items so a TOC
+  batch still gets every locked name it needs.
+- **Glossary auto-proposer dedupes by source term, not by
+  `(source_term, type)`.** An unreliable helper LLM used to land the
+  same proper noun twice (once as `term`, once as `place`) which
+  confused the validator and bloated the lore bible. Auto-proposal
+  now keys on `source_term` alone, auto-upgrades a generic `term`
+  row to a more specific type when the next pass is confident, and
+  never overwrites curator-promoted entries. Manual creation via
+  `repo.create_glossary_entry` still allows the rare disambiguation
+  case where one source spelling really does map to two senses with
+  different targets.
+- **"Merge duplicates" action on the Glossary screen.** Existing
+  duplicates from the old auto-propose contract are surfaced via
+  `repo.find_duplicate_source_terms`. Pressing `m` on the Glossary
+  screen opens a confirm modal; on `y`, `repo.merge_glossary_entries`
+  folds each loser's source/target spellings into the winner's
+  aliases, re-points `entity_mention` rows so audit history is
+  preserved, deletes the losers, and appends a `glossary_revision`
+  + `glossary.duplicates_merged` event. The winner is the highest
+  status in the group (locked > confirmed > proposed), specific type
+  before `term`, oldest first.
+- **Gender flows from the entry to the prompt.** `GlossaryConstraint`
+  and `TargetOnlyConstraint` now carry `gender`, `_format_glossary_block`
+  renders it inline (`House → Câmara (gender: feminine)`), and the
+  translator system prompt has a new hard rule: when a glossary entry
+  has a gender, articles, demonstratives, possessives, adjectives,
+  and past participles MUST agree with it (so `the House` →
+  `a Câmara` / `da Câmara`, never `o Câmara`). When a glossary term
+  appears with an article in the source, the article must be kept
+  and inflected in the target.
+- **"Same-sense" guard rule.** A new hard rule in the system prompt
+  asks the model to apply a glossary entry only when the source term
+  is used in the *same sense* as the entry — common-noun → specialized
+  mappings should be skipped when the source uses the word in an
+  ordinary, unrelated sense. The `notes` field is now positioned as
+  a "when to apply" hint so curators have a place to disambiguate.
+
 ### Added — App-owned batch lifecycle, cancellation, richer batch UI
 
 - **Batch worker lives on the App, not the Dashboard.** Pressing

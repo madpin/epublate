@@ -289,6 +289,115 @@ def test_upsert_proposed_does_not_clobber_curator_target(
     assert entry.target_term == "Iulius Caesar"
 
 
+def test_upsert_proposed_dedups_across_types(project_db: Engine) -> None:
+    """Same source term, different types → still one auto-proposed row.
+
+    Regression test for the curator-reported "House appears as both
+    `term` and `place`" duplication. The auto-proposer used to dedup
+    by ``(source_term, type)``, which let an unreliable helper LLM
+    create two rows for the same proper noun. The contract now keys
+    on ``source_term`` alone so the lore bible carries one entry per
+    surface form.
+    """
+
+    pid = _project(project_db)
+    eid_first, created_first = glossary_io.upsert_proposed(
+        project_db,
+        project_id=pid,
+        source_term="House",
+        type="term",
+    )
+    eid_second, created_second = glossary_io.upsert_proposed(
+        project_db,
+        project_id=pid,
+        source_term="House",
+        type="place",
+    )
+    assert created_first is True
+    assert created_second is False
+    assert eid_second == eid_first
+    rows = repo.list_glossary_entries(project_db, pid)
+    assert len(rows) == 1
+
+
+def test_upsert_proposed_upgrades_generic_term_type(project_db: Engine) -> None:
+    """Generic ``term`` rows take the first specific type that arrives.
+
+    The helper LLM falls back to ``term`` when it can't tell. A later
+    pass with a confident ``character`` reading should win, otherwise
+    the curator sees a lore bible polluted with ``term`` placeholders
+    for things that are clearly people / places.
+    """
+
+    pid = _project(project_db)
+    eid, _ = glossary_io.upsert_proposed(
+        project_db,
+        project_id=pid,
+        source_term="Geralt",
+        type="term",
+    )
+    glossary_io.upsert_proposed(
+        project_db,
+        project_id=pid,
+        source_term="Geralt",
+        type="character",
+    )
+    entry = repo.get_glossary_entry(project_db, eid)
+    assert entry is not None
+    assert entry.entry.type == "character"
+
+
+def test_upsert_proposed_does_not_downgrade_specific_type(project_db: Engine) -> None:
+    """A confident ``place`` reading is never downgraded to generic ``term``."""
+
+    pid = _project(project_db)
+    eid, _ = glossary_io.upsert_proposed(
+        project_db,
+        project_id=pid,
+        source_term="Cintra",
+        type="place",
+    )
+    glossary_io.upsert_proposed(
+        project_db,
+        project_id=pid,
+        source_term="Cintra",
+        type="term",
+    )
+    entry = repo.get_glossary_entry(project_db, eid)
+    assert entry is not None
+    assert entry.entry.type == "place"
+
+
+def test_upsert_proposed_does_not_change_curator_promoted_type(
+    project_db: Engine,
+) -> None:
+    """A curator-promoted entry is immutable from the auto-propose path."""
+
+    pid = _project(project_db)
+    eid, _ = glossary_io.upsert_proposed(
+        project_db,
+        project_id=pid,
+        source_term="House",
+        type="term",
+    )
+    repo.update_glossary_entry(
+        project_db,
+        entry_id=eid,
+        status="confirmed",
+        reason="curator:promoted",
+    )
+    glossary_io.upsert_proposed(
+        project_db,
+        project_id=pid,
+        source_term="House",
+        type="place",
+    )
+    entry = repo.get_glossary_entry(project_db, eid)
+    assert entry is not None
+    assert entry.entry.type == "term"
+    assert entry.status == "confirmed"
+
+
 def test_read_payload_validates(tmp_path: Path) -> None:
     p = tmp_path / "garbage.json"
     p.write_text("{not json", encoding="utf-8")

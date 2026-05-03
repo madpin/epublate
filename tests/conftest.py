@@ -13,6 +13,8 @@ directory.
 
 from __future__ import annotations
 
+import os
+import sys
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
@@ -21,6 +23,40 @@ from ebooklib import epub
 from sqlalchemy.engine import Engine
 
 from epublate.db import connect
+
+# Snapshot tests render Textual screens to SVG and byte-compare them
+# against a committed baseline. Even with masked dynamic content the
+# byte stream drifts across operating systems (font fallbacks, terminal
+# cell metrics, asyncio scheduling), so we lock the canonical platform
+# to Linux. macOS / Windows skip the suite by default; contributors who
+# want to run snapshots locally on those OSes can opt in via the
+# ``EPUBLATE_RUN_SNAPSHOTS=1`` env var (the same hook CI uses on
+# Linux).
+_SNAPSHOT_FORCE_RUN = os.environ.get("EPUBLATE_RUN_SNAPSHOTS", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+_SNAPSHOTS_SUPPORTED = sys.platform.startswith("linux") or _SNAPSHOT_FORCE_RUN
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    """Skip ``test_snapshot_*.py`` modules on non-canonical platforms."""
+
+    if _SNAPSHOTS_SUPPORTED:
+        return
+    skip_marker = pytest.mark.skip(
+        reason=(
+            "snapshot tests are pinned to Linux to avoid cross-platform "
+            "rendering drift (set EPUBLATE_RUN_SNAPSHOTS=1 to override)"
+        )
+    )
+    for item in items:
+        if "test_snapshot_" in Path(str(item.fspath)).name:
+            item.add_marker(skip_marker)
 
 
 @pytest.fixture(autouse=True)

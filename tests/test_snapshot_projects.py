@@ -27,8 +27,10 @@ def _populate_recents(path: Path) -> None:
         # vanished on mount. Make the mock project directories real so
         # they survive the mount-time sweep; the mask callback still
         # rewrites the visible cells before the snapshot.
+        # NB: avoid characters illegal on Windows file systems (``<``,
+        # ``>``, ``:`` etc.) — the test runs on every OS.
         slug = name.lower().replace(" ", "-")
-        project_dir = path.parent / f"<{slug}>"
+        project_dir = path.parent / f"snap-{slug}"
         project_dir.mkdir(parents=True, exist_ok=True)
         store.upsert(
             RecentProject(

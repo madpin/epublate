@@ -122,6 +122,15 @@ ignore_missing_imports = true
 module = ["tiktoken.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+# epubcheck (optional extra) ships without py.typed and without stubs,
+# so mypy emits ``import-untyped`` when the extra is installed and
+# ``import-not-found`` when it isn't. Suppress both via the override
+# instead of inline ``# type: ignore`` comments that would only be
+# right in one of the two configurations.
+module = ["epubcheck.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]

@@ -109,6 +109,7 @@ def build_constraints(
                     type=ent.entry.type,
                     status=status,
                     notes=ent.entry.notes,
+                    gender=ent.entry.gender,
                 )
             )
     return out
@@ -151,6 +152,7 @@ def build_target_only_constraints(
                     status=status,
                     notes=ent.entry.notes,
                     target_aliases=target_aliases,
+                    gender=ent.entry.gender,
                 )
             )
     return out

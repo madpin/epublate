@@ -246,21 +246,37 @@ def upsert_proposed(
     """Insert a ``proposed`` entry if no row exists yet for this source term.
 
     Returns ``(entry_id, created)`` so the pipeline can decide whether
-    to emit an ``entity.proposed`` event (only on first sighting). If
-    an entry already exists for ``(source_term, type)`` we *backfill*
-    its ``target_term`` when the existing row still mirrors the source
-    term verbatim and the caller has supplied a real translation —
-    that's how the auto-proposer recovers from the cold-start case
-    where an entity was first proposed by the extractor (target unknown)
-    and only later observed in a real translation.
+    to emit an ``entity.proposed`` event (only on first sighting).
 
-    A non-empty ``target_term`` argument that *differs* from the
-    proposed row's source term is treated as a real translation.
-    Anything else (``None``, empty string, or equal to ``source_term``)
-    keeps the placeholder behaviour of the pre-Lore-Books rollout.
-    Existing rows that the curator has already edited (status no longer
-    ``proposed`` or ``target_term`` already differs from ``source_term``)
-    are never touched.
+    Dedup contract (refined alongside the per-segment glossary filter):
+
+    * Lookup is keyed by ``source_term`` *alone*, ignoring ``type``.
+      The auto-proposer used to dedup by ``(source_term, type)``, but
+      the helper LLM is unreliable about the type field, so the same
+      proper noun would land twice (once as ``term``, once as
+      ``place``) and confuse the validator. Auto-proposed entries are
+      now always merged onto the first row that claimed the source
+      term. Curator-created duplicates remain possible via
+      :func:`repo.create_glossary_entry` for the rare disambiguation
+      case where one source spelling really does map to two senses
+      with different targets.
+    * **Type upgrade.** When the existing row carries the generic
+      fallback type ``term`` and the incoming candidate has a more
+      specific type (``character``, ``place``, …), upgrade the row.
+      We treat ``term`` as "we didn't know yet" — a confident
+      ``character`` reading from a later pass should win. We never
+      *downgrade* a specific type, and we never overwrite a
+      curator-edited row (status no longer ``proposed``).
+    * **Target backfill.** If the existing row still mirrors the
+      source term verbatim and the caller supplied a real translation,
+      backfill the target so the lore bible records what the
+      translator actually used. Mirrors the pre-existing
+      ``Julius Caesar`` cold-start fix.
+
+    Anything else (``target_term`` ``None``, empty, or equal to
+    ``source_term``) keeps the placeholder behavior of the
+    pre-Lore-Books rollout. Existing rows that the curator has already
+    promoted/edited are never touched.
     """
 
     cleaned_target = (target_term or "").strip() or None
@@ -271,19 +287,28 @@ def upsert_proposed(
         engine,
         project_id=project_id,
         source_term=source_term,
-        type=type,
     )
     if existing is not None:
-        if (
+        # Auto-upgrade the type when the existing row was created by
+        # an earlier auto-propose pass that didn't know better.
+        upgrade_type = (
+            existing.status == "proposed" and existing.type == "term" and type != "term"
+        )
+        backfill_target = (
             cleaned_target is not None
             and existing.status == "proposed"
             and existing.target_term == existing.source_term
-        ):
+        )
+        if upgrade_type or backfill_target:
             repo.update_glossary_entry(
                 engine,
                 entry_id=existing.id,
-                target_term=cleaned_target,
-                reason="auto_propose:backfill_target",
+                target_term=cleaned_target if backfill_target else None,
+                type=type if upgrade_type else None,
+                reason=_upsert_reason(
+                    upgrade_type=upgrade_type,
+                    backfill_target=backfill_target,
+                ),
             )
         return existing.id, False
     entry = repo.create_glossary_entry(
@@ -297,6 +322,16 @@ def upsert_proposed(
         first_seen_segment_id=first_seen_segment_id,
     )
     return entry.id, True
+
+
+def _upsert_reason(*, upgrade_type: bool, backfill_target: bool) -> str:
+    """Stable reason strings for the revision audit trail."""
+
+    if upgrade_type and backfill_target:
+        return "auto_propose:upgrade_type+backfill_target"
+    if upgrade_type:
+        return "auto_propose:upgrade_type"
+    return "auto_propose:backfill_target"
 
 
 # ---------------------------------------------------------------------------

@@ -205,6 +205,156 @@ def test_delete_cascades_aliases(project_db: Engine) -> None:
     assert repo.list_aliases(project_db, entry.id) == []
 
 
+def test_find_duplicate_source_terms_groups_by_source(project_db: Engine) -> None:
+    """Surface every group of entries that share a source term.
+
+    Returned groups are sorted with the "most useful winner" first
+    (locked > confirmed > proposed; specific type before generic
+    ``term``) so the curator can accept the head as-is.
+    """
+
+    pid = _ensure_project(project_db)
+    repo.create_glossary_entry(
+        project_db,
+        project_id=pid,
+        source_term="House",
+        target_term="house",
+        type="term",
+        status="proposed",
+    )
+    repo.create_glossary_entry(
+        project_db,
+        project_id=pid,
+        source_term="House",
+        target_term="Câmara",
+        type="organization",
+        status="locked",
+    )
+    repo.create_glossary_entry(
+        project_db,
+        project_id=pid,
+        source_term="Lone",
+        target_term="Sozinho",
+        type="character",
+    )
+    groups = repo.find_duplicate_source_terms(project_db, pid)
+    assert len(groups) == 1
+    sources = [e.source_term for e in groups[0]]
+    types = [e.entry.type for e in groups[0]]
+    assert sources == ["House", "House"]
+    assert types[0] == "organization"
+    assert types[1] == "term"
+
+
+def test_find_duplicate_source_terms_skips_target_only(project_db: Engine) -> None:
+    """Target-only Lore Book entries (``source_term IS NULL``) are not duplicates."""
+
+    pid = _ensure_project(project_db)
+    repo.create_glossary_entry(
+        project_db,
+        project_id=pid,
+        source_term=None,
+        target_term="Geralt de Rívia",
+        type="character",
+        source_known=False,
+    )
+    repo.create_glossary_entry(
+        project_db,
+        project_id=pid,
+        source_term=None,
+        target_term="Yennefer de Vengerberg",
+        type="character",
+        source_known=False,
+    )
+    assert repo.find_duplicate_source_terms(project_db, pid) == []
+
+
+def test_merge_glossary_entries_folds_aliases_and_mentions(project_db: Engine) -> None:
+    """Merge keeps the winner intact and absorbs the losers' aliases + mentions.
+
+    After the merge, ``entity_mention`` rows that pointed at any
+    loser must now point at the winner so the audit trail is
+    preserved (glossary-invariants §5: "no silent merges"). A
+    ``glossary_revision`` row is appended on the winner so the
+    history surfaces in the Glossary detail pane.
+    """
+
+    pid = _ensure_project(project_db)
+    chap = repo.ChapterRow(
+        id="c1",
+        project_id=pid,
+        spine_idx=0,
+        href="c1.xhtml",
+        title="C1",
+        status="pending",
+    )
+    repo.bulk_insert_chapters(project_db, [chap])
+    seg = repo.SegmentRow(
+        id="s1",
+        chapter_id="c1",
+        idx=0,
+        source_text="House",
+        source_hash="0" * 64,
+    )
+    repo.bulk_insert_segments(project_db, [seg])
+
+    winner = repo.create_glossary_entry(
+        project_db,
+        project_id=pid,
+        source_term="House",
+        target_term="Câmara",
+        type="organization",
+        status="locked",
+        target_aliases=["Casa"],
+    )
+    loser = repo.create_glossary_entry(
+        project_db,
+        project_id=pid,
+        source_term="House",
+        target_term="house",
+        type="term",
+        status="proposed",
+        source_aliases=["the House"],
+    )
+    repo.record_mentions(
+        project_db,
+        segment_id="s1",
+        mentions=[(loser.id, 0, 5)],
+    )
+
+    removed = repo.merge_glossary_entries(
+        project_db,
+        winner_id=winner.id,
+        loser_ids=[loser.id],
+        reason="curator:merge",
+    )
+    assert removed == 1
+    assert repo.get_glossary_entry(project_db, loser.id) is None
+    refreshed = repo.get_glossary_entry(project_db, winner.id)
+    assert refreshed is not None
+    assert refreshed.target_term == "Câmara"
+    assert "the House" in refreshed.source_aliases
+    assert "house" in refreshed.target_aliases
+    # Mentions should now point at the winner so the segment's
+    # history isn't lost.
+    mentions = repo.list_mentions(project_db, entry_id=winner.id)
+    assert any(m.segment_id == "s1" for m in mentions)
+    revisions = repo.list_glossary_revisions(project_db, winner.id)
+    assert any(r.reason == "curator:merge" for r in revisions)
+
+
+def test_merge_glossary_entries_no_op_on_empty_losers(project_db: Engine) -> None:
+    pid = _ensure_project(project_db)
+    winner = repo.create_glossary_entry(
+        project_db,
+        project_id=pid,
+        source_term="A",
+        target_term="A",
+    )
+    merged = repo.merge_glossary_entries(project_db, winner_id=winner.id, loser_ids=[])
+    assert merged == 0
+
+
 def test_update_segment_status_does_not_touch_target(project_db: Engine) -> None:
     pid = _ensure_project(project_db)
     chap = repo.ChapterRow(

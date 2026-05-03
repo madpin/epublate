@@ -52,8 +52,13 @@ def test_default_projects_root_falls_back_to_xdg_data(
     data_home = tmp_path / "data"
     data_home.mkdir()
     monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
-    # Make Documents-home absent by pointing HOME at tmp_path.
-    monkeypatch.setenv("HOME", str(tmp_path))
+    # Point Path.home() at a directory that does NOT contain Documents
+    # so the resolver skips the Documents branch on every OS.
+    # Just setting HOME isn't enough on Windows (which reads USERPROFILE
+    # via pathlib internals), so monkeypatch the classmethod directly.
+    fake_home = tmp_path / "fake-home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
     empty_cfg = UIConfig()
     assert default_projects_root(ui_config=empty_cfg) == (data_home / "epublate")
 
@@ -132,7 +137,9 @@ def test_quick_locations_filters_missing_dirs(
     (fake_home / "Downloads").mkdir(parents=True)
     (fake_home / "Documents").mkdir()
     # Desktop deliberately omitted — quick_locations should drop it.
-    monkeypatch.setenv("HOME", str(fake_home))
+    # Monkeypatch Path.home() instead of just setting $HOME so the test
+    # works on Windows (where Path.home() reads USERPROFILE).
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
     locs = quick_locations(cwd=tmp_path)
     labels = [loc.label for loc in locs]
     assert "Current" in labels
@@ -148,7 +155,7 @@ def test_quick_locations_dedups_overlapping_paths(
     # If ``cwd == HOME`` we only emit one of them rather than both.
     fake_home = tmp_path / "home"
     fake_home.mkdir()
-    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
     locs = quick_locations(cwd=fake_home)
     seen = {loc.path for loc in locs}
     assert fake_home.resolve() in seen

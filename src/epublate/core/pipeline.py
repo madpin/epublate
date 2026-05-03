@@ -46,6 +46,7 @@ from epublate.glossary.enforcer import (
     has_locked_violation,
     validate_target,
 )
+from epublate.glossary.matcher import match_source
 from epublate.glossary.models import EntityType, GlossaryEntryWithAliases
 from epublate.llm.base import LLMProvider, ResponseFormat
 from epublate.llm.pricing import estimate_cost
@@ -203,16 +204,20 @@ def translate_segment(
 
     glossary_view = _load_glossary_view(engine, project_id=project_id)
     project_entries = glossary_view.entries
-    constraints = (
-        list(options.glossary)
-        if options.glossary is not None
-        else build_constraints(project_entries)
-    )
-    target_only_constraints = (
-        []
-        if options.glossary is not None
-        else build_target_only_constraints(project_entries)
-    )
+    if options.glossary is not None:
+        constraints = list(options.glossary)
+        target_only_constraints: list[TargetOnlyConstraint] = []
+    else:
+        relevant_entries = _entries_relevant_to_text(
+            segment.source_text, project_entries
+        )
+        constraints = build_constraints(relevant_entries)
+        target_only_constraints = build_target_only_constraints(project_entries)
+    # The cache key folds the *full* project glossary (PRD F-LLM-6 / the
+    # cascade flow). The per-segment prompt only ships the relevant
+    # subset — see ``_entries_relevant_to_text`` — but a curator edit
+    # anywhere in the lore bible must still invalidate cached
+    # translations downstream of the cascade.
     g_hash = glossary_hash(project_entries)
 
     messages = build_translator_messages(
@@ -754,6 +759,35 @@ def _load_glossary(engine: Any, *, project_id: str) -> list[GlossaryEntryWithAli
     return list(repo.list_glossary_entries(engine, project_id))
 
 
+def _entries_relevant_to_text(
+    text: str,
+    entries: Sequence[GlossaryEntryWithAliases],
+) -> list[GlossaryEntryWithAliases]:
+    """Filter ``entries`` to those whose source term actually occurs in ``text``.
+
+    The pipeline used to ship the *whole* project glossary as
+    constraints to every segment, which (a) drowned locked entries in
+    noise as the lore bible grew and (b) over-applied common-noun
+    entries: "House → Câmara" would be enforced on segments where
+    "house" is just a building, even though the matcher would have
+    skipped them. By filtering to entries the matcher actually hits in
+    this segment, the LLM only sees relevant constraints and the
+    validator only fires on entries that were actually in scope.
+
+    Order is preserved from ``entries`` so cache keys are stable.
+    Target-only entries (``source_term is None``) are excluded — they
+    have no source-side regex to match on. Callers that need them
+    keep using :func:`build_target_only_constraints` over the full
+    project entries.
+    """
+
+    if not entries:
+        return []
+    matches = match_source(text, entries)
+    matched_ids = {m.entry_id for m in matches}
+    return [e for e in entries if e.id in matched_ids]
+
+
 @dataclass(slots=True)
 class _GlossaryView:
     """Bundle of glossary state used by one translate call.
@@ -1115,15 +1149,9 @@ def translate_segments_grouped(
 
     glossary_view = _load_glossary_view(engine, project_id=project_id)
     project_entries = glossary_view.entries
-    constraints = (
-        list(options.glossary)
-        if options.glossary is not None
-        else build_constraints(project_entries)
-    )
-    target_only_constraints = (
-        []
-        if options.glossary is not None
-        else build_target_only_constraints(project_entries)
+    explicit_constraints = options.glossary is not None
+    fallback_target_only_constraints = (
+        [] if explicit_constraints else build_target_only_constraints(project_entries)
     )
     g_hash = glossary_hash(project_entries)
 
@@ -1134,7 +1162,9 @@ def translate_segments_grouped(
 
     # Pass 1 — try the cache per segment (exactly like translate_segment
     # would) so any previously translated item short-circuits without
-    # paying for the whole group call.
+    # paying for the whole group call. Each segment gets its own
+    # constraint subset so cache keys match what
+    # :func:`translate_segment` would compute for the same input.
     for idx, seg in enumerate(segments):
         if not is_group_eligible(seg):
             outcomes[idx] = translate_segment(
@@ -1149,13 +1179,21 @@ def translate_segments_grouped(
             )
             continue
 
+        if explicit_constraints:
+            seg_constraints = list(options.glossary or ())
+            seg_target_only: list[TargetOnlyConstraint] = []
+        else:
+            seg_relevant = _entries_relevant_to_text(seg.source_text, project_entries)
+            seg_constraints = build_constraints(seg_relevant)
+            seg_target_only = fallback_target_only_constraints
+
         messages = build_translator_messages(
             source_lang=source_lang,
             target_lang=target_lang,
             source_text=seg.source_text,
             style_guide=style_guide,
-            glossary=constraints,
-            target_only_glossary=target_only_constraints,
+            glossary=seg_constraints,
+            target_only_glossary=seg_target_only,
         )
         key = cache_key_for_messages(
             model=options.model, messages=messages, glossary_hash=g_hash
@@ -1200,17 +1238,31 @@ def translate_segments_grouped(
         glossary_view.close()
         return [o for o in outcomes if o is not None]
 
-    # Pass 2 — one LLM call for the surviving misses.
+    # Pass 2 — one LLM call for the surviving misses. The batch's
+    # system prompt ships the union of every relevant entry across the
+    # surviving items so each item still sees the constraints it needs
+    # without re-introducing irrelevant entries from elsewhere in the
+    # project. The cache key for each item was computed in pass 1 from
+    # its *own* relevant subset; pass 2's union doesn't enter the cache
+    # key — it only governs what the batched LLM call actually sees.
     source_items: list[tuple[int, str]] = [
         (idx, seg.source_text) for idx, seg in enumerate(group_segments)
     ]
+    if explicit_constraints:
+        group_constraints = list(options.glossary or ())
+        group_target_only: list[TargetOnlyConstraint] = []
+    else:
+        union_text = "\n\n".join(seg.source_text for seg in group_segments)
+        union_relevant = _entries_relevant_to_text(union_text, project_entries)
+        group_constraints = build_constraints(union_relevant)
+        group_target_only = fallback_target_only_constraints
     group_messages = build_group_translator_messages(
         source_lang=source_lang,
         target_lang=target_lang,
         source_items=source_items,
         style_guide=style_guide,
-        glossary=constraints,
-        target_only_glossary=target_only_constraints,
+        glossary=group_constraints,
+        target_only_glossary=group_target_only,
     )
     request_payload = {
         "model": options.model,

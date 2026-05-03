@@ -174,7 +174,13 @@ For each segment, the pipeline runs these phases:
    source), chapter title, book title, project style guide.
 2. **Resolve entities.** Match the segment against the glossary (exact
    + alias + optional fuzzy/embedding match). Build a constrained
-   "must-use" map: `source_term → required_target_term`.
+   "must-use" map: `source_term → required_target_term`. Only entries
+   whose source term actually hits in this segment (with word-boundary
+   matching) are rendered into the LLM's system prompt — passing the
+   whole project glossary every time bloats prompts and over-applies
+   common-noun mappings (e.g. enforcing `House → Câmara` on plain
+   `house` in unrelated prose). Target-only entries (F-LB-9) and
+   gender markers (F-LB-2) ride alongside.
 3. **Detect new entities (optional pre-pass).** A cheap LLM or NER
    model proposes candidate proper nouns missing from the glossary.
    Candidates are queued for curator review **before** translation
@@ -1033,16 +1039,26 @@ explicitly and given a short failure-handling instruction.
    nickname, do we lock the nickname separately or as an alias of the
    canonical entry? Proposal: alias by default, promotable to its own
    entry.
-2. **Gendered/pronoun policy** in target languages with grammatical
-   gender. Proposal: store `gender` on character entries and pass it as
-   a constraint; surface a curator prompt the first time a character
-   appears.
-3. **Title / front-matter / TOC translation.** Translate by default but
+2. **Title / front-matter / TOC translation.** Translate by default but
    make it opt-out per item.
-4. **License and distribution model.** Already MIT per repo; confirm
+3. **License and distribution model.** Already MIT per repo; confirm
    we're happy distributing on PyPI as MIT.
 
 ### Resolved
+
+- ~~**Gendered/pronoun policy** in target languages with grammatical
+  gender.~~ Resolved: ``gender`` lives on every glossary entry
+  (``GenderTag``: ``feminine`` / ``masculine`` / ``neuter`` /
+  ``common`` / ``unspecified``). The translator system prompt
+  surfaces it inline next to the target term —
+  ``[organization] House → Câmara (gender: feminine)`` — and a hard
+  rule asks the model to match articles, demonstratives, possessives,
+  adjectives, participles, and any preposition contractions to that
+  gender. When the source uses a glossary term with an article, the
+  translation must keep the article and inflect it correctly. Curator
+  prompting on first appearance is post-v1; the auto-extractor's
+  best-effort target spelling and the inline gender marker cover the
+  common case.
 
 - ~~**Multi-book projects** (a series sharing a glossary).~~ Resolved:
   shipped as **Lore Books** (PRD F-LB-10). Rather than turning

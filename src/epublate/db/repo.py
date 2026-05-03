@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -1197,6 +1197,215 @@ def delete_glossary_entry(engine_or_conn: Engine | Connection, entry_id: str) ->
         )
 
 
+def find_duplicate_source_terms(
+    engine_or_conn: Engine | Connection,
+    project_id: str,
+) -> list[list[GlossaryEntryWithAliases]]:
+    """Return every group of entries that share a non-empty source term.
+
+    The auto-proposer used to dedup by ``(source_term, type)`` which let
+    the same proper noun appear with multiple types (the curator's
+    "House → Câmara" / "House → Casa" issue). We've since switched
+    auto-propose to dedupe on source term alone; this helper surfaces
+    the historical duplicates so the curator can merge them via the
+    Glossary screen.
+
+    Returns one list per duplicate group. Each group is sorted with the
+    "most useful winner" first (locked > confirmed > proposed; specific
+    type before generic ``term``; older row before newer) so a
+    no-decision curator can accept the head as the keeper. Target-only
+    entries (``source_term IS NULL``) are excluded — they have no
+    source key to dedupe on.
+    """
+
+    entries = list_glossary_entries(engine_or_conn, project_id)
+    by_source: dict[str, list[GlossaryEntryWithAliases]] = {}
+    for ent in entries:
+        if not ent.source_term:
+            continue
+        by_source.setdefault(ent.source_term, []).append(ent)
+
+    status_rank = {"locked": 0, "confirmed": 1, "proposed": 2}
+
+    def _rank(e: GlossaryEntryWithAliases) -> tuple[int, int, int]:
+        return (
+            status_rank.get(e.status, 99),
+            0 if e.entry.type != "term" else 1,
+            e.entry.created_at,
+        )
+
+    return [sorted(group, key=_rank) for group in by_source.values() if len(group) > 1]
+
+
+def merge_glossary_entries(
+    engine_or_conn: Engine | Connection,
+    *,
+    winner_id: str,
+    loser_ids: Sequence[str],
+    reason: str | None = None,
+) -> int:
+    """Fold ``loser_ids`` into ``winner_id`` and delete the losers.
+
+    Mechanics:
+
+    * Each loser's canonical source term that differs from the
+      winner's is added as a source-side alias on the winner. Each
+      loser's existing source aliases come along too. Same for target
+      aliases (against the winner's canonical target term).
+    * ``entity_mention`` rows pointing at the loser are re-pointed to
+      the winner so the lore bible's audit trail is preserved.
+    * Loser rows are deleted; cascading FKs sweep the remaining
+      ``glossary_alias`` / ``glossary_revision`` rows.
+    * A ``glossary_revision`` row is appended to the winner with the
+      provided ``reason`` (defaults to ``merge``). Returns the count of
+      losers actually removed.
+
+    Runs in a single transaction so a crash never leaves a half-merged
+    glossary (db-and-persistence rule §2 / glossary-invariants §5).
+    """
+
+    if not loser_ids:
+        return 0
+
+    with _begin(engine_or_conn) as conn:
+        winner_row = (
+            conn.execute(
+                select(schema.glossary_entry).where(
+                    schema.glossary_entry.c.id == winner_id
+                )
+            )
+            .mappings()
+            .first()
+        )
+        if winner_row is None:
+            raise ValueError(f"glossary entry not found: {winner_id}")
+        winner_source = (
+            str(winner_row["source_term"])
+            if winner_row["source_term"] is not None
+            else None
+        )
+        winner_target = str(winner_row["target_term"])
+
+        existing_alias_rows = (
+            conn.execute(
+                select(schema.glossary_alias).where(
+                    schema.glossary_alias.c.entry_id == winner_id
+                )
+            )
+            .mappings()
+            .all()
+        )
+        existing_src: set[str] = {
+            str(r["text"]) for r in existing_alias_rows if r["side"] == "source"
+        }
+        existing_tgt: set[str] = {
+            str(r["text"]) for r in existing_alias_rows if r["side"] == "target"
+        }
+
+        added = 0
+        for lid in loser_ids:
+            if lid == winner_id:
+                continue
+            loser_row = (
+                conn.execute(
+                    select(schema.glossary_entry).where(
+                        schema.glossary_entry.c.id == lid
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            if loser_row is None:
+                continue
+            new_aliases: list[dict[str, Any]] = []
+            loser_source = (
+                str(loser_row["source_term"])
+                if loser_row["source_term"] is not None
+                else None
+            )
+            loser_target = str(loser_row["target_term"])
+            if (
+                loser_source
+                and loser_source != winner_source
+                and loser_source not in existing_src
+            ):
+                existing_src.add(loser_source)
+                new_aliases.append(
+                    {
+                        "id": _new_id(),
+                        "entry_id": winner_id,
+                        "side": "source",
+                        "text": loser_source,
+                    }
+                )
+            if (
+                loser_target
+                and loser_target != winner_target
+                and loser_target not in existing_tgt
+            ):
+                existing_tgt.add(loser_target)
+                new_aliases.append(
+                    {
+                        "id": _new_id(),
+                        "entry_id": winner_id,
+                        "side": "target",
+                        "text": loser_target,
+                    }
+                )
+            for alias_row in conn.execute(
+                select(schema.glossary_alias).where(
+                    schema.glossary_alias.c.entry_id == lid
+                )
+            ).mappings():
+                side = str(alias_row["side"])
+                text = str(alias_row["text"])
+                if side == "source":
+                    if text in existing_src or text == winner_source:
+                        continue
+                    existing_src.add(text)
+                else:
+                    if text in existing_tgt or text == winner_target:
+                        continue
+                    existing_tgt.add(text)
+                new_aliases.append(
+                    {
+                        "id": _new_id(),
+                        "entry_id": winner_id,
+                        "side": side,
+                        "text": text,
+                    }
+                )
+            if new_aliases:
+                conn.execute(insert(schema.glossary_alias), new_aliases)
+            conn.execute(
+                update(schema.entity_mention)
+                .where(schema.entity_mention.c.entry_id == lid)
+                .values(entry_id=winner_id)
+            )
+            conn.execute(
+                delete(schema.glossary_entry).where(schema.glossary_entry.c.id == lid)
+            )
+            added += 1
+
+        if added:
+            conn.execute(
+                insert(schema.glossary_revision).values(
+                    id=_new_id(),
+                    entry_id=winner_id,
+                    prev_target_term=winner_target,
+                    new_target_term=winner_target,
+                    reason=reason or "merge",
+                    created_at=_now_unix(),
+                )
+            )
+            conn.execute(
+                update(schema.glossary_entry)
+                .where(schema.glossary_entry.c.id == winner_id)
+                .values(updated_at=_now_unix())
+            )
+        return added
+
+
 def set_aliases(
     engine_or_conn: Engine | Connection,
     *,
@@ -1719,6 +1928,7 @@ __all__ = [
     "create_glossary_entry",
     "create_project",
     "delete_glossary_entry",
+    "find_duplicate_source_terms",
     "find_glossary_entry_by_source_term",
     "find_llm_call_by_cache_key",
     "get_glossary_entry",
@@ -1737,6 +1947,7 @@ __all__ = [
     "list_segments",
     "list_segments_by_status",
     "list_segments_for_project",
+    "merge_glossary_entries",
     "record_mentions",
     "segment_row_from",
     "segment_row_to",

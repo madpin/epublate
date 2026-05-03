@@ -9,7 +9,7 @@ from epublate.glossary.enforcer import (
     has_locked_violation,
     validate_target,
 )
-from epublate.glossary.models import GlossaryEntry, GlossaryEntryWithAliases
+from epublate.glossary.models import GenderTag, GlossaryEntry, GlossaryEntryWithAliases
 
 
 def _entry(
@@ -22,6 +22,7 @@ def _entry(
     eid: str = "e1",
     notes: str | None = None,
     source_known: bool | None = None,
+    gender: GenderTag | None = None,
 ) -> GlossaryEntryWithAliases:
     return GlossaryEntryWithAliases(
         entry=GlossaryEntry(
@@ -32,6 +33,7 @@ def _entry(
             target_term=target,
             status=status,  # type: ignore[arg-type]
             notes=notes,
+            gender=gender,
             source_known=source is not None if source_known is None else source_known,
         ),
         source_aliases=src_aliases or [],
@@ -227,3 +229,33 @@ def test_glossary_hash_changes_with_source_known_flag() -> None:
     a = [_entry("Élise", "Elisa", eid="a", source_known=True)]
     b = [_entry("Élise", "Elisa", eid="a", source_known=False)]
     assert glossary_hash(a) != glossary_hash(b)
+
+
+def test_build_constraints_threads_gender_through() -> None:
+    """The gender hint must travel into the prompt projection.
+
+    The translator prompt now renders a ``(gender: …)`` marker so the
+    LLM can match articles and agreement (PRD §4.3 / glossary
+    invariants §6). The enforcer is the layer responsible for
+    forwarding the entry's gender into the prompt-shape constraint.
+    """
+
+    entries = [_entry("Câmara", "Câmara", status="locked", gender="feminine")]
+    out = build_constraints(entries)
+    assert len(out) == 1
+    assert out[0].gender == "feminine"
+
+
+def test_build_target_only_constraints_threads_gender_through() -> None:
+    entries = [
+        _entry(
+            None,
+            "Câmara dos Lordes",
+            status="locked",
+            gender="feminine",
+            source_known=False,
+        ),
+    ]
+    out = build_target_only_constraints(entries)
+    assert len(out) == 1
+    assert out[0].gender == "feminine"

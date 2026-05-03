@@ -30,6 +30,16 @@ from epublate.errors import LLMResponseError
 from epublate.llm.base import Message
 
 GlossaryStatus = Literal["proposed", "confirmed", "locked"]
+GenderTag = Literal["feminine", "masculine", "neuter", "common", "unspecified"]
+"""Mirror of :data:`epublate.glossary.models.GenderTag`.
+
+Re-declared here to keep the prompt module free of cross-package
+imports (`translator.py` is intentionally above `glossary/` in the
+dependency graph). When the glossary projects an entry into a
+:class:`GlossaryConstraint`, gender is pinned through verbatim so the
+prompt can ask the LLM to match articles and agreement to it (e.g.
+"a Câmara dos Lordes" / "do Senhor da Casa", not "o Câmara").
+"""
 
 
 class GlossaryConstraint(BaseModel):
@@ -37,6 +47,11 @@ class GlossaryConstraint(BaseModel):
 
     Kept independent of :mod:`epublate.glossary.models` (which arrives in
     M3) so M2 can produce empty lists without circular imports.
+
+    ``gender`` is surfaced inline next to the term so the LLM can
+    match articles and agreement (PRD §4.3 / glossary-invariants
+    rule §6) — gendered target languages need this for natural-sounding
+    phrases like "a Câmara dos Lordes" rather than "o Câmara".
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -46,6 +61,7 @@ class GlossaryConstraint(BaseModel):
     type: str = "term"
     status: GlossaryStatus = "confirmed"
     notes: str | None = None
+    gender: GenderTag | None = None
 
 
 class TargetOnlyConstraint(BaseModel):
@@ -57,6 +73,10 @@ class TargetOnlyConstraint(BaseModel):
     target form when it maps. Soft-locked: a missed match is a warning,
     not a hard failure (validator-side enforcement lives in
     :func:`epublate.glossary.enforcer.validate_target`).
+
+    Like :class:`GlossaryConstraint`, ``gender`` flows through to the
+    prompt so the LLM picks the right article / agreement when the
+    canonical target form has a grammatical gender.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -66,6 +86,7 @@ class TargetOnlyConstraint(BaseModel):
     status: GlossaryStatus = "confirmed"
     notes: str | None = None
     target_aliases: tuple[str, ...] = ()
+    gender: GenderTag | None = None
 
 
 class TranslatorTrace(BaseModel):
@@ -132,6 +153,21 @@ Hard rules — these are not negotiable:
    the book. The glossary below lists agreed translations.
 4. Locked glossary entries are non-negotiable. Confirmed entries are
    strong defaults. Proposed entries are suggestions.
+5. Apply a glossary entry only when the source term is used in the
+   same sense as the entry. Some entries map a common noun to a
+   specialized translation (e.g. ``House`` → ``Câmara`` for a
+   parliamentary chamber) — when the source uses the same word in an
+   ordinary, unrelated sense (a building, a family, …), translate
+   it idiomatically and ignore the entry. The notes column on each
+   entry, when present, hints at the intended sense.
+6. When a glossary entry carries a ``(gender: …)`` marker the
+   canonical target term has that grammatical gender. Surrounding
+   articles, demonstratives, possessives, adjectives, and past
+   participles MUST agree with that gender, including any preposition
+   contractions (e.g. ``a Câmara`` / ``da Câmara`` for feminine,
+   ``o Senhor`` / ``do Senhor`` for masculine).
+   When the source uses an article with a glossary term, your
+   translation MUST keep the article and inflect it correctly.
 
 {style_guide_block}{glossary_block}{target_only_block}\
 Respond with a single JSON object and nothing else:
@@ -181,7 +217,19 @@ Hard rules — these are not negotiable:
    the glossary below. Locked glossary entries are non-negotiable,
    confirmed entries are strong defaults, proposed entries are
    suggestions.
-5. Inline formatting in each item's source is encoded as opaque
+5. Apply a glossary entry only when the source term is used in the
+   same sense as the entry. When the source uses the same word in an
+   ordinary, unrelated sense, translate it idiomatically and ignore
+   the entry. The notes column on each entry, when present, hints at
+   the intended sense.
+6. When a glossary entry carries a ``(gender: …)`` marker the
+   canonical target term has that grammatical gender. Surrounding
+   articles, demonstratives, possessives, adjectives, and past
+   participles MUST agree with that gender, including any preposition
+   contractions. When the source uses an article with a glossary
+   term, your translation MUST keep the article and inflect it
+   correctly.
+7. Inline formatting in each item's source is encoded as opaque
    placeholders of the form ``[[T0]]``, ``[[/T0]]``, ``[[T1]]``, etc.
    For each item, every placeholder that appears in that item's
    source MUST appear exactly once in that item's target, in the same
@@ -279,9 +327,15 @@ def _format_glossary_block(glossary: Sequence[GlossaryConstraint]) -> str:
             continue
         lines.append(f"  {status} entries (must use the canonical target term):")
         for entry in bucket:
+            gender_marker = (
+                f" (gender: {entry.gender})"
+                if entry.gender and entry.gender != "unspecified"
+                else ""
+            )
             note = f" — {entry.notes}" if entry.notes else ""
             lines.append(
-                f"    - [{entry.type}] {entry.source_term} → {entry.target_term}{note}"
+                f"    - [{entry.type}] {entry.source_term} → "
+                f"{entry.target_term}{gender_marker}{note}"
             )
     lines.append("")
     return "\n".join(lines) + "\n"
@@ -327,8 +381,16 @@ def _format_target_only_block(
                 if entry.target_aliases
                 else ""
             )
+            gender_marker = (
+                f" (gender: {entry.gender})"
+                if entry.gender and entry.gender != "unspecified"
+                else ""
+            )
             note = f" — {entry.notes}" if entry.notes else ""
-            lines.append(f"    - [{entry.type}] {entry.target_term}{aliases}{note}")
+            lines.append(
+                f"    - [{entry.type}] {entry.target_term}"
+                f"{gender_marker}{aliases}{note}"
+            )
     if not has_any:
         return ""
     lines.append("")

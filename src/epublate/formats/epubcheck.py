@@ -123,7 +123,7 @@ def is_available() -> bool:
     """``True`` iff the ``epubcheck`` extra and a JRE are both reachable."""
 
     try:
-        import epubcheck  # type: ignore[import-not-found]  # noqa: F401
+        import epubcheck  # noqa: F401
     except ImportError:
         return False
     return _java_available()
