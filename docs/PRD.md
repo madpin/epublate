@@ -410,8 +410,13 @@ Top-level screens:
   failures, low-confidence translations, budget alerts.
 - **Settings.** LLM provider, models, prices, prompt templates, style
   guide, output formatting.
-- **Logs.** Tail of the event stream + LLM call log with full
-  prompts/responses (collapsible).
+- **Logs.** Unified tail of three streams (`app/screens/logs.py`):
+  the project ``event`` table, the in-process Python ring-buffer
+  (`app/log_buffer.RingBufferHandler`), and the ``llm_call`` table.
+  Source / level / time / substring filters; row highlight expands
+  the full payload (event JSON, log traceback, ``llm_call`` request
+  + response). Bound to lowercase ``l`` from the Dashboard
+  (uppercase ``L`` keeps the cost-focused LLM-activity view).
 
 UX requirements:
 
@@ -1053,6 +1058,34 @@ explicitly and given a short failure-handling instruction.
   the curator hits Create. Toggle persists in `UIConfig.auto_tone_sniff`
   (default on); `EPUBLATE_AUTO_TONE_SNIFF` overrides at runtime;
   Settings screen binds `A` to flip + persist the toggle (F-STYLE-4).
+
+### M8 — Observability & UX polish — landed
+
+- [x] **Logs screen** (`app/screens/logs.py`) merging events, the
+  in-memory Python `RingBufferHandler` (`app/log_buffer.py`), and
+  ``llm_call`` rows; source/level/time/substring filters; row
+  detail pane; lowercase `l` from the Dashboard. Resolves the
+  §4.6 "Logs" line that was specced in M0 but never built.
+- [x] **App-wide toast notifications** (`app.notify`) for batch
+  failures, pauses, cancellations, completed-with-flags, and
+  Reader pipeline failures so errors are visible regardless of
+  the focused screen.
+- [x] **Batch progress always re-attaches.** `DashboardScreen`
+  re-binds itself to the App-level batch listener on `on_mount`
+  when `EpublateApp.batch_progress.active` is true for the
+  current project; `BatchStatusBar` polished (solid backgrounds,
+  `▶ BATCH` ribbon prefix) and mounted on every screen.
+- [x] **Modal submit unification.** Every form modal accepts
+  ``Enter`` *and* ``Ctrl+S``; `EditTargetScreen` documented as
+  the only ``Ctrl+S``-only exception. New rule
+  `.cursor/rules/tui-keybindings.mdc` codifies the convention.
+- [x] **Glossary quality.** Tighter extractor prompts + parser
+  caps (10 words / 100 chars / no full sentences / no
+  unbalanced parens), canonical-form dedup in `upsert_proposed`
+  (`glossary/dedup.py:canonical_form`), and a unified
+  "Cleanup dupes" flow on the Glossary screen wired through the
+  existing `MergeDuplicatesScreen` for curator-confirmed merges
+  (`glossary/dedup.py:find_near_duplicates`).
 
 ### Post-v1
 

@@ -1,0 +1,115 @@
+---
+description: TUI keybinding conventions — consistent navigation, submit, and Refresh semantics across screens
+globs: src/epublate/app/screens/**/*.py,src/epublate/app/widgets/**/*.py
+alwaysApply: false
+---
+
+# TUI keybinding conventions
+
+Curators move through epublate fast — flagged segment in the Inbox,
+Reader to fix it, back to Glossary to lock the entry, Dashboard to
+re-batch. Every keystroke that means "the same thing on a different
+screen" must use the same key. Inconsistencies (Enter submits here
+but not there; `r` refreshes here but retries there) burn 5 seconds
+of cognitive load each — fast enough to ruin the workflow. These
+rules codify what's been observed to work and what's been seen to
+break.
+
+## View screens (Dashboard, Inbox, Glossary, LLM Activity, Logs, Lore Books, …)
+
+Read-only or list-style surfaces where the curator scans, picks, and
+opens detail screens.
+
+| Key      | Action  | Notes                                              |
+| -------- | ------- | -------------------------------------------------- |
+| `Enter`  | Open selected row / primary action | Routes via `DataTable.RowSelected` when applicable |
+| `r`      | Refresh | Re-poll the DB and repaint                         |
+| `f`      | Cycle filter | When the screen has a stream of mixed kinds   |
+| `q`      | Back    | Pop screen                                         |
+| `Esc`    | Back    | Mirror of `q`, hidden from footer to keep it short |
+| `?` / `F1` | Help  | App-level binding, always available                |
+| `T`      | Cycle theme | App-level binding                              |
+
+## Form modals (`BatchModal`, `BudgetModal`, `IntakeModal`, `EntryEditScreen`, `LoreIngestModal`, `NewProjectModal`, `OpenProjectModal`, `ExportModal`, `LoreImportProjectModal`, `NewLoreBookModal`, `OpenLoreBookModal`, …)
+
+Editable forms with one or more `Input` / `Select` widgets. The
+curator should be able to:
+
+| Key       | Action |
+| --------- | ------ |
+| `Enter`   | Submit (works from any single-line `Input`) |
+| `Ctrl+S`  | Submit (works anywhere, including `TextArea`) |
+| `Esc`     | Cancel and dismiss with `None` |
+
+Implementation contract for every form modal:
+
+1. Bind `ctrl+s` to `action_submit` (or `action_save`).
+2. Bind `escape` to `action_cancel`.
+3. Override `on_input_submitted(self, event: Input.Submitted)` to
+   call `self.action_submit()` (or `action_save`). This is the
+   piece that's been missing on multiple modals — when the curator
+   types a value and hits Enter, nothing happens and they have to
+   reach for Ctrl+S.
+4. The footer hint string must read `"Press Enter or Ctrl+S to
+   <verb>, Esc to cancel."` so the convention is discoverable
+   in-modal.
+
+```python
+# ✅ GOOD — every form modal carries this pair
+def on_input_submitted(self, event: Input.Submitted) -> None:
+    del event
+    self.action_submit()
+
+def action_submit(self) -> None:
+    ...
+```
+
+```python
+# ❌ BAD — only Ctrl+S works; Enter on the Input does nothing
+def action_submit(self) -> None:
+    ...
+```
+
+## Yes/No confirm modals (`CascadeConfirmScreen`, `MergeDuplicatesScreen`, `DeleteConfirmScreen`, `RemoveRecentConfirmModal`, `LoreConflictResolveModal`, …)
+
+| Key   | Action |
+| ----- | ------ |
+| `y`   | Confirm |
+| `n`   | Cancel |
+| `Esc` | Cancel |
+
+Don't add `Enter` on these — they have no input field and no
+unambiguous "primary action" to submit. The two-letter `y`/`n`
+discipline is what makes them safe.
+
+## Editor screens (Reader, `EditTargetScreen`)
+
+The Reader and the in-segment edit modal are deliberate exceptions.
+
+| Key       | Reader meaning | Notes |
+| --------- | -------------- | ----- |
+| `r`       | **Retry** (re-translate current segment) | Conflicts with view `r` = Refresh; Reader is an editor, not a view |
+| `t`       | Translate next | |
+| `b`       | Translate chapter | |
+| `a` / `A` | Accept / Approve chapter | |
+| `e`       | Edit (push `EditTargetScreen`) | |
+| arrows    | Move segment / chapter focus | |
+| `Ctrl+S`  | (in `EditTargetScreen`) Save the target | `Enter` is content (multi-line); only `Ctrl+S` saves |
+| `Esc`     | Cancel / back | |
+
+The `r` conflict is explicit and intentional: the Reader has no
+"refresh from DB" semantics (it lives off the stats poller), and
+"retry the LLM call" is the most-used action there. Document this
+in code comments rather than remap.
+
+## Don't
+
+- Don't introduce a key that means a different verb on a different
+  screen unless it's documented as an editor exception above.
+- Don't add `Enter`-to-submit only on some form modals. Either every
+  form modal supports it, or none do. (The standard is "every".)
+- Don't bury submit/cancel hints — every form modal must show the
+  footer hint string. Curators don't memorize 12 modals' bindings.
+- Don't rely on screen order. The slim `BatchStatusBar` may be
+  docked between content and `Footer`; never assume the Footer is
+  the only bottom-docked widget on a screen.

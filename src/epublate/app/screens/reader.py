@@ -33,6 +33,7 @@ All long operations run in Textual workers so the UI never blocks
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
@@ -49,7 +50,7 @@ from textual.timer import Timer
 from textual.widgets import Button, Footer, Header, Label, Static, TextArea
 
 from epublate.app.preview import has_translatable_text, render_preview
-from epublate.app.widgets import BatchProgressMeter, BatchSnapshot
+from epublate.app.widgets import BatchProgressMeter, BatchSnapshot, BatchStatusBar
 from epublate.core.batch import (
     BatchOptions,
     BatchPaused,
@@ -71,6 +72,25 @@ from epublate.llm.factory import build_provider, resolve_helper_model
 
 if TYPE_CHECKING:
     from epublate.app.main import BatchProgress
+
+_logger = logging.getLogger(__name__)
+
+
+def _truncate_for_toast(text: str, *, max_chars: int = 100) -> str:
+    """Shorten an error message so the toast banner stays one line.
+
+    Long provider errors (rate-limit JSON, stack-trace fragments)
+    push the toast off the right edge of the terminal and the
+    curator loses everything past the first 80 columns. The full
+    message is always recoverable via the Logs screen and the
+    on-screen status line.
+    """
+
+    text = text.replace("\n", " ").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1] + "…"
+
 
 DEFAULT_MODEL = "gpt-5-mini"
 
@@ -551,6 +571,11 @@ class ReaderScreen(Screen[None]):
             with Vertical(id="reader-status-bar"):
                 yield Static("Ready.", id="reader-status", markup=True)
                 yield BatchProgressMeter(id="reader-batch-meter")
+        # Slim app-level batch banner. The richer ``reader-batch-meter``
+        # above renders the *Reader's own* chapter-batch worker; this
+        # one mirrors the App-level worker so a global batch started
+        # from the Dashboard is visible from the Reader too.
+        yield BatchStatusBar(id="reader-batch-status")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -1526,6 +1551,14 @@ class ReaderScreen(Screen[None]):
         if message.segment_id is not None:
             self._mark_translating(message.segment_id, False)
         self._set_status(f"Translation failed: {message.error}")
+        # Toast the failure too so it stays visible if the curator
+        # navigates away from the Reader (status line lives on this
+        # screen only). Truncated to keep the toast short — the full
+        # error stays on the status line and in the Logs screen.
+        self._notify_safe(
+            f"Translation failed: {_truncate_for_toast(message.error)}",
+            severity="error",
+        )
 
     # ----------------- chapter batch worker -----------------
 
@@ -1680,6 +1713,32 @@ class ReaderScreen(Screen[None]):
         self._set_status(
             f"Chapter batch failed for [b]{escape(chap_label)}[/b]: {message.error}"
         )
+        self._notify_safe(
+            f"Chapter batch failed: {_truncate_for_toast(message.error)}",
+            severity="error",
+            title=chap_label,
+        )
+
+    def _notify_safe(
+        self,
+        message: str,
+        *,
+        severity: str = "information",
+        title: str | None = None,
+    ) -> None:
+        """Wrap ``app.notify`` so headless tests / popped screens never crash.
+
+        ``Screen.notify`` raises if there's no active App or if the
+        screen is in the middle of being unmounted. The Reader posts
+        these toasts from worker threads via the message bus, which
+        means the screen could legitimately be gone by the time the
+        UI thread handles the message.
+        """
+
+        try:
+            self.notify(message, severity=severity, title=title or "")  # type: ignore[arg-type]
+        except Exception:
+            _logger.debug("notify failed (screen popped?)", exc_info=True)
 
     # ----------------- button wiring -----------------
 

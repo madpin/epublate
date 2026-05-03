@@ -49,7 +49,12 @@ from textual.widgets import (
 from epublate.app.branding import ICON_ARROW
 from epublate.app.config import UIConfig
 from epublate.app.messages import BatchFinished, BatchPrePassTick, BatchTick
-from epublate.app.widgets import BatchProgressMeter, BatchSnapshot, CostMeter
+from epublate.app.widgets import (
+    BatchProgressMeter,
+    BatchSnapshot,
+    BatchStatusBar,
+    CostMeter,
+)
 from epublate.core.batch import (
     BatchOptions,
 )
@@ -224,7 +229,8 @@ class BatchModal(ModalScreen[BatchRequest | None]):
                 yield Label("Helper pre-pass [y/n]:")
                 yield Input(value="y", id="batch-pre-pass")
             yield Static(
-                "Press [b]Ctrl+S[/b] to start, [b]Escape[/b] to cancel. "
+                "Press [b]Enter[/b] or [b]Ctrl+S[/b] to start, "
+                "[b]Escape[/b] to cancel. "
                 "Use [b]*[/b] for all chapters, [b]N[/b] for one, "
                 "[b]A-B[/b] for a 1-indexed range over translatable chapters. "
                 "Grouping batches short placeholder-free segments (TOCs, indices, "
@@ -305,6 +311,15 @@ class BatchModal(ModalScreen[BatchRequest | None]):
 
     def on_mount(self) -> None:
         self.query_one("#batch-chapters", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        # Pressing Enter on any text Input in the form submits the
+        # whole modal (TUI keybinding rule: form modals accept Enter
+        # as the equivalent of Ctrl+S). Without this the curator has
+        # to remember Ctrl+S for some modals (Batch / Budget / Intake)
+        # but not others (NewProject / Open / Export already had it).
+        del event
+        self.action_submit()
 
     def action_submit(self) -> None:
         chapters = self.query_one("#batch-chapters", Input).value.strip() or "*"
@@ -427,12 +442,16 @@ class BudgetModal(ModalScreen[BudgetRequest | None]):
                     id="budget-input",
                 )
             yield Static(
-                "Ctrl+S to save, Escape to cancel.",
+                "Enter or Ctrl+S to save, Escape to cancel.",
                 markup=False,
             )
 
     def on_mount(self) -> None:
         self.query_one("#budget-input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        del event
+        self.action_submit()
 
     def action_submit(self) -> None:
         raw = self.query_one("#budget-input", Input).value.strip()
@@ -524,7 +543,8 @@ class IntakeModal(ModalScreen[IntakeRequest | None]):
                     id="intake-max",
                 )
             yield Static(
-                "Press [b]Ctrl+S[/b] to start, [b]Escape[/b] to cancel. "
+                "Press [b]Enter[/b] or [b]Ctrl+S[/b] to start, "
+                "[b]Escape[/b] to cancel. "
                 "Helper LLM scans the first N segments and proposes "
                 "characters / places / terms.",
                 id="intake-help",
@@ -533,6 +553,10 @@ class IntakeModal(ModalScreen[IntakeRequest | None]):
 
     def on_mount(self) -> None:
         self.query_one("#intake-helper", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        del event
+        self.action_submit()
 
     def action_submit(self) -> None:
         helper = self.query_one("#intake-helper", Input).value.strip()
@@ -921,6 +945,12 @@ class DashboardScreen(Screen[None]):
         Binding("B", "set_budget", "Budget", show=True),
         Binding("e", "intake", "Intake", show=True),
         Binding("L", "open_llm_activity", "LLM activity", show=True),
+        # Lowercase ``l`` opens the unified Logs screen (events +
+        # Python logger + LLM call stream). Distinct from ``L`` so
+        # the curator can still get the deep-stats view; the Logs
+        # screen is the new "what just happened?" surface that PRD
+        # §11 was tracking as an open question.
+        Binding("l", "open_logs", "Logs", show=True),
         Binding("s", "open_settings", "Settings", show=True),
         Binding("r", "refresh", "Refresh", show=True),
         Binding("q", "app.pop_screen", "Back", show=True),
@@ -1184,6 +1214,12 @@ class DashboardScreen(Screen[None]):
                         markup=True,
                     )
             yield Static("Ready.", id="dashboard-status", markup=True)
+        # The slim status bar complements the rich panel above: it
+        # surfaces App-level batch state even when the running batch
+        # belongs to a *different* project than the one this Dashboard
+        # is showing (rich panel is project-scoped). Self-hides when
+        # no batch is active.
+        yield BatchStatusBar(id="dashboard-batch-status")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -1194,6 +1230,12 @@ class DashboardScreen(Screen[None]):
         if not llm_table.columns:
             llm_table.add_columns("Model", "Purpose", "Tokens", "Cost", "Cache")
         self._refresh_stats()
+        # Re-attach to a batch that was already running before this
+        # Dashboard mounted — the curator may have queued the batch,
+        # backed out to the Projects screen, and then reopened the
+        # same project. Without this, the rich progress panel stays
+        # hidden and the curator thinks the batch died.
+        self._reattach_to_running_batch()
         if self._auto_intake_on_first_mount:
             # Fire-and-forget: the IntakeModal owns its own dispatch.
             # Reset the flag immediately so a subsequent ``on_mount``
@@ -1207,6 +1249,87 @@ class DashboardScreen(Screen[None]):
                 intake_status = IntakeStatus(has_run=False)
             if not intake_status.has_run:
                 self.call_later(self.action_intake)
+
+    def on_unmount(self) -> None:
+        """Detach from the App-level batch listener slot when popped.
+
+        Without this, the App's worker keeps trying to deliver
+        ``BatchTick`` messages to a Screen that's been removed from
+        the DOM — the ``post_message`` call swallows the resulting
+        error but it's noise in the logs and prevents a future
+        Dashboard from receiving ticks until the next ``start_batch``
+        rebinds the slot. We only detach if we are the current
+        listener so popping a Dashboard that never owned the batch
+        doesn't accidentally drop another screen's subscription.
+        """
+
+        from epublate.app.main import EpublateApp
+
+        app = self.app
+        if not isinstance(app, EpublateApp):
+            return
+        # ``_batch_listener`` is private but checking identity is
+        # cheaper than introducing a public getter just for cleanup.
+        if getattr(app, "_batch_listener", None) is self:
+            app.attach_batch_listener(None)
+
+    def _reattach_to_running_batch(self) -> None:
+        """If the App is mid-batch for this project, restore the panel.
+
+        Three things have to happen for the curator's mental model to
+        match reality:
+
+        1. The rich :class:`BatchProgressMeter` panel becomes visible
+           with the *current* totals (not zeros).
+        2. We re-register as the App's batch listener so subsequent
+           per-segment ticks update the meter live.
+        3. ``self._batch_running`` flips to True so the Dashboard's
+           own internal guards (Cancel binding, double-dispatch
+           refusal) work correctly.
+
+        The cost meter is updated separately by ``_refresh_stats``
+        which runs first; here we only repaint the batch-specific
+        widgets.
+        """
+
+        from epublate.app.main import EpublateApp
+
+        app = self.app
+        if not isinstance(app, EpublateApp):
+            return
+        progress = app.batch_progress
+        if not progress.active or progress.project_id != self._project.project_id:
+            return
+        self._batch_running = True
+        app.attach_batch_listener(self)
+        self._show_batch_panel(
+            total=progress.total,
+            chapter_count=progress.chapter_count,
+        )
+        # Repaint the meter with whatever summary we have right now,
+        # so the curator sees real numbers instead of "0/N" until the
+        # next worker tick lands.
+        meter = self.query_one("#dashboard-batch-meter", BatchProgressMeter)
+        summary = progress.summary
+        if summary is None:
+            return
+        starting_spend = progress.starting_spend_usd
+        meter.update_snapshot(
+            BatchSnapshot(
+                attempted=summary.attempted,
+                total=max(progress.total, summary.attempted),
+                chapter_count=progress.chapter_count,
+                translated=summary.translated,
+                cached=summary.cached,
+                flagged=summary.flagged,
+                failed=summary.failed,
+                cost_usd=summary.cost_usd,
+                project_total_cost_usd=starting_spend + summary.cost_usd,
+                elapsed_s=summary.elapsed_s,
+                paused=progress.paused,
+                cancelling=progress.cancelling,
+            )
+        )
 
     # ------------- state helpers -------------
 
@@ -1622,6 +1745,14 @@ class DashboardScreen(Screen[None]):
         self.app.push_screen(
             LLMActivityScreen(self._project), self._on_child_screen_closed
         )
+
+    def action_open_logs(self) -> None:
+        # Lazy import keeps the LogsScreen out of the Dashboard's
+        # import path until the curator actually presses ``l`` —
+        # mirrors the LLM-activity / Settings flows above.
+        from epublate.app.screens.logs import LogsScreen
+
+        self.app.push_screen(LogsScreen(self._project), self._on_child_screen_closed)
 
     def action_open_settings(self) -> None:
         from epublate.app.screens.settings import SettingsScreen

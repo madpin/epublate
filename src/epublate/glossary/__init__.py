@@ -14,6 +14,7 @@ from epublate.glossary.cascade import (
     cascade_retranslate,
     compute_affected,
 )
+from epublate.glossary.dedup import canonical_form, find_near_duplicates
 from epublate.glossary.enforcer import (
     Violation,
     ViolationKind,
@@ -68,10 +69,12 @@ __all__ = [
     "ViolationSeverity",
     "analyze_pair",
     "build_constraints",
+    "canonical_form",
     "cascade_retranslate",
     "compute_affected",
     "find_doubled_particles",
     "find_mentions",
+    "find_near_duplicates",
     "find_target_doubled_particles",
     "glossary_hash",
     "has_flagging_violation",

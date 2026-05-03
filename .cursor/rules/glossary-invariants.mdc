@@ -34,9 +34,24 @@ strictness:
    preserved in history, never deleted.
 5. **No silent merges.** When the user merges two entries, both
    histories are preserved; the losing entry becomes an alias of the
-   winning one.
+   winning one. The "Cleanup duplicates" flow on the Glossary screen
+   surfaces near-duplicates via `glossary.dedup.find_near_duplicates`
+   (canonical-form bucketing + Levenshtein guard) and routes each
+   group through `MergeDuplicatesScreen` for curator confirmation.
+   The auto-proposer (`glossary.io.upsert_proposed`) deduplicates by
+   `glossary.dedup.canonical_form` *before* writing, folding
+   spelling variants in as `source_alias` rows on the existing
+   entry — never as a second `proposed` row.
 6. **Gender (if present)** is passed to the prompt as a constraint
    for gendered target languages. Never inferred silently per call.
+7. **Extractor caps are enforced at the parser, not the prompt.**
+   The helper LLM is best-effort; `_violates_extractor_caps` in
+   `llm/prompts/extractor.py` drops candidates that exceed 10
+   words / 100 characters, contain multiple sentence-final
+   punctuations, or have unbalanced parentheses. The same
+   predicate runs on `extractor_target.py`. Don't relax the caps
+   to make a noisy endpoint's output land — sharpen the prompt or
+   wait for the curator to add the entry by hand.
 
 ## Don't
 

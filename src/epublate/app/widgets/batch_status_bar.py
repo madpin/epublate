@@ -1,23 +1,30 @@
 """Compact persistent banner for the App-level batch worker.
 
-Mounted on every screen except the Dashboard (which has its full
-``BatchProgressMeter`` panel) and the Reader (which has a multi-line
-footer mirror). The bar reads
+Mounted on **every** Screen so the curator never loses sight of an
+in-flight batch — Dashboard, Reader, Inbox, Glossary, Settings, LLM
+Activity, Logs, Lore Books, etc. The bar reads
 :attr:`epublate.app.main.EpublateApp.batch_progress` on a 500 ms timer
 so it tracks the worker as it runs and self-hides as soon as the
-batch terminates. This is what keeps the curator anchored when they
-navigate to the Inbox / Glossary / Settings while a long batch runs:
-they always know whether the worker is still consuming budget without
-having to step back to the Dashboard.
+batch terminates. The Dashboard ALSO carries the rich
+:class:`BatchProgressMeter` panel for the project that owns the
+batch; the slim bar complements it for cross-project visibility (a
+batch on Project B is still visible from Project A's Dashboard).
 
 Single-line layout (with a wrap-around line for the cost details when
-the bar is too narrow), color-coded by state:
+the bar is too narrow), prefixed with a high-contrast ``BATCH ▶``
+ribbon and color-coded by state:
 
-* ``running``    — accent
+* ``running``    — accent (solid background)
 * ``cancelling`` — warning
 * ``paused``     — warning
 * ``cancelled``  — error
 * ``done``       — neutral
+
+The high-contrast prefix exists because curators reported missing the
+banner during long batches when the rest of the screen was busy
+(reading translations, triaging the inbox). The solid accent
+background makes the bar impossible to miss without crowding the
+screen.
 
 The bar is also fully ``aria``-friendly: it sets ``ARIA_LIVE`` so
 screen readers see status updates without yanking focus
@@ -45,6 +52,18 @@ def _state_label(progress: BatchProgress) -> tuple[str, str]:
     if progress.paused:
         return ("paused", "-paused")
     return ("running", "-active")
+
+
+_PREFIX = "▶ BATCH"
+"""High-contrast ribbon at the start of every line.
+
+The triangle plays a double role: it's the universal "play" /
+"running" glyph so screen readers and visual scans both register it
+as motion, and it gives the bar a recognizable left edge no matter
+how cramped the rest of the line gets. Reused verbatim across
+``running``, ``cancelling``, and ``paused`` states (the state label
+follows it, e.g. ``▶ BATCH  running  ·  …``).
+"""
 
 
 def _format_compact(progress: BatchProgress) -> str:
@@ -89,13 +108,18 @@ def _format_compact(progress: BatchProgress) -> str:
             f"{cost_strip}  ·  project total ${(starting_spend + cost_usd):.4f}"
         )
     return (
-        f"[b]{label}[/b]  ·  {attempted}/{total} ({pct:5.1f}%)"
+        f"[b]{_PREFIX}[/b]  [b]{label}[/b]  ·  {attempted}/{total} ({pct:5.1f}%)"
         f"{chapter_strip}{cost_strip}"
     )
 
 
 class BatchStatusBar(Static):
-    """Slim bottom-docked banner mirroring the App's batch state."""
+    """Slim bottom-docked banner mirroring the App's batch state.
+
+    Solid background colors (not the previous 20% wash) so the bar is
+    obvious even on busy screens. The bar still self-hides when no
+    batch is active — see :meth:`_hide`.
+    """
 
     DEFAULT_CSS = """
     BatchStatusBar {
@@ -109,18 +133,18 @@ class BatchStatusBar(Static):
     }
     BatchStatusBar.-active {
         display: block;
-        background: $accent 20%;
-        color: $accent;
+        background: $accent;
+        color: $background;
     }
     BatchStatusBar.-cancelling {
         display: block;
-        background: $warning 20%;
-        color: $warning;
+        background: $warning;
+        color: $background;
     }
     BatchStatusBar.-paused {
         display: block;
-        background: $warning 20%;
-        color: $warning;
+        background: $warning;
+        color: $background;
     }
     """
 

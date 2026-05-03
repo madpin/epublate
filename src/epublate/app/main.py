@@ -39,6 +39,7 @@ from textual.binding import Binding, BindingType
 from textual.screen import Screen
 
 from epublate.app.config import UIConfig
+from epublate.app.log_buffer import RingBufferHandler, install_ring_buffer
 from epublate.app.messages import BatchFinished, BatchPrePassTick, BatchTick
 from epublate.app.screens.help import HelpScreen
 from epublate.app.screens.projects import ProjectsScreen
@@ -157,6 +158,13 @@ class EpublateApp(App[None]):
         # dropped in that case (the BatchProgress slot stays
         # authoritative for any screen that re-attaches later).
         self._batch_listener: Screen[None] | None = None
+        # Ring-buffer handler that backs the Logs screen. Installed on
+        # the package-root ``epublate`` logger so every child logger
+        # (``epublate.core.batch``, ``epublate.llm.openai_compat`` …)
+        # propagates into it without further wiring. The handler is
+        # held on the App so a future "Clear logs" action / test
+        # cleanup can reach it.
+        self.log_buffer: RingBufferHandler = install_ring_buffer()
 
     def on_mount(self) -> None:
         self.register_theme(epublate_theme())
@@ -447,6 +455,53 @@ class EpublateApp(App[None]):
                 )
             except Exception:  # pragma: no cover — listener gone
                 _logger.debug("listener gone before BatchFinished delivered")
+        # App-level toast so the curator gets feedback even when the
+        # original Dashboard has been popped (the batch was started,
+        # the curator navigated away, then the worker hit a problem).
+        # The toast is non-blocking and auto-dismisses.
+        self._notify_batch_done(status=status, error=error, summary=summary)
+
+    def _notify_batch_done(
+        self,
+        *,
+        status: str,
+        error: str | None,
+        summary: BatchSummary | None,
+    ) -> None:
+        """Surface a transient toast when a batch terminates.
+
+        Routed through ``self.notify`` so it lands on whatever Screen
+        is focused — by design, errors that happen "while you're
+        looking somewhere else" should still be visible. We
+        deliberately stay quiet for ``completed`` runs that didn't
+        flag anything: a successful batch is the expected case and
+        the rich progress panel already showed the curator the
+        outcome.
+        """
+
+        try:
+            if status == "failed":
+                msg = "Batch failed"
+                if error:
+                    msg = f"{msg}: {error}"
+                self.notify(msg, severity="error", title="Batch")
+            elif status == "cancelled":
+                self.notify("Batch cancelled.", severity="warning", title="Batch")
+            elif status == "paused":
+                self.notify(
+                    "Batch paused (rate limit or budget cap). "
+                    "Resume from the Dashboard.",
+                    severity="warning",
+                    title="Batch",
+                )
+            elif status == "completed" and summary is not None and summary.flagged > 0:
+                self.notify(
+                    f"Batch finished with {summary.flagged} flagged segment(s).",
+                    severity="warning",
+                    title="Batch",
+                )
+        except Exception:  # pragma: no cover — defensive in headless tests
+            _logger.debug("notify failed for batch %s status", status)
 
 
 def run(

@@ -7,6 +7,165 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Logs screen, app-wide toasts, glossary cleanup, batch-progress polish
+
+Four user-reported pain points addressed in one pass:
+
+1. **Batch progress disappeared on navigation.** Backing out of a
+   running project to the Projects screen and reopening the same
+   project showed an empty Dashboard rich progress panel — the
+   freshly-mounted `DashboardScreen` reset its `_batch_running`
+   flag to ``False`` and never re-attached as a batch listener.
+   Other screens (Inbox, LLM activity) had a `BatchStatusBar` but
+   it was washed-out (`$accent 20%` background) and curators kept
+   missing it during long batches.
+2. **Inconsistent submit semantics.** Some form modals accepted
+   ``Enter`` to submit (NewProject, OpenProject), others required
+   ``Ctrl+S`` (Batch, Budget, Intake, EntryEdit, LoreIngest, …);
+   the curator had to remember which was which.
+3. **Glossary entries too large or near-duplicate.** The helper
+   LLM occasionally proposed full sentences as "phrases"
+   (`First you will eat your chickens, then your goats, …`),
+   broken-paren artefacts (`Fédération … (FIFA` with no close
+   paren), and near-duplicates (`HIPC` vs
+   `HIPC initiative`) that the auto-proposer's exact-source-term
+   dedup let through.
+4. **Logs / errors invisible in the TUI.** Batch failures, rate
+   limits, and pipeline errors landed in `_logger.warning` /
+   `_logger.exception` only — the curator had no in-TUI way to see
+   "what just went wrong?".
+
+#### Workstream A — Batch progress visibility
+
+- `epublate.app.screens.dashboard.DashboardScreen.on_mount` →
+  re-attach to the App-level batch when one is active for this
+  project (re-paints `BatchProgressMeter` from
+  `EpublateApp.batch_progress.summary` and re-registers the
+  listener).
+- `epublate.app.screens.dashboard.DashboardScreen.on_unmount` →
+  release the App-level batch listener slot when it was ours.
+- `epublate.app.widgets.batch_status_bar.BatchStatusBar` → solid
+  background for `-active` / `-cancelling` / `-paused` (was 20%
+  wash); high-contrast `▶ BATCH` ribbon prefix; updated docstring
+  reflecting the "every screen" mounting policy.
+- `BatchStatusBar` now mounts on Dashboard (in addition to its
+  rich panel — the slim bar surfaces *cross-project* App-level
+  state), Reader, Lore Books, and Lore Book Dashboard. It already
+  lived on Inbox / Glossary / LLM activity / Settings.
+
+#### Workstream B — Modal submit consistency (`Enter` *and* `Ctrl+S`)
+
+Every form modal (`BatchModal`, `BudgetModal`, `IntakeModal`,
+`EntryEditScreen`, `LoreIngestModal`, `LoreImportProjectModal`,
+`NewLoreBookModal`, `OpenLoreBookModal`) now overrides
+`on_input_submitted` to call its `action_submit` /
+`action_save` so ``Enter`` from any single-line `Input` is
+equivalent to ``Ctrl+S``. Footer hint strings unified to
+`Press Enter or Ctrl+S to <verb>, Esc to cancel.`. The Reader's
+`EditTargetScreen` is the documented exception (its `TextArea`
+keeps ``Enter`` as content; only ``Ctrl+S`` saves).
+
+New rule `.cursor/rules/tui-keybindings.mdc` codifies the
+convention so future modals don't drift back into "only `Ctrl+S`
+works".
+
+#### Workstream C — Glossary quality (prevention + cleanup)
+
+- `epublate.llm.prompts.extractor` → tightened the system prompt
+  with explicit length caps ("noun phrase, named entity, or short
+  fixed expression — at most 10 words and 100 characters") and
+  the `Full Name (ACRONYM)` canonicalisation rule. New parser
+  caps (`EXTRACTOR_MAX_WORDS`, `EXTRACTOR_MAX_CHARS`,
+  `_violates_extractor_caps`) drop full-sentence proposals,
+  unbalanced-paren artefacts, and runaway-length candidates at
+  the parser boundary. Logged at DEBUG so noisy endpoints can be
+  spotted without spamming INFO.
+- `epublate.llm.prompts.extractor_target` → same caps applied to
+  the target-language extractor used by Lore Book ingest, with
+  the alias list filtered through the same predicate.
+- `epublate.glossary.dedup` → new module exposing
+  `canonical_form` (NFKC + lowercase + paren acronym strip + a
+  conservative trailing common-noun strip — repeated to a fixed
+  point so `Foo (BAR) initiative` and `Foo` collapse to the same
+  bucket) and `find_near_duplicates` (canonical-form bucketing
+  plus a Levenshtein guard for residual fuzzy matches).
+- `epublate.glossary.io.upsert_proposed` → after the exact
+  source-term lookup misses, scan the project glossary by
+  canonical form. When a match is found, fold the variant
+  spelling in as a `source_alias` instead of creating a second
+  proposed entry. Catches the user-reported HIPC / FIFA shapes
+  before they land in the DB.
+- `epublate.app.screens.glossary.GlossaryScreen.action_merge_duplicates`
+  → unified the existing `m` "Merge dupes" action under the new
+  `find_near_duplicates`. Curator confirms each group via the
+  existing `MergeDuplicatesScreen` (per
+  `glossary-invariants.mdc` §4 "no silent merges"). Binding
+  description updated to "Cleanup dupes" to reflect the broader
+  scope.
+
+#### Workstream D — Logs screen + toast notifications
+
+- `epublate.app.log_buffer` → new in-memory `RingBufferHandler`
+  (default 2000 records on the package-root `epublate` logger).
+  Pure observer; clears on app restart by design (NFR-7 / "no
+  telemetry" — Python logs stay ephemeral, the persistent audit
+  trail is still the `event` table).
+- `epublate.app.screens.logs.LogsScreen` → new screen merging
+  three streams newest-first: project events, the ring buffer's
+  log records, and `llm_call` rows. Source filter (`f`) cycles
+  `events+logs` (default) → `all` → `events` → `logs` → `llm`;
+  level filter (`l`) cycles `all` → `warning+` → `error+` for
+  the log stream; time filter (`t`) cycles `24h` (default) →
+  `today` → `all`; `/` opens a substring search; row highlight
+  expands a detail pane below the table with the full payload
+  (event JSON, log traceback, `llm_call` request/response).
+  Bound to lowercase ``l`` from the Dashboard (uppercase ``L``
+  still opens the LLM-activity deep-stats screen). Resolves the
+  PRD §4.6 "Logs" entry that was specced in M0 but never built.
+- `epublate.app.main.EpublateApp._notify_batch_done` → toasts
+  routed through `app.notify` for `failed` / `cancelled` /
+  `paused` and `completed-with-flags`. Lands on whatever screen
+  is focused, so an error that happened "while you were looking
+  somewhere else" is still visible.
+- `epublate.app.screens.reader._handle_pipeline_failed` and
+  `_handle_chapter_batch_failed` toast via a new `_notify_safe`
+  helper that swallows the rare race between the worker and an
+  unmounted screen.
+
+#### Tests
+
+- `tests/test_glossary_dedup.py` — canonical-form known cases,
+  HIPC/FIFA grouping, Levenshtein-guard typo case, target-only
+  dedup, deterministic group ordering.
+- `tests/test_extractor_caps.py` — eat-your-chickens sentence
+  rejected, `Heavily Indebted Poor Country (HIPC)` accepted,
+  `(FIFA` with broken paren rejected, target-side aliases
+  filtered, `Sammy Davis Jr.` accepted (single trailing period
+  is allowed).
+- `tests/test_app_log_buffer.py` — capacity, wraparound,
+  snapshot-copy semantics, args-mismatch resilience,
+  install/uninstall round-trip, level / substring / logger-prefix
+  filters.
+- `tests/test_app_dashboard_batch_reattach.py` — re-mount with a
+  running batch reattaches the listener and shows the rich
+  panel; cross-project batches don't leak into the wrong
+  Dashboard; `on_unmount` releases the listener slot.
+- `tests/test_app_modal_enter_submit.py` — every form modal
+  covered (`BatchModal`, `BudgetModal`, `IntakeModal`,
+  `EntryEditScreen`, `LoreIngestModal`, `NewLoreBookModal`)
+  accepts ``Enter`` to submit.
+- `tests/test_app_logs_screen.py` — events + log records render,
+  source filter cycle adds LLM rows, summary helper extracts
+  known event payloads.
+
+#### Docs / rules
+
+- `.cursor/rules/tui-keybindings.mdc` — new rule codifying
+  `Enter`/`Ctrl+S`/`Esc` semantics on modals, `r` = Refresh on
+  view screens, `r` = Retry as the documented Reader exception.
+- `docs/PRD.md` — Logs screen marked "shipped" alongside its
+  M0/M4 sibling entries; entry added to M6 polish list.
+
 ### Fixed — Rate-limit (HTTP 429) pauses the batch instead of failing every segment
 
 A curator running a batch against the OpenRouter free tier hit

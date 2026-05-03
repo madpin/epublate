@@ -107,6 +107,7 @@ Key bindings (PRD §4.6 / M6):
 | `B`       | Set / clear the project budget cap                                 |
 | `e`       | Helper-LLM book intake (M5)                                        |
 | `L`       | LLM activity (deep cost auditing, recent calls)                    |
+| `l`       | Logs (events + Python logger ring buffer + `llm_call` rows; filterable) |
 | `s`       | Settings (read-only LLM config, theme, budget)                     |
 | `r`       | Refresh                                                            |
 | `q` / `esc` | Back to the previous screen                                      |
@@ -274,8 +275,12 @@ mention count plus distinct segments hit; press `o` on a row to open
 **Show occurrences**, a per-entry list of every recorded use in book
 order with the matched span highlighted (`«…»`), so you can spot a
 locked entry mis-firing on common-noun prose. `m` triggers a one-pass
-**Merge duplicates** to collapse legacy `(source_term, type)` clones
-into a single winning entry with the others' aliases folded in.
+**Cleanup duplicates** to surface near-duplicate entries (exact
+matches *and* fuzzy matches via `glossary.dedup.find_near_duplicates`
+— catches the `HIPC` vs `HIPC initiative`, `(FIFA` vs `FIFA (FIFA)`
+shapes the auto-proposer used to let through) and routes each group
+through the merge confirmation modal so nothing collapses without
+the curator's say-so.
 
 **Particle symmetry on save.** When you create or edit an entry, the
 modal enforces that the source and target either *both* carry a
@@ -313,7 +318,23 @@ recent-calls table with timestamps and segment ids — open the
 **LLM activity** screen with **`L`** from the Dashboard. The
 Dashboard's compact panel surfaces the latest few calls inline; the
 full screen lifts the limit so you can see where the budget is
-going across an entire run. Both views also report input/output
+going across an entire run.
+
+For *errors* (rate limits, pipeline failures, validator alerts),
+press lowercase **`l`** to open the **Logs** screen, which merges
+three streams newest-first: the project event table, the in-process
+Python logger ring buffer (last 2,000 records since app start), and
+``llm_call`` rows. Cycle the source filter with `f`, the level
+filter (warning+, error+) with `l`, the time window (`24h`, `today`,
+`all`) with `t`, and search the message column with `/`. Highlight a
+row to see its full payload (event JSON, log traceback, llm_call
+request + response) in the detail pane below the table. Errors that
+happen while you're on a different screen (a batch fails while
+you're in Glossary, the rate limiter pauses a run while you're in
+the Reader, …) also pop a transient toast notification, so nothing
+quietly disappears into a log file.
+
+Both LLM-activity and Logs report input/output
 token counts (read from the API's ``usage`` block when present, or
 counted with ``tiktoken`` as a fallback) so a runaway prompt or
 output is obvious.

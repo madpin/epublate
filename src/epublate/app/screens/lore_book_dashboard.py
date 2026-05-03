@@ -41,6 +41,7 @@ from textual.widgets import (
 )
 
 from epublate.app.screens.glossary import GlossaryScreen
+from epublate.app.widgets import BatchStatusBar
 from epublate.db import repo
 from epublate.db.schema import LoreSourceKind
 from epublate.lore import (
@@ -139,13 +140,17 @@ class LoreIngestModal(ModalScreen[IngestRequest | None]):
                 id="lore-ingest-max",
             )
             yield Static(
-                "Press [b]Ctrl+S[/b] to run, [b]Esc[/b] to cancel.",
+                "Press [b]Enter[/b] or [b]Ctrl+S[/b] to run, [b]Esc[/b] to cancel.",
                 id="lore-ingest-help",
                 markup=True,
             )
 
     def on_mount(self) -> None:
         self.query_one("#lore-ingest-path", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        del event
+        self.action_save()
 
     def action_save(self) -> None:
         raw_path = self.query_one("#lore-ingest-path", Input).value.strip()
@@ -248,13 +253,17 @@ class LoreImportProjectModal(ModalScreen[ImportProjectRequest | None]):
                 allow_blank=False,
             )
             yield Static(
-                "Press [b]Ctrl+S[/b] to run, [b]Esc[/b] to cancel.",
+                "Press [b]Enter[/b] or [b]Ctrl+S[/b] to run, [b]Esc[/b] to cancel.",
                 id="lore-import-project-help",
                 markup=True,
             )
 
     def on_mount(self) -> None:
         self.query_one("#lore-import-project-path", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        del event
+        self.action_save()
 
     def action_save(self) -> None:
         raw = self.query_one("#lore-import-project-path", Input).value.strip()
@@ -539,6 +548,7 @@ class LoreBookDashboardScreen(Screen[None]):
                         markup=True,
                     )
             yield Static("Ready.", id="lore-dashboard-status", markup=True)
+        yield BatchStatusBar(id="lore-dashboard-batch-status")
         yield Footer()
 
     def on_mount(self) -> None:

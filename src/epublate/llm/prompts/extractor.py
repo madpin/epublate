@@ -29,6 +29,7 @@ The prompt deliberately:
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Sequence
 from typing import Any, Literal
@@ -38,6 +39,78 @@ from pydantic import BaseModel, ConfigDict, Field
 from epublate.errors import LLMResponseError
 from epublate.llm.base import Message, ResponseFormat
 from epublate.llm.prompts.translator import GlossaryConstraint
+
+_logger = logging.getLogger(__name__)
+
+# Caps for an extractor candidate's ``source`` (or ``target``) field.
+# A glossary entry is supposed to be a name or short fixed phrase the
+# translator must keep consistent — anything longer than this is almost
+# always a sentence the helper LLM mistakenly proposed. Real proper
+# nouns ("Heavily Indebted Poor Country (HIPC) initiative") sit
+# comfortably inside both caps; the eat-your-chickens example that
+# motivated the caps blows past both. Tightening further has been
+# observed to drop legitimate long compound names; loosening lets
+# noisy sentences in.
+EXTRACTOR_MAX_WORDS = 10
+EXTRACTOR_MAX_CHARS = 100
+
+# Sentence-final punctuation that signals "this candidate is a clause,
+# not an entity". A single trailing period is sometimes part of a name
+# ("Jr.", "St."), so we only reject when the period is followed by
+# whitespace and more characters (i.e. mid-string punctuation), or
+# when there are *two* sentence-final marks anywhere — ``"He left.
+# Then she ran."`` is unambiguously a sentence pair.
+_MULTI_SENTENCE_RE = re.compile(r"[.!?]\s+\S")
+_TRAILING_SENTENCE_RE = re.compile(r"[!?](?:\s|$)")
+
+
+def _looks_like_sentence(term: str) -> bool:
+    """True if ``term`` reads as a clause/sentence rather than an entity."""
+
+    if _MULTI_SENTENCE_RE.search(term):
+        return True
+    return bool(_TRAILING_SENTENCE_RE.search(term))
+
+
+def _has_unbalanced_parens(term: str) -> bool:
+    """True when parens / brackets don't close in ``term``.
+
+    Catches the broken-paren auto-proposed entries the curator's been
+    seeing (``Fédération Internationale de Football Association (FIFA``
+    with no closing paren). Conservative: only counts ASCII pairs the
+    extractor prompt's example shape uses; mismatched fancy quotes
+    aren't enough to drop a candidate.
+    """
+
+    return (
+        term.count("(") != term.count(")")
+        or term.count("[") != term.count("]")
+        or term.count("{") != term.count("}")
+    )
+
+
+def _violates_extractor_caps(term: str) -> str | None:
+    """Return a debug-level reason string when ``term`` should be dropped.
+
+    Used by both extractor parsers (source-language and target-language)
+    so a sentence proposal, a runaway phrase, or a broken-paren
+    candidate dies at the parser boundary. Returns ``None`` when the
+    candidate is acceptable.
+    """
+
+    cleaned = term.strip()
+    if not cleaned:
+        return "empty after strip"
+    if len(cleaned) > EXTRACTOR_MAX_CHARS:
+        return f"length {len(cleaned)} > {EXTRACTOR_MAX_CHARS} chars"
+    if len(cleaned.split()) > EXTRACTOR_MAX_WORDS:
+        return f"word count {len(cleaned.split())} > {EXTRACTOR_MAX_WORDS}"
+    if _looks_like_sentence(cleaned):
+        return "looks like a sentence (punctuation pattern)"
+    if _has_unbalanced_parens(cleaned):
+        return "unbalanced brackets"
+    return None
+
 
 DEFAULT_RESPONSE_FORMAT: ResponseFormat = ResponseFormat(type="json_object")
 """Default ``response_format`` for the helper-LLM extractor (PRD F-LLM-3).
@@ -156,20 +229,33 @@ Hard rules:
    are settled. Do not propose synonyms or aliases of locked terms.
 3. The ``source`` field must be the exact surface form as it appears
    in the source text — keep capitalization, hyphens, punctuation,
-   and spacing.
-4. The ``target`` field is your best-effort translation of the source
+   and spacing. **It must be a noun phrase, named entity, or short
+   fixed expression — at most 10 words and 100 characters. Never
+   propose a full sentence, a clause with a verb chain, a
+   description, or a quoted line of dialogue.** "Council of Five"
+   is fine; "First you will eat your chickens, then your goats" is
+   not — the second is a sentence and must not be proposed even
+   if it recurs.
+4. **When a name is commonly written ``Full Name (ACRONYM)``** (e.g.
+   ``Heavily Indebted Poor Country (HIPC)``,
+   ``Fédération Internationale de Football Association (FIFA)``):
+   use the ACRONYM as the canonical ``source`` (and ``target``) and
+   put the long form in ``aliases`` if the chunk shows it that way.
+   Don't propose two separate entries for the long form and the
+   acronym — they are the same entity.
+5. The ``target`` field is your best-effort translation of the source
    term in {target_lang} — apply the language's spelling and
    capitalization conventions (e.g. ``Julius Caesar`` → ``Júlio
    César`` in Brazilian Portuguese). Leave it as an empty string
    only when no idiomatic translation exists (proper nouns that
    stay identical across languages).
-5. ``confidence`` is a number between 0.0 and 1.0; use 1.0 only when
+6. ``confidence`` is a number between 0.0 and 1.0; use 1.0 only when
    the text makes the entity unambiguous.
-6. Best-effort narrative metadata: detect the dominant point-of-view
+7. Best-effort narrative metadata: detect the dominant point-of-view
    (``first``, ``second``, ``third_limited``, ``third_omniscient``, ...)
    and tense (``past``, ``present``, ...) from the chunk. Leave them
    ``null`` if the chunk is too short or mixed.
-7. Best-effort style observations for the curator (used to co-propose
+8. Best-effort style observations for the curator (used to co-propose
    a tone preset): ``register`` is a short tag for the tone of the
    prose — pick from ``literary``, ``genre`` (thriller / fantasy /
    SF / mystery), ``romance``, ``explicit`` (sexually explicit /
@@ -343,6 +429,14 @@ def _normalize_entity(raw: Any) -> ExtractedEntity | None:
     malformed candidate than fail the whole intake on one stray dict.
     Other malformed shapes raise :class:`LLMResponseError` so a model
     that returns garbage for ``entities`` is loud about it.
+
+    Entries that violate the extractor caps (full sentences, runaway
+    phrases, broken parens — see :func:`_violates_extractor_caps`)
+    are also dropped silently. The helper LLM occasionally proposes a
+    quoted line of dialogue or a multi-clause description as a
+    "phrase" when there's no real recurring entity in the chunk;
+    rejecting them here keeps the lore bible focused on actual
+    proper nouns. Logged at DEBUG so noisy endpoints can be spotted.
     """
 
     if not isinstance(raw, dict):
@@ -352,6 +446,12 @@ def _normalize_entity(raw: Any) -> ExtractedEntity | None:
         return None
     source = source.strip()
     if not source:
+        return None
+    cap_reason = _violates_extractor_caps(source)
+    if cap_reason is not None:
+        _logger.debug(
+            "extractor: dropped candidate source=%r (%s)", source[:80], cap_reason
+        )
         return None
 
     type_str = str(raw.get("type", "term")).strip().lower() or "term"
@@ -366,6 +466,15 @@ def _normalize_entity(raw: Any) -> ExtractedEntity | None:
         target = target_raw.strip() or None
     else:
         raise LLMResponseError("entity 'target' must be a string or null")
+    if target is not None:
+        target_cap_reason = _violates_extractor_caps(target)
+        if target_cap_reason is not None:
+            _logger.debug(
+                "extractor: dropped candidate target=%r (%s); keeping source",
+                target[:80],
+                target_cap_reason,
+            )
+            target = None
 
     evidence_raw = raw.get("evidence")
     evidence: str | None

@@ -51,6 +51,7 @@ from epublate.glossary import (
     analyze_pair,
     cascade_retranslate,
     compute_affected,
+    find_near_duplicates,
 )
 from epublate.glossary.models import (
     EntityType,
@@ -266,13 +267,21 @@ class EntryEditScreen(ModalScreen[_EntryDraftResult | None]):
             yield TextArea(self._draft.notes, id="entry-notes")
             yield Static("", id="entry-error", markup=False)
             yield Static(
-                "Ctrl+S to save, Escape to cancel.",
+                "Enter or Ctrl+S to save, Escape to cancel.",
                 id="entry-help",
                 markup=False,
             )
 
     def on_mount(self) -> None:
         self.query_one("#entry-source", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        # Enter on any single-line Input (source/target term, alias
+        # lists) submits the modal. The notes ``TextArea`` keeps
+        # Enter as content because multi-line notes are common —
+        # only Ctrl+S works from the notes field.
+        del event
+        self.action_save()
 
     def action_save(self) -> None:
         source_term = self.query_one("#entry-source", Input).value.strip()
@@ -723,7 +732,7 @@ class GlossaryScreen(Screen[None]):
         Binding("c", "set_status_confirmed", "Confirm", show=True),
         Binding("p", "set_status_proposed", "Propose", show=True),
         Binding("r", "cascade", "Cascade", show=True),
-        Binding("m", "merge_duplicates", "Merge dupes", show=True),
+        Binding("m", "merge_duplicates", "Cleanup dupes", show=True),
         Binding("o", "show_occurrences", "Occurrences", show=True),
         Binding("f", "cycle_filter", "Filter", show=True),
         Binding("q", "app.pop_screen", "Back", show=True),
@@ -1103,11 +1112,20 @@ class GlossaryScreen(Screen[None]):
         )
 
     def action_merge_duplicates(self) -> None:
-        groups = repo.find_duplicate_source_terms(
+        # Fuzzy + exact in a single pass: the canonical-form pass
+        # catches the historical pairs that motivated this flow
+        # ("HIPC" vs "HIPC initiative", "FIFA" vs broken-paren
+        # "(FIFA"), and the Levenshtein guard catches typos that
+        # canonicalisation alone misses. Per
+        # ``glossary-invariants.mdc`` §4 (no silent merges) the
+        # MergeDuplicatesScreen still asks the curator to confirm
+        # each group before any DB write happens.
+        all_entries = repo.list_glossary_entries(
             self._project.engine, self._project.project_id
         )
+        groups = find_near_duplicates(all_entries)
         if not groups:
-            self._set_status("No duplicate source terms found.")
+            self._set_status("No duplicate or near-duplicate entries found.")
             return
         modal = MergeDuplicatesScreen(groups)
         self.app.push_screen(modal, _make_merge_callback(self, groups))

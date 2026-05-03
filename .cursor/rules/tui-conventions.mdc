@@ -32,10 +32,43 @@ posting — the Reader updates as workers finish segments. No polling.
 Light/dark plus a high-contrast variant. Never hardcode colors;
 always go through the theme.
 
-## Logging
+## Logging & errors
 
-Use Textual's logging integration. The Logs screen tails the event
-stream and the LLM call log (collapsible per call).
+- Use Python's `logging` module via the package-root `epublate`
+  logger (never `print`). The `LogsScreen`
+  (`app/screens/logs.py`) tails three streams: the project
+  `event` table, the in-process Python `RingBufferHandler`
+  (`app/log_buffer.py`), and the `llm_call` table.
+- Any error site that previously dropped to
+  `_logger.warning` / `_logger.exception` and walked away must
+  also raise a Textual toast via `self.notify(...)` (or the
+  screen's `_notify_safe` helper if the screen might unmount
+  mid-flight). Toasts are auto-dismissing and land on whatever
+  screen is focused, so the curator sees the error even when
+  they're not on the screen that originated it.
+- Persistent audit data (state-changing actions, LLM call
+  rows) belongs in the DB; the `RingBufferHandler` is
+  ephemeral by design (NFR-7) and clears on app restart.
+
+## Cross-screen status
+
+The slim `BatchStatusBar` (`app/widgets/batch_status_bar.py`)
+mirrors `EpublateApp.batch_progress` and must mount on every
+screen the curator might visit while a batch is running
+(Dashboard, Reader, Inbox, Glossary, Lore Books, Lore Book
+Dashboard, LLM activity, Settings, Logs). The Dashboard's rich
+`BatchProgressMeter` is project-scoped and must re-attach as a
+batch listener on `on_mount` whenever
+`app.batch_progress.active and project_id == self._project.project_id`,
+and release the listener on `on_unmount`.
+
+## Modal submit / keybindings
+
+See `.cursor/rules/tui-keybindings.mdc` for the canonical key
+table. TL;DR: form modals must override `on_input_submitted` so
+``Enter`` is equivalent to ``Ctrl+S``; view screens use ``r`` for
+Refresh; the Reader's ``r`` for Retry is the documented
+exception.
 
 ## Don't
 

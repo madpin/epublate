@@ -31,6 +31,7 @@ from textual.widgets import (
 )
 
 from epublate.app.branding import ICON_BULLET
+from epublate.app.widgets import BatchStatusBar
 from epublate.lore import (
     LoreBook,
     default_library_dir,
@@ -141,13 +142,18 @@ class NewLoreBookModal(ModalScreen[NewLoreBookResult | None]):
                 f"Will be created under [b]{self._library_dir}[/b].\n"
                 "Leave the import field empty for an empty Lore Book; otherwise "
                 "the new book is bootstrapped from that project's glossary.\n"
-                "Press [b]Ctrl+S[/b] to create, [b]Esc[/b] to cancel.",
+                "Press [b]Enter[/b] or [b]Ctrl+S[/b] to create, "
+                "[b]Esc[/b] to cancel.",
                 id="lore-new-help",
                 markup=True,
             )
 
     def on_mount(self) -> None:
         self.query_one("#lore-new-name", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        del event
+        self.action_save()
 
     def action_save(self) -> None:
         name = self.query_one("#lore-new-name", Input).value.strip()
@@ -228,13 +234,17 @@ class OpenLoreBookModal(ModalScreen[OpenLoreBookResult | None]):
                 placeholder="/path/to/whatever.epublate-lore",
             )
             yield Static(
-                "Press [b]Ctrl+S[/b] to open, [b]Esc[/b] to cancel.",
+                "Press [b]Enter[/b] or [b]Ctrl+S[/b] to open, [b]Esc[/b] to cancel.",
                 id="lore-open-help",
                 markup=True,
             )
 
     def on_mount(self) -> None:
         self.query_one("#lore-open-path", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        del event
+        self.action_save()
 
     def action_save(self) -> None:
         raw = self.query_one("#lore-open-path", Input).value.strip()
@@ -372,6 +382,7 @@ class LoreBooksScreen(Screen[None]):
                 id="lore-books-status",
                 markup=True,
             )
+        yield BatchStatusBar(id="lore-books-batch-status")
         yield Footer()
 
     # ------------------------------------------------------------------

@@ -24,6 +24,7 @@ helper owns the LLM call, the cache lookup, and the upserts.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Sequence
 from typing import Any, Literal
@@ -32,7 +33,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from epublate.errors import LLMResponseError
 from epublate.llm.base import Message, ResponseFormat
+from epublate.llm.prompts.extractor import _violates_extractor_caps
 from epublate.llm.prompts.translator import GlossaryConstraint
+
+_logger = logging.getLogger(__name__)
 
 DEFAULT_RESPONSE_FORMAT: ResponseFormat = ResponseFormat(type="json_object")
 """Default ``response_format`` for the target-language extractor.
@@ -119,13 +123,23 @@ Hard rules:
 1. Every ``target`` field MUST be the exact spelling that appears in
    the chunk I give you (in {target_lang}). Do not back-translate to
    {source_lang}; the source spelling is unknown for this entry.
-2. Skip entries already present in the existing Lore Book glossary
+   **It must be a noun phrase, named entity, or short fixed
+   expression — at most 10 words and 100 characters. Never propose a
+   full sentence, a clause with a verb chain, a description, or a
+   quoted line of dialogue** even if it recurs.
+2. **When a name is commonly written ``Full Name (ACRONYM)``** (e.g.
+   ``Federação Internacional de Futebol (FIFA)``): use the ACRONYM
+   as the canonical ``target`` and put the long form in ``aliases``.
+   Don't propose two separate entries for the long form and the
+   acronym — they are the same entity.
+3. Skip entries already present in the existing Lore Book glossary
    below — they are settled. Do not propose synonyms or aliases of
    ``locked`` terms.
-3. ``aliases`` is an optional list of additional target-side spellings
+4. ``aliases`` is an optional list of additional target-side spellings
    (nicknames, short forms, alternative transliterations) you observed
-   in the chunk for the same entity.
-4. ``confidence`` is a number between 0.0 and 1.0; use 1.0 only when
+   in the chunk for the same entity. Each alias must respect the same
+   length cap as ``target``.
+5. ``confidence`` is a number between 0.0 and 1.0; use 1.0 only when
    the chunk makes the entity unambiguous.
 
 {glossary_block}\
@@ -231,7 +245,13 @@ def parse_target_extractor_response(content: str) -> TargetExtractorTrace:
 
 
 def _normalize_entity(raw: Any) -> TargetExtractedEntity | None:
-    """Coerce one ``entities`` item to :class:`TargetExtractedEntity` or drop it."""
+    """Coerce one ``entities`` item to :class:`TargetExtractedEntity` or drop it.
+
+    Sentence-shaped, runaway-length, or broken-paren candidates are
+    silently dropped via :func:`extractor._violates_extractor_caps`
+    (re-used so the source-language and target-language extractors
+    apply the exact same definition of "too big to be an entity").
+    """
 
     if not isinstance(raw, dict):
         raise LLMResponseError("each entry in 'entities' must be a JSON object")
@@ -240,6 +260,14 @@ def _normalize_entity(raw: Any) -> TargetExtractedEntity | None:
         return None
     target = target.strip()
     if not target:
+        return None
+    cap_reason = _violates_extractor_caps(target)
+    if cap_reason is not None:
+        _logger.debug(
+            "extractor_target: dropped candidate target=%r (%s)",
+            target[:80],
+            cap_reason,
+        )
         return None
 
     type_str = str(raw.get("type", "term")).strip().lower() or "term"
@@ -255,8 +283,17 @@ def _normalize_entity(raw: Any) -> TargetExtractedEntity | None:
             if not isinstance(item, str):
                 raise LLMResponseError("entity 'aliases' must be a list of strings")
             cleaned = item.strip()
-            if cleaned and cleaned != target:
-                aliases.append(cleaned)
+            if not cleaned or cleaned == target:
+                continue
+            alias_cap_reason = _violates_extractor_caps(cleaned)
+            if alias_cap_reason is not None:
+                _logger.debug(
+                    "extractor_target: dropped alias=%r (%s)",
+                    cleaned[:80],
+                    alias_cap_reason,
+                )
+                continue
+            aliases.append(cleaned)
     else:
         raise LLMResponseError("entity 'aliases' must be a list of strings")
 

@@ -30,6 +30,7 @@ from sqlalchemy.engine import Connection, Engine
 
 from epublate.db import repo
 from epublate.errors import ConfigurationError
+from epublate.glossary.dedup import canonical_form
 from epublate.glossary.models import (
     EntityType,
     GenderTag,
@@ -263,6 +264,17 @@ def upsert_proposed(
       :func:`repo.create_glossary_entry` for the rare disambiguation
       case where one source spelling really does map to two senses
       with different targets.
+    * **Canonical-form fallback.** When the exact source-term lookup
+      misses, we try again against
+      :func:`epublate.glossary.dedup.canonical_form` so the
+      well-known near-duplicates (HIPC vs HIPC initiative, FIFA vs
+      ``FIFA`` with broken paren, ``House Stark`` vs ``house stark``)
+      land on the existing row rather than creating a second
+      proposed entry. The variant spelling is folded in as a
+      ``source_alias`` so the matcher still recognises it in the
+      source text. We do this only when the canonical form
+      meaningfully differs from the raw source term — pure case /
+      whitespace differences don't add anything new as an alias.
     * **Type upgrade.** When the existing row carries the generic
       fallback type ``term`` and the incoming candidate has a more
       specific type (``character``, ``place``, …), upgrade the row.
@@ -311,9 +323,36 @@ def upsert_proposed(
         project_id=project_id,
         source_term=source_term,
     )
+    canonical_match: GlossaryEntryWithAliases | None = None
+    if existing is None:
+        # Canonical-form fallback. Bounded scan over the project's
+        # current glossary; most projects sit in the low hundreds, so
+        # the linear pass is cheap relative to a network call to the
+        # helper LLM that produced this candidate.
+        target_canonical = canonical_form(source_term)
+        if target_canonical:
+            for candidate in repo.list_glossary_entries(engine, project_id):
+                if not candidate.source_term:
+                    continue
+                if canonical_form(candidate.source_term) == target_canonical:
+                    canonical_match = candidate
+                    break
+    if existing is None and canonical_match is not None:
+        existing = canonical_match.entry
+        # Fold the new spelling in as a source alias when it adds
+        # signal — exact case-insensitive match is already covered by
+        # the matcher's case_insensitive flag, so no point recording it.
+        if (
+            source_term.lower() != (existing.source_term or "").lower()
+            and source_term not in canonical_match.source_aliases
+        ):
+            repo.set_aliases(
+                engine,
+                entry_id=existing.id,
+                source_aliases=[*canonical_match.source_aliases, source_term],
+                target_aliases=canonical_match.target_aliases,
+            )
     if existing is not None:
-        # Auto-upgrade the type when the existing row was created by
-        # an earlier auto-propose pass that didn't know better.
         upgrade_type = (
             existing.status == "proposed" and existing.type == "term" and type != "term"
         )
