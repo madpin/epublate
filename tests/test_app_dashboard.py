@@ -279,6 +279,136 @@ async def test_dashboard_batch_run_publishes_progress_to_app(
             assert provider.call_count > 0
             assert pilot.app.batch_progress.summary is not None  # type: ignore[attr-defined]
             assert pilot.app.batch_progress.active is False  # type: ignore[attr-defined]
+            # Chapter count + project total cost are surfaced on the
+            # snapshot so curators can see "across N chapters" and
+            # "this batch · project total" at a glance.
+            progress = pilot.app.batch_progress  # type: ignore[attr-defined]
+            assert progress.chapter_count >= 1
+            assert progress.starting_spend_usd == 0.0
+            content_with_chapters = str(meter.render())
+            assert "chapter" in content_with_chapters.lower()
+            assert "project total" in content_with_chapters
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_batch_keeps_running_after_screen_pop(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """A batch dispatched on the Dashboard survives popping back to Projects.
+
+    The App owns the worker thread and the originating Project (which
+    keeps the SQLite engine alive); popping the Dashboard does NOT
+    cancel the batch. This pins down PRD §4.6 / §7.3 — the curator
+    can leave the project and come back to a still-progressing run.
+    """
+
+    from epublate.app.screens.dashboard import BatchRequest
+    from epublate.app.screens.projects import ProjectsScreen
+
+    src = tiny_epub_factory(
+        chapters=[
+            ("Solo", "<p>Para one.</p><p>Para two.</p><p>Para three.</p>"),
+        ]
+    )
+    project = Project.create(
+        src,
+        out_dir=tmp_path / "persist-proj",
+        source_lang="en",
+        target_lang="pt",
+    )
+    try:
+        provider = MockLLMProvider()
+        provider.set_responder(_placeholder_responder())
+        # Land on Projects first, then push the Dashboard, so popping the
+        # Dashboard returns to a real screen the App will keep mounted.
+        landing = ProjectsScreen()
+        app = EpublateApp(initial_screen=landing)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            dashboard = DashboardScreen(
+                project,
+                provider_factory=lambda: provider,
+                default_model="gpt-mock",
+            )
+            pilot.app.push_screen(dashboard)
+            await pilot.pause()
+            assert isinstance(pilot.app.screen, DashboardScreen)
+            dashboard._on_batch_chosen(  # type: ignore[reportPrivateUsage]
+                BatchRequest(
+                    chapters="*",
+                    concurrency=1,
+                    model="gpt-mock",
+                    budget_usd=None,
+                    bypass_cache=False,
+                )
+            )
+            assert pilot.app.batch_running  # type: ignore[attr-defined]
+            pilot.app.pop_screen()
+            await pilot.pause()
+            assert isinstance(pilot.app.screen, ProjectsScreen)
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+            assert provider.call_count > 0
+            assert not pilot.app.batch_running  # type: ignore[attr-defined]
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_cancel_batch_stops_worker(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """Pressing 'c' on the Dashboard asks the App to cancel the running batch.
+
+    Cancellation is best-effort: in-flight LLM calls finish, no new
+    ones are submitted. The final ``batch_progress`` snapshot is
+    inactive (the worker drained) and ``batch_running`` is false.
+    """
+
+    from epublate.app.screens.dashboard import BatchRequest
+
+    src = tiny_epub_factory(
+        chapters=[
+            (
+                "Solo",
+                "".join(f"<p>Para {n}.</p>" for n in range(8)),
+            ),
+        ]
+    )
+    project = Project.create(
+        src, out_dir=tmp_path / "cancel-proj", source_lang="en", target_lang="pt"
+    )
+    try:
+        provider = MockLLMProvider()
+        provider.set_responder(_placeholder_responder())
+        screen = DashboardScreen(
+            project,
+            provider_factory=lambda: provider,
+            default_model="gpt-mock",
+        )
+        app = EpublateApp(initial_screen=screen)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            dashboard = pilot.app.screen
+            assert isinstance(dashboard, DashboardScreen)
+            dashboard._on_batch_chosen(  # type: ignore[reportPrivateUsage]
+                BatchRequest(
+                    chapters="*",
+                    concurrency=1,
+                    model="gpt-mock",
+                    budget_usd=None,
+                    bypass_cache=False,
+                    group_small_segments=False,
+                )
+            )
+            cancelled = pilot.app.cancel_batch()  # type: ignore[attr-defined]
+            assert cancelled is True
+            assert pilot.app.batch_progress.cancelling  # type: ignore[attr-defined]
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+            assert not pilot.app.batch_running  # type: ignore[attr-defined]
     finally:
         project.close()
 

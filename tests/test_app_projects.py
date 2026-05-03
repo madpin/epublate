@@ -172,11 +172,102 @@ async def test_remove_selected_drops_entry_from_store(
         await pilot.pause()
         from textual.widgets import DataTable
 
+        from epublate.app.screens.projects import RemoveRecentConfirmModal
+
         table = pilot.app.screen.query_one("#projects-table", DataTable)
         assert table.row_count == 1
+        # Pressing ``delete`` no longer wipes the row immediately —
+        # the modal demands an explicit confirm so muscle-memory
+        # delete-key spam can't shred the recents list.
         await pilot.press("delete")
         await pilot.pause()
+        assert isinstance(pilot.app.screen, RemoveRecentConfirmModal)
+        # Cancel path leaves the row untouched.
+        await pilot.press("escape")
+        await pilot.pause()
+        assert table.row_count == 1
+
+        await pilot.press("delete")
+        await pilot.pause()
+        assert isinstance(pilot.app.screen, RemoveRecentConfirmModal)
+        await pilot.press("y")
+        await pilot.pause()
         assert table.row_count == 0
+        # Project files must remain on disk — Remove only drops the
+        # recents row.
+        assert project_dir.exists()
+        await pilot.press("q")
+
+    assert RecentsStore.load(recents).entries == []
+
+
+@pytest.mark.asyncio
+async def test_delete_project_wipes_folder_after_typed_confirm(
+    tmp_path: Path, sample_epub_path: Path
+) -> None:
+    """Capital ``D`` is the destructive path: project files are gone.
+
+    Guards three behaviors at once:
+
+    * Cancelling leaves the project untouched.
+    * The destructive button refuses to fire until the curator types
+      the project name verbatim.
+    * Confirming wipes both the recents row and the project folder.
+    """
+
+    from textual.widgets import DataTable, Input
+
+    from epublate.app.screens.projects import DeleteProjectConfirmModal
+
+    project_dir = tmp_path / "doomed"
+    project = Project.create(
+        sample_epub_path,
+        out_dir=project_dir,
+        source_lang="en",
+        target_lang="pt",
+        name="Doomed Project",
+    )
+    project.close()
+    assert project_dir.is_dir()
+
+    recents = tmp_path / "recents.json"
+    store = RecentsStore()
+    store.upsert(
+        RecentProject(
+            project_dir=str(project_dir),
+            name="Doomed Project",
+            source_lang="en",
+            target_lang="pt",
+            last_opened=time.time(),
+        )
+    )
+    store.save(recents)
+
+    app = EpublateApp(initial_screen=ProjectsScreen(recents_path=recents))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        table = pilot.app.screen.query_one("#projects-table", DataTable)
+        assert table.row_count == 1
+
+        # Cancel path keeps the folder + row.
+        await pilot.press("D")
+        await pilot.pause()
+        assert isinstance(pilot.app.screen, DeleteProjectConfirmModal)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert project_dir.is_dir()
+        assert table.row_count == 1
+
+        # Typed confirmation enables the destructive submit.
+        await pilot.press("D")
+        await pilot.pause()
+        assert isinstance(pilot.app.screen, DeleteProjectConfirmModal)
+        confirm_input = pilot.app.screen.query_one("#delete-confirm-input", Input)
+        confirm_input.value = "Doomed Project"
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert table.row_count == 0
+        assert not project_dir.exists()
         await pilot.press("q")
 
     assert RecentsStore.load(recents).entries == []

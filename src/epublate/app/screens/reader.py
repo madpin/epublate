@@ -499,6 +499,19 @@ class ReaderScreen(Screen[None]):
         self._chapter_queue: list[str] = []
         self._active_batch_chapter_id: str | None = None
         self._active_batch_total: int = 0
+        # Set while we drive a programmatic scroll on either pane so the
+        # source<->target sync watcher doesn't recurse on itself.
+        # ``_render_segment_panes`` and ``_highlight_current_segment``
+        # also flip this on while they re-anchor the panes after a chapter
+        # change so the watchers see the new layout as a single move.
+        # We clear via ``call_after_refresh`` rather than synchronously:
+        # ``scroll_to`` writes ``scroll_y`` immediately but the
+        # destination pane's *layout* (and any post-clamp reactive
+        # bounces it produces) settles on the next refresh. Clearing
+        # synchronously left the door open to a watcher fire that
+        # treated the rebound as a fresh user scroll, which caused the
+        # panes to flicker non-stop while one was being scrolled.
+        self._syncing_scroll: bool = False
 
     @property
     def state(self) -> _ReaderState:
@@ -550,6 +563,15 @@ class ReaderScreen(Screen[None]):
         self._refresh_timer = self.set_interval(
             _LIVE_REFRESH_SECONDS, self._tick_live_refresh
         )
+        # Mirror scroll position between the Source and Target panes so a
+        # curator skimming one side keeps the other in lockstep
+        # (PRD §4.6 reader UX). The watchers run on this Screen, not on
+        # the panes themselves, so we don't have to subclass
+        # ``VerticalScroll`` just to register a callback.
+        source_pane = self.query_one("#reader-source-pane", VerticalScroll)
+        target_pane = self.query_one("#reader-target-pane", VerticalScroll)
+        self.watch(source_pane, "scroll_y", self._on_source_scroll_y, init=False)
+        self.watch(target_pane, "scroll_y", self._on_target_scroll_y, init=False)
 
     def on_unmount(self) -> None:
         self._provider = None
@@ -770,10 +792,116 @@ class ReaderScreen(Screen[None]):
             target_card = self._target_cards.get(seg.id)
             source_pane = self.query_one("#reader-source-pane", VerticalScroll)
             target_pane = self.query_one("#reader-target-pane", VerticalScroll)
-            if source_card is not None:
-                source_pane.scroll_to_widget(source_card, animate=False)
-            if target_card is not None:
-                target_pane.scroll_to_widget(target_card, animate=False)
+            self._begin_syncing_scroll()
+            try:
+                if source_card is not None:
+                    source_pane.scroll_to_widget(source_card, animate=False)
+                if target_card is not None:
+                    target_pane.scroll_to_widget(target_card, animate=False)
+            except Exception:
+                self._syncing_scroll = False
+                raise
+            self.call_after_refresh(self._end_syncing_scroll)
+
+    def _on_source_scroll_y(self, _value: float) -> None:
+        self._mirror_scroll(source_to_target=True)
+
+    def _on_target_scroll_y(self, _value: float) -> None:
+        self._mirror_scroll(source_to_target=False)
+
+    def _mirror_scroll(self, *, source_to_target: bool) -> None:
+        """Anchor the *other* pane to the same segment + offset.
+
+        We sync at the segment level: pick the topmost segment whose
+        virtual region contains the originating pane's ``scroll_y``,
+        compute the fractional offset within that segment, and scroll
+        the mirror pane to the same fractional offset on its matching
+        card. Segment-anchored sync handles the common case where the
+        source and target cards have different rendered heights — a
+        purely pixel-based mirror would drift the longer pane out of
+        alignment.
+        """
+
+        if self._syncing_scroll:
+            return
+        if not self._source_cards or not self._target_cards:
+            return
+        if source_to_target:
+            from_pane = self.query_one("#reader-source-pane", VerticalScroll)
+            to_pane = self.query_one("#reader-target-pane", VerticalScroll)
+            from_cards = self._source_cards
+            to_cards = self._target_cards
+        else:
+            from_pane = self.query_one("#reader-target-pane", VerticalScroll)
+            to_pane = self.query_one("#reader-source-pane", VerticalScroll)
+            from_cards = self._target_cards
+            to_cards = self._source_cards
+        anchor = self._anchor_for_scroll(from_pane, from_cards)
+        if anchor is None:
+            return
+        seg_id, frac = anchor
+        to_card = to_cards.get(seg_id)
+        if to_card is None:
+            return
+        try:
+            to_region = to_card.virtual_region
+        except Exception:
+            return
+        height = max(to_region.height, 1)
+        target_y = float(to_region.y) + frac * float(height)
+        # Convergence guard: skip the mirror when the destination is
+        # already (effectively) aligned. Without this, sub-cell drift
+        # in the fractional offset bounces back through the watcher
+        # the moment ``scroll_to`` clamps the value.
+        if abs(float(to_pane.scroll_y) - target_y) < 1.0:
+            return
+        self._begin_syncing_scroll()
+        try:
+            to_pane.scroll_to(y=target_y, animate=False, force=True)
+        except Exception:
+            self._syncing_scroll = False
+            raise
+        self.call_after_refresh(self._end_syncing_scroll)
+
+    def _begin_syncing_scroll(self) -> None:
+        self._syncing_scroll = True
+
+    def _end_syncing_scroll(self) -> None:
+        self._syncing_scroll = False
+
+    @staticmethod
+    def _anchor_for_scroll(
+        pane: VerticalScroll,
+        cards: dict[str, SegmentCard],
+    ) -> tuple[str, float] | None:
+        """Locate the segment containing the pane's scroll position.
+
+        Returns ``(segment_id, frac)`` where ``frac`` is the 0..1
+        offset *within* that segment's card, or ``None`` if no card
+        is positioned for the current scroll value (cards still
+        unlaid-out, etc.).
+        """
+
+        scroll_y = float(pane.scroll_y)
+        last_above: tuple[str, float] | None = None
+        for sid, card in cards.items():
+            try:
+                region = card.virtual_region
+            except Exception:
+                continue
+            top = float(region.y)
+            height = float(region.height) if region.height else 1.0
+            bottom = top + height
+            if top <= scroll_y < bottom:
+                frac = (scroll_y - top) / height
+                if frac < 0.0:
+                    frac = 0.0
+                elif frac > 1.0:
+                    frac = 1.0
+                return sid, frac
+            if scroll_y >= bottom:
+                last_above = sid, 1.0
+        return last_above
 
     def _refresh_segment_card(self, segment_id: str) -> None:
         seg = self._find_segment_by_id(segment_id)
@@ -949,24 +1077,31 @@ class ReaderScreen(Screen[None]):
             return
         summary = progress.summary
         total = progress.total
+        starting_spend = progress.starting_spend_usd
         if summary is None:
             snapshot = BatchSnapshot(
                 attempted=0,
                 total=total,
+                chapter_count=progress.chapter_count,
                 paused=progress.paused,
+                cancelling=progress.cancelling,
+                project_total_cost_usd=starting_spend or None,
             )
         else:
             snapshot = BatchSnapshot(
                 attempted=summary.attempted,
                 total=total,
+                chapter_count=progress.chapter_count,
                 translated=summary.translated,
                 cached=summary.cached,
                 flagged=summary.flagged,
                 failed=summary.failed,
                 cost_usd=summary.cost_usd,
+                project_total_cost_usd=starting_spend + summary.cost_usd,
                 elapsed_s=summary.elapsed_s,
                 paused=progress.paused,
                 paused_reason=summary.paused_reason,
+                cancelling=progress.cancelling,
             )
         meter.update_snapshot(snapshot)
         self._batch_meter_visible = True

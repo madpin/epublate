@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.engine import Engine
@@ -82,6 +83,46 @@ class ChapterShapeSummary:
     shortest: ChapterShape | None
     average_segments: float
     median_segments: float
+
+
+@dataclass(slots=True, frozen=True)
+class LLMActivityRow:
+    """One row in the per-model / per-purpose / per-day rollup grids.
+
+    Used by the Dashboard's compact LLM activity panel and the
+    full-screen :class:`epublate.app.screens.llm_activity.LLMActivityScreen`
+    for at-a-glance budget review (PRD F-LLM-7).
+    """
+
+    key: str
+    calls: int
+    cache_hits: int
+    prompt_tokens: int
+    completion_tokens: int
+    cost_usd: float
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+    @property
+    def cache_hit_rate(self) -> float:
+        if not self.calls:
+            return 0.0
+        return self.cache_hits / self.calls
+
+
+@dataclass(slots=True, frozen=True)
+class LLMActivityBreakdown:
+    """Aggregated LLM-call rollups for the activity screen."""
+
+    by_model: tuple[LLMActivityRow, ...]
+    by_purpose: tuple[LLMActivityRow, ...]
+    totals: LLMActivityRow
+
+    @property
+    def has_calls(self) -> bool:
+        return self.totals.calls > 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -225,6 +266,81 @@ def compute_stats(engine: Engine, project_id: str) -> ProjectStats:
         segments_by_status=segments_by_status,
         spend_by_model=spend_by_model,
     )
+
+
+def compute_llm_activity(engine: Engine, project_id: str) -> LLMActivityBreakdown:
+    """Roll ``llm_call`` up by model and by purpose for a single project.
+
+    Used by the dedicated :class:`LLMActivityScreen` (and any future
+    "deep stats" view) so the curator can spot which model or purpose
+    is dominating the budget without parsing the raw audit table by
+    hand. Issues two grouped queries plus one totals query — small
+    fanout per project keeps this fast in practice (NFR-2).
+    """
+
+    by_model = _grouped_activity(engine, project_id, schema.llm_call.c.model)
+    by_purpose = _grouped_activity(engine, project_id, schema.llm_call.c.purpose)
+
+    totals_stmt = select(
+        func.coalesce(func.sum(schema.llm_call.c.cost_usd), 0.0).label("cost"),
+        func.coalesce(func.sum(schema.llm_call.c.prompt_tokens), 0).label("ptok"),
+        func.coalesce(func.sum(schema.llm_call.c.completion_tokens), 0).label("ctok"),
+        func.count().label("calls"),
+        func.coalesce(func.sum(schema.llm_call.c.cache_hit), 0).label("hits"),
+    ).where(schema.llm_call.c.project_id == project_id)
+    with engine.begin() as conn:
+        totals_mapping = conn.execute(totals_stmt).mappings().first()
+    totals_row: dict[str, Any] = (
+        dict(totals_mapping) if totals_mapping is not None else {}
+    )
+
+    totals = LLMActivityRow(
+        key="(all)",
+        calls=int(totals_row.get("calls") or 0),
+        cache_hits=int(totals_row.get("hits") or 0),
+        prompt_tokens=int(totals_row.get("ptok") or 0),
+        completion_tokens=int(totals_row.get("ctok") or 0),
+        cost_usd=float(totals_row.get("cost") or 0.0),
+    )
+
+    return LLMActivityBreakdown(
+        by_model=tuple(by_model),
+        by_purpose=tuple(by_purpose),
+        totals=totals,
+    )
+
+
+def _grouped_activity(
+    engine: Engine, project_id: str, group_col: Any
+) -> list[LLMActivityRow]:
+    stmt = (
+        select(
+            group_col.label("key"),
+            func.coalesce(func.sum(schema.llm_call.c.cost_usd), 0.0).label("cost"),
+            func.coalesce(func.sum(schema.llm_call.c.prompt_tokens), 0).label("ptok"),
+            func.coalesce(func.sum(schema.llm_call.c.completion_tokens), 0).label(
+                "ctok"
+            ),
+            func.count().label("calls"),
+            func.coalesce(func.sum(schema.llm_call.c.cache_hit), 0).label("hits"),
+        )
+        .where(schema.llm_call.c.project_id == project_id)
+        .group_by(group_col)
+        .order_by(func.sum(schema.llm_call.c.cost_usd).desc())
+    )
+    with engine.begin() as conn:
+        rows = conn.execute(stmt).mappings().all()
+    return [
+        LLMActivityRow(
+            key=str(r["key"] if r["key"] is not None else "(unknown)"),
+            calls=int(r["calls"] or 0),
+            cache_hits=int(r["hits"] or 0),
+            prompt_tokens=int(r["ptok"] or 0),
+            completion_tokens=int(r["ctok"] or 0),
+            cost_usd=float(r["cost"] or 0.0),
+        )
+        for r in rows
+    ]
 
 
 def compute_spend(engine: Engine, project_id: str) -> float:
@@ -398,8 +514,11 @@ __all__ = [
     "ALERT_KINDS",
     "ChapterShape",
     "ChapterShapeSummary",
+    "LLMActivityBreakdown",
+    "LLMActivityRow",
     "ProjectStats",
     "compute_chapter_shapes",
+    "compute_llm_activity",
     "compute_spend",
     "compute_stats",
     "flagged_segments",

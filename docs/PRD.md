@@ -213,7 +213,15 @@ For each segment, the pipeline runs these phases:
   on deviation; LLM prompt presents them as preferences.
 - **F-LB-5.** **Proposed** entries are LLM/NER-suggested and not yet
   reviewed; they do not constrain anything but show up in the curator's
-  inbox.
+  inbox. The auto-proposer accepts a best-effort ``target_term`` from
+  the model — the helper-LLM extractor's prompt asks for an idiomatic
+  translation of each candidate, and the translator's prompt is
+  required to echo back the exact target spelling it used in the
+  segment. When a proposed entry already exists with a placeholder
+  ``target_term == source_term`` (e.g. seeded from an older intake
+  pass that didn't capture target spellings) the next observation
+  with a real translation backfills the placeholder. Curator-edited
+  rows are never overwritten.
 - **F-LB-6.** **History.** Every change to a glossary entry is versioned
   with reason and timestamp.
 - **F-LB-7.** **Cascade re-translation.** When a confirmed/locked entry
@@ -286,21 +294,48 @@ For each segment, the pipeline runs these phases:
   `(model, system_prompt_hash, user_prompt_hash, glossary_state_hash)`.
   Cache hits are free and instantaneous.
 - **F-LLM-7.** **Cost tracking.** Per-model price table (user-editable);
-  every call records prompt/completion tokens and cost.
+  every call records prompt/completion tokens and cost. The price
+  lookup falls back through ``model`` → ``model`` minus the
+  ``-YYYY-MM-DD`` snapshot suffix → longest-prefix-match (so
+  ``gpt-4o-2024-08-06`` and ``gpt-4o-mini-2024-07-18`` resolve to
+  their families without bespoke entries). The Dashboard cost panel
+  surfaces running spend, prompt + completion token totals,
+  cache-hit rate, and call count; a dedicated **LLM activity** screen
+  (``L`` from the Dashboard) drills into per-model and per-purpose
+  rollups plus a recent-calls audit table.
 - **F-LLM-8.** **Budget cap.** Optional per-project hard cap (USD); when
   hit, batch mode pauses and the TUI surfaces a confirmation prompt.
 - **F-LLM-9.** **Small-segment grouping.** Dense list-like content
   (table of contents, indices, glossaries) is translated in batched
   LLM calls instead of one round-trip per segment. The pipeline only
   groups segments that are ``pending``, short (default ≤240 chars),
-  and free of inline-tag placeholders; grouping never crosses a
-  chapter boundary. Each segment still gets its own ``llm_call``
-  audit row (tokens and cost allocated proportionally to completion
-  length) and its own cache key, so a second run finds cache hits
-  individually. On group-parse failure the pipeline falls back to
-  per-segment translation so a bad batch can never corrupt a segment.
-  Default group size is 50 items; user-configurable via the batch
-  modal and the CLI (`--group-small` / `--group-max-items`).
+  and lightly-marked-up — up to ``group_max_placeholders`` (default
+  8) inline-tag placeholders, so a TOC link such as ``<li><a href="..
+  ">Chapter 1</a></li>`` (one ``[[T0]]…[[/T0]]`` pair) groups
+  alongside plain ``<li>`` entries. Heavier markup falls back to the
+  per-segment path where the richer prompt context is the safer call.
+  Grouping never crosses a chapter boundary. Each segment still gets
+  its own ``llm_call`` audit row (tokens and cost allocated
+  proportionally to completion length) and its own cache key, so a
+  second run finds cache hits individually. On group-parse failure
+  the pipeline falls back to per-segment translation so a bad batch
+  can never corrupt a segment. Default group size is 50 items;
+  user-configurable via the batch modal and the CLI
+  (`--group-small` / `--group-max-items`).
+- **F-LLM-10.** **Trivial-segment short-circuit.** Segments whose
+  source is wholly placeholders plus invisible glue characters
+  (``&nbsp;`` / ``\u00a0``, BOM, zero-width spaces / joiners) skip
+  the LLM entirely: the pipeline copies ``source_text`` to
+  ``target_text``, marks the segment ``translated``, and emits a
+  ``segment.translated_trivial`` event. **No** ``llm_call`` row is
+  written because no call was made (this is the one carve-out from
+  "every translation has an llm_call row"). The intake-time
+  segmenter already drops these on ingest; the pipeline-level check
+  is defense-in-depth so projects segmented before this filter
+  existed (``<p>&#160;</p>`` separators from Calibre-converted
+  ePubs) also avoid spurious round-trips. Segments with one
+  character of real content (a chapter number "1", a dash "—") are
+  *not* trivial and still go through the translator.
 
 ### 4.5 Embeddings (Optional, S1)
 
@@ -326,7 +361,11 @@ Top-level screens:
   validated / locked), cost meter, recent activity log, quick actions.
 - **Reader.** Side-by-side source / target view, segment-by-segment;
   keybindings to translate-next, accept, edit, reject, lock entities,
-  jump-to-chapter.
+  jump-to-chapter. The two panes are scroll-synced segment-by-segment
+  (an offset within a source card maps to the same fractional offset
+  on the matching target card) so the curator can skim either side
+  and the other follows in lockstep, even when the target is shorter
+  or longer than the source.
 - **Glossary.** Filterable, sortable table; detail pane with history;
   bulk operations; conflict resolver.
 - **Inbox.** Curator queue: proposed glossary entries, validation

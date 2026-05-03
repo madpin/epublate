@@ -983,3 +983,61 @@ async def test_reader_approve_chapter_noop_when_nothing_translated(
             assert provider.call_count == 0
     finally:
         project.close()
+
+
+@pytest.mark.asyncio
+async def test_reader_scroll_sync_guard_outlives_synchronous_clear(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """Regression: the sync guard must outlive the synchronous return of
+    ``scroll_to`` so that any post-layout reactive bounce on the
+    destination pane is still suppressed. The earlier implementation
+    cleared ``_syncing_scroll`` in a ``finally`` block, which left a
+    window for Textual's deferred layout pass to fire the watcher
+    *after* the guard was off — every such fire mirrored back to the
+    originating pane and the panes flickered non-stop.
+    """
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    try:
+        provider = MockLLMProvider()
+        screen = ReaderScreen(project, provider_factory=lambda: provider)
+        app = EpublateApp(initial_screen=screen)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            current = pilot.app.screen
+            assert isinstance(current, ReaderScreen)
+
+            assert current._syncing_scroll is False  # type: ignore[reportPrivateUsage]
+            current._begin_syncing_scroll()  # type: ignore[reportPrivateUsage]
+            assert current._syncing_scroll is True  # type: ignore[reportPrivateUsage]
+
+            current.call_after_refresh(current._end_syncing_scroll)  # type: ignore[reportPrivateUsage]
+            await pilot.pause()
+            assert current._syncing_scroll is False, (  # type: ignore[reportPrivateUsage]
+                "guard must clear after the next refresh, not synchronously"
+            )
+
+            mirror_calls: list[bool] = []
+            original_mirror = current._mirror_scroll  # type: ignore[reportPrivateUsage]
+
+            def _spy(*, source_to_target: bool) -> None:
+                mirror_calls.append(source_to_target)
+                original_mirror(source_to_target=source_to_target)
+
+            current._mirror_scroll = _spy  # type: ignore[method-assign]
+
+            current._begin_syncing_scroll()  # type: ignore[reportPrivateUsage]
+            try:
+                current._mirror_scroll(source_to_target=True)  # type: ignore[reportPrivateUsage]
+                current._mirror_scroll(source_to_target=False)  # type: ignore[reportPrivateUsage]
+            finally:
+                current._end_syncing_scroll()  # type: ignore[reportPrivateUsage]
+
+            assert mirror_calls == [True, False], (
+                "the spy should record entry, but the inner mirror logic "
+                "must short-circuit when the guard is set so we never "
+                "issue a programmatic scroll on the destination pane"
+            )
+    finally:
+        project.close()

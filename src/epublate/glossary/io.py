@@ -241,14 +241,31 @@ def upsert_proposed(
     type: EntityType = "term",
     notes: str | None = None,
     first_seen_segment_id: str | None = None,
+    target_term: str | None = None,
 ) -> tuple[str, bool]:
     """Insert a ``proposed`` entry if no row exists yet for this source term.
 
     Returns ``(entry_id, created)`` so the pipeline can decide whether
     to emit an ``entity.proposed`` event (only on first sighting). If
-    an entry already exists for ``(source_term, type)`` we do not
-    touch it — the curator may have already promoted/edited it.
+    an entry already exists for ``(source_term, type)`` we *backfill*
+    its ``target_term`` when the existing row still mirrors the source
+    term verbatim and the caller has supplied a real translation —
+    that's how the auto-proposer recovers from the cold-start case
+    where an entity was first proposed by the extractor (target unknown)
+    and only later observed in a real translation.
+
+    A non-empty ``target_term`` argument that *differs* from the
+    proposed row's source term is treated as a real translation.
+    Anything else (``None``, empty string, or equal to ``source_term``)
+    keeps the placeholder behaviour of the pre-Lore-Books rollout.
+    Existing rows that the curator has already edited (status no longer
+    ``proposed`` or ``target_term`` already differs from ``source_term``)
+    are never touched.
     """
+
+    cleaned_target = (target_term or "").strip() or None
+    if cleaned_target is not None and cleaned_target == source_term:
+        cleaned_target = None
 
     existing = repo.find_glossary_entry_by_source_term(
         engine,
@@ -257,12 +274,23 @@ def upsert_proposed(
         type=type,
     )
     if existing is not None:
+        if (
+            cleaned_target is not None
+            and existing.status == "proposed"
+            and existing.target_term == existing.source_term
+        ):
+            repo.update_glossary_entry(
+                engine,
+                entry_id=existing.id,
+                target_term=cleaned_target,
+                reason="auto_propose:backfill_target",
+            )
         return existing.id, False
     entry = repo.create_glossary_entry(
         engine,
         project_id=project_id,
         source_term=source_term,
-        target_term=source_term,  # placeholder; curator promotes/edits
+        target_term=cleaned_target or source_term,
         type=type,
         status="proposed",
         notes=notes,

@@ -9,6 +9,7 @@ from epublate.app.screens.dashboard import DashboardScreen
 from epublate.app.screens.glossary import GlossaryScreen
 from epublate.app.screens.help import HelpScreen
 from epublate.app.screens.inbox import InboxScreen
+from epublate.app.screens.llm_activity import LLMActivityScreen
 from epublate.app.screens.new_project import NewProjectModal
 from epublate.app.screens.open_project import OpenProjectModal
 from epublate.app.screens.projects import ProjectsScreen
@@ -20,6 +21,7 @@ __all__ = [
     "GlossaryScreen",
     "HelpScreen",
     "InboxScreen",
+    "LLMActivityScreen",
     "NewProjectModal",
     "OpenProjectModal",
     "ProjectsScreen",

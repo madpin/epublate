@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 
 from epublate.core.cache import cache_key_for_messages
+from epublate.core.segmentation import PLACEHOLDER_RE, is_trivially_empty
 from epublate.core.validators import validate_segment_placeholders
 from epublate.db import repo, schema
 from epublate.errors import EpublateError
@@ -67,7 +68,16 @@ PURPOSE_TRANSLATE = "translate"
 # Default grouping parameters — see ``translate_segments_grouped``.
 GROUP_DEFAULT_MAX_ITEMS = 50
 GROUP_DEFAULT_MAX_SOURCE_CHARS = 240
-GROUP_PLACEHOLDER_PREFIX = "[[T"
+# Cap on placeholders per item in a grouped call. The grouped prompt
+# scopes placeholder ids per-item so each TOC link / index entry can
+# carry its own ``[[T0]]…[[/T0]]`` pair without colliding with siblings.
+# The cap exists because (a) reliability of the JSON response degrades
+# faster than linearly with placeholder density and (b) longer items
+# already get rejected by the char-budget check, which is the more useful
+# signal for "this isn't a TOC entry, send it solo". 8 placeholders is
+# enough for an anchor wrapping a chapter number plus a title, which is
+# the worst case in real-world TOCs we've sampled.
+GROUP_DEFAULT_MAX_PLACEHOLDERS = 8
 
 # When the translator's trace returns a candidate ``type`` we don't
 # recognize, we collapse to ``term`` so the auto-proposer can still
@@ -179,7 +189,17 @@ def translate_segment(
     * The segment update, the ``llm_call`` audit row, mentions, the
       auto-proposed entries, and every event commit together — one
       transaction, crash safe.
+    * Trivially empty segments (whitespace / NBSP / zero-width content
+      after stripping placeholders) short-circuit *before* any LLM /
+      glossary work: the pipeline copies ``source_text`` to
+      ``target_text`` and records a ``segment.translated_trivial``
+      event. No ``llm_call`` row is written because nothing was
+      called, and the segment counts as translated for budget /
+      progress purposes.
     """
+
+    if is_trivially_empty(segment.source_text):
+        return _short_circuit_trivial(engine, project_id=project_id, segment=segment)
 
     glossary_view = _load_glossary_view(engine, project_id=project_id)
     project_entries = glossary_view.entries
@@ -566,6 +586,68 @@ def _replay_from_cache(
     )
 
 
+def _short_circuit_trivial(
+    engine: Any,
+    *,
+    project_id: str,
+    segment: repo.SegmentRow,
+) -> TranslateOutcome:
+    """Persist a "translated" segment without paying for an LLM call.
+
+    Used for segments whose source is wholly placeholders + invisible
+    glue characters (``&nbsp;``, BOM, zero-width spaces). The original
+    text is round-tripped verbatim so the reassembled ePub keeps its
+    structural separators intact (PRD F-IO-2 / F-IO-5). We *don't*
+    write an ``llm_call`` row: nothing was called, so the audit log
+    shouldn't pretend otherwise. The ``segment.translated_trivial``
+    event keeps the breadcrumb for the Inbox / Dashboard activity
+    feed, and stats queries that aggregate over ``llm_call`` keep
+    their cost / token math correct because the row simply doesn't
+    contribute.
+    """
+
+    target = segment.source_text
+    spliced = _splice_target(segment, target=target)
+    validate_segment_placeholders(spliced)
+
+    with engine.begin() as conn:
+        repo.update_segment_translation(
+            conn,
+            segment_id=segment.id,
+            target_text=target,
+            status=schema.SegmentStatus.TRANSLATED,
+        )
+        repo.append_event(
+            conn,
+            project_id=project_id,
+            kind="segment.translated_trivial",
+            payload={
+                "segment_id": segment.id,
+                "char_count": len(target),
+                "reason": "trivially_empty",
+            },
+        )
+
+    _logger.info("translated segment %s (trivial / no LLM call)", segment.id)
+    trace = TranslatorTrace(target=target)
+    return TranslateOutcome(
+        segment_id=segment.id,
+        target_text=target,
+        trace=trace,
+        cache_hit=False,
+        prompt_tokens=0,
+        completion_tokens=0,
+        cost_usd=0.0,
+        llm_call_id="",
+        cache_key="",
+        violations=(),
+        flagged=False,
+        mention_entry_ids=(),
+        proposed_entry_ids=(),
+        extra={"trivial": True},
+    )
+
+
 def _splice_target(segment: repo.SegmentRow, *, target: str) -> Segment:
     """Reconstruct a runtime :class:`Segment` with the LLM target attached.
 
@@ -854,7 +936,7 @@ def _auto_propose_entities(
                     candidate = _normalize_new_entity(raw)
                     if candidate is None:
                         continue
-                    source_term, type_ = candidate
+                    source_term, type_, target_term = candidate
                     entry_id, created = glossary_io.upsert_proposed(
                         lore_conn,
                         project_id=target_pid,
@@ -862,6 +944,7 @@ def _auto_propose_entities(
                         type=type_,
                         first_seen_segment_id=None,
                         notes=None,
+                        target_term=target_term,
                     )
                     if not created:
                         continue
@@ -890,7 +973,7 @@ def _auto_propose_entities(
         candidate = _normalize_new_entity(raw)
         if candidate is None:
             continue
-        source_term, type_ = candidate
+        source_term, type_, target_term = candidate
         entry_id, created = glossary_io.upsert_proposed(
             conn,
             project_id=project_id,
@@ -898,6 +981,7 @@ def _auto_propose_entities(
             type=type_,
             first_seen_segment_id=segment_id,
             notes=None,
+            target_term=target_term,
         )
         if not created:
             continue
@@ -916,13 +1000,19 @@ def _auto_propose_entities(
     return created_ids
 
 
-def _normalize_new_entity(raw: dict[str, Any]) -> tuple[str, EntityType] | None:
-    """Coerce one ``new_entities`` item to ``(source_term, type)`` or ``None``.
+def _normalize_new_entity(
+    raw: dict[str, Any],
+) -> tuple[str, EntityType, str | None] | None:
+    """Coerce one ``new_entities`` item to ``(source, type, target)`` or ``None``.
 
-    The translator prompt asks for ``{"type": ..., "source": ..., "evidence": ...}``
-    but we accept ``"source_term"`` too in case the model uses the
-    English variant. Anything missing or empty is dropped silently —
-    auto-proposal is best-effort, not a hard contract.
+    The translator prompt asks for
+    ``{"type": ..., "source": ..., "target": ..., "evidence": ...}``
+    but we accept the ``"_term"`` variants too in case the model uses
+    the longer keys. Anything missing or empty is dropped silently —
+    auto-proposal is best-effort, not a hard contract. ``target`` is
+    optional and falls back to ``None`` when the model omitted it; the
+    glossary IO layer treats ``None`` and ``source_term``-equal as
+    "no real translation observed yet".
     """
 
     if not isinstance(raw, dict):
@@ -936,32 +1026,50 @@ def _normalize_new_entity(raw: dict[str, Any]) -> tuple[str, EntityType] | None:
     type_str = str(raw.get("type", "term")).strip().lower() or "term"
     if type_str not in _VALID_ENTITY_TYPES:
         type_str = "term"
-    return source_term, cast(EntityType, type_str)
+    target_raw = raw.get("target") or raw.get("target_term")
+    if isinstance(target_raw, str):
+        target_term: str | None = target_raw.strip() or None
+    else:
+        target_term = None
+    return source_term, cast(EntityType, type_str), target_term
 
 
 def is_group_eligible(
     segment: repo.SegmentRow,
     *,
     max_source_chars: int = GROUP_DEFAULT_MAX_SOURCE_CHARS,
+    max_placeholders: int = GROUP_DEFAULT_MAX_PLACEHOLDERS,
 ) -> bool:
     """Cheap check: is ``segment`` safe to translate in a batched call?
 
     The grouped call path trades one round-trip per N items for a
     slightly less context-rich prompt. It's only a win for segments
     that are (a) short enough to fit N of them in a single prompt,
-    (b) free of inline-tag placeholders so a parse failure doesn't
+    (b) light on inline-tag placeholders so a parse failure doesn't
     risk format corruption across many segments, and (c) still
     ``pending`` (grouping already-translated content wastes tokens).
+
+    Light placeholder use *is* allowed (TOC / index links wrap their
+    text in a single ``<a>`` and end up with one ``[[T0]]…[[/T0]]``
+    pair). The grouped prompt scopes placeholder ids per item; a
+    response that mangles them still falls back to per-segment
+    translation via :func:`translate_segments_grouped`, so the cap on
+    ``max_placeholders`` is really a heuristic for "this is too markup-
+    heavy to risk batching".
     """
 
     if segment.status != schema.SegmentStatus.PENDING:
         return False
     text = segment.source_text or ""
-    if not text.strip():
+    # Skip whitespace-only / placeholder-only items: they're handled by
+    # the trivial short-circuit in ``translate_segment`` and grouping
+    # them just clutters the batch payload.
+    if is_trivially_empty(text):
         return False
     if len(text) > max_source_chars:
         return False
-    return GROUP_PLACEHOLDER_PREFIX not in text
+    placeholder_count = sum(1 for _ in PLACEHOLDER_RE.finditer(text))
+    return placeholder_count <= max_placeholders
 
 
 def translate_segments_grouped(
@@ -1478,6 +1586,7 @@ def _split_tokens(total: int, weight: int, total_weight: int) -> int:
 
 __all__ = [
     "GROUP_DEFAULT_MAX_ITEMS",
+    "GROUP_DEFAULT_MAX_PLACEHOLDERS",
     "GROUP_DEFAULT_MAX_SOURCE_CHARS",
     "PURPOSE_TRANSLATE",
     "PipelineError",

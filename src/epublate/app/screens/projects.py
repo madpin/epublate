@@ -13,6 +13,7 @@ authoritative project state still lives in each project's SQLite DB.
 from __future__ import annotations
 
 import logging
+import shutil
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,9 +21,9 @@ from typing import TYPE_CHECKING, ClassVar
 
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
-from textual.containers import Center, Vertical
-from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, Static
+from textual.containers import Center, Horizontal, Vertical
+from textual.screen import ModalScreen, Screen
+from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Static
 
 from epublate.app.branding import (
     EPUBLATE_LOGO,
@@ -38,6 +39,7 @@ from epublate.app.paths import default_projects_root
 from epublate.app.recents import RecentProject, RecentsStore
 from epublate.app.screens.new_project import NewProjectModal, ProviderFactory
 from epublate.app.screens.open_project import OpenProjectModal
+from epublate.app.widgets import BatchStatusBar
 from epublate.core.stats import compute_stats
 
 if TYPE_CHECKING:
@@ -54,6 +56,227 @@ _HERO_HINT = (
     f"{ICON_BULLET} [b]L[/b] lore books   "
     f"{ICON_BULLET} [b]?[/b] help"
 )
+
+
+class RemoveRecentConfirmModal(ModalScreen[bool]):
+    """Confirm dropping a project entry from the recents list (non-destructive).
+
+    The entry's project files are *never* touched here — only the
+    `recents.json` row goes away. We still surface a confirmation
+    because the row holds the only obvious path to a project that
+    isn't in the curator's filesystem mental cache, and accidental
+    delete-key presses on a packed table happen.
+    """
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("y", "confirm", "Yes", show=True),
+        Binding("n", "cancel", "No", show=True),
+        Binding("escape", "cancel", "Cancel", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    RemoveRecentConfirmModal {
+        align: center middle;
+    }
+    RemoveRecentConfirmModal #remove-box {
+        width: 70;
+        height: auto;
+        border: round $accent;
+        padding: 1 2;
+        background: $panel;
+    }
+    RemoveRecentConfirmModal #remove-title {
+        text-style: bold;
+        color: $primary;
+        padding: 0 0 1 0;
+    }
+    RemoveRecentConfirmModal #remove-body {
+        height: auto;
+        padding: 0 0 1 0;
+    }
+    RemoveRecentConfirmModal #remove-buttons {
+        height: 3;
+        align-horizontal: right;
+    }
+    RemoveRecentConfirmModal #remove-buttons Button {
+        margin: 0 0 0 1;
+    }
+    """
+
+    def __init__(self, *, name: str, project_dir: str) -> None:
+        super().__init__()
+        # Avoid clashing with ``Screen.name``/``Widget.name`` (typed
+        # ``str | None`` upstream) so mypy keeps our attribute as a
+        # non-optional ``str``.
+        self._project_name = name
+        self._project_dir = project_dir
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="remove-box"):
+            yield Label(
+                f"Remove [b]{_escape(self._project_name)}[/b] from recents?",
+                id="remove-title",
+                markup=True,
+            )
+            yield Static(
+                "[b]The project files stay on disk[/b]; this only removes "
+                "the row from the recents list.\n\n"
+                f"  [dim]{_escape(_shorten_path(self._project_dir))}[/dim]\n\n"
+                "Press [b]y[/b] to remove from recents, [b]n[/b] to cancel.",
+                id="remove-body",
+                markup=True,
+            )
+            with Horizontal(id="remove-buttons"):
+                yield Button("Cancel", id="remove-cancel", variant="default")
+                yield Button(
+                    "Remove from recents",
+                    id="remove-confirm",
+                    variant="primary",
+                )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        if button_id == "remove-confirm":
+            self.action_confirm()
+        elif button_id == "remove-cancel":
+            self.action_cancel()
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
+class DeleteProjectConfirmModal(ModalScreen[bool]):
+    """Two-step confirmation for irreversibly wiping a project's folder.
+
+    Deleting a project is destructive: the SQLite DB (which carries
+    every translated segment, every glossary entry, every LLM
+    audit row), the original ePub copy, and any exported translations
+    living in the same folder all go away. We require the curator to
+    type the project's name verbatim before the destructive button
+    enables — this is the same pattern GitHub / GitLab use for
+    "delete repository" and matches the destructive-action best
+    practice from the testing rule (no flaky destructive paths).
+    """
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("ctrl+s", "submit", "Delete", show=True),
+        Binding("escape", "cancel", "Cancel", show=True),
+    ]
+
+    DEFAULT_CSS = """
+    DeleteProjectConfirmModal {
+        align: center middle;
+    }
+    DeleteProjectConfirmModal #delete-box {
+        width: 80;
+        height: auto;
+        border: round $error;
+        padding: 1 2;
+        background: $panel;
+    }
+    DeleteProjectConfirmModal #delete-title {
+        text-style: bold;
+        color: $error;
+        padding: 0 0 1 0;
+    }
+    DeleteProjectConfirmModal #delete-warning {
+        color: $error;
+        padding: 0 0 1 0;
+    }
+    DeleteProjectConfirmModal #delete-detail {
+        color: $text-muted;
+        padding: 0 0 1 0;
+    }
+    DeleteProjectConfirmModal #delete-prompt {
+        padding: 0 0 1 0;
+    }
+    DeleteProjectConfirmModal #delete-error {
+        color: $error;
+        text-style: bold;
+        height: auto;
+        padding: 0 0 1 0;
+    }
+    DeleteProjectConfirmModal #delete-buttons {
+        height: 3;
+        align-horizontal: right;
+    }
+    DeleteProjectConfirmModal #delete-buttons Button {
+        margin: 0 0 0 1;
+    }
+    """
+
+    def __init__(self, *, name: str, project_dir: str) -> None:
+        super().__init__()
+        # Stored under ``_project_name`` (not ``_name``) to dodge
+        # Textual's ``Widget.name`` / ``Screen.name`` attribute, which
+        # is typed ``str | None`` and would weaken our type guarantees.
+        self._project_name = name
+        self._project_dir = project_dir
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="delete-box"):
+            yield Label(
+                f"  [error]{ICON_BULLET}[/error] Delete project "
+                f"[b]{_escape(self._project_name)}[/b]?",
+                id="delete-title",
+                markup=True,
+            )
+            yield Static(
+                "[b]This is irreversible.[/b] The project folder and every "
+                "file inside it (SQLite database, original ePub copy, any "
+                "exported translations) will be permanently deleted from disk.",
+                id="delete-warning",
+                markup=True,
+            )
+            yield Static(
+                f"  folder : [dim]{_escape(_shorten_path(self._project_dir))}[/dim]",
+                id="delete-detail",
+                markup=True,
+            )
+            yield Static(
+                "Type the project name "
+                f"[b]{_escape(self._project_name)}[/b] to confirm:",
+                id="delete-prompt",
+                markup=True,
+            )
+            yield Input(value="", id="delete-confirm-input")
+            yield Static("", id="delete-error", markup=False)
+            with Horizontal(id="delete-buttons"):
+                yield Button("Cancel", id="delete-cancel", variant="default")
+                yield Button(
+                    "Delete project",
+                    id="delete-confirm",
+                    variant="error",
+                )
+
+    def on_mount(self) -> None:
+        self.query_one("#delete-confirm-input", Input).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        if button_id == "delete-confirm":
+            self.action_submit()
+        elif button_id == "delete-cancel":
+            self.action_cancel()
+
+    def on_input_submitted(self, _event: Input.Submitted) -> None:
+        self.action_submit()
+
+    def action_submit(self) -> None:
+        typed = self.query_one("#delete-confirm-input", Input).value.strip()
+        if typed != self._project_name:
+            self.query_one("#delete-error", Static).update(
+                f"Doesn't match. Type {self._project_name!r} exactly to confirm."
+            )
+            return
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
 
 _EMPTY_BODY = (
     "[b]Welcome to epublate.[/b]\n\n"
@@ -84,9 +307,12 @@ class ProjectsScreen(Screen[None]):
         Binding("L", "open_lore_books", "Lore Books", show=True),
         Binding("delete", "remove_selected", "Remove", show=True),
         Binding("x", "remove_selected", "Remove", show=False),
+        # ``D`` (capital) wipes the project folder *and* drops the
+        # recents row. Capital so muscle-memory ``d`` (textual's
+        # toggle-dark legacy) never lands on a destructive action.
+        Binding("D", "delete_project", "Delete", show=True),
         Binding("r", "refresh", "Refresh", show=True),
         Binding("q", "app.quit", "Quit", show=True),
-        Binding("d", "app.toggle_dark", "Toggle dark", show=False),
     ]
 
     DEFAULT_CSS = """
@@ -241,6 +467,7 @@ class ProjectsScreen(Screen[None]):
                 id="projects-status",
                 markup=True,
             )
+        yield BatchStatusBar(id="projects-batch-status")
         yield Footer()
 
     # ------------------------------------------------------------------
@@ -355,12 +582,76 @@ class ProjectsScreen(Screen[None]):
         if entry is None:
             self._set_status("Nothing selected to remove.")
             return
-        if self._store.remove(entry.project_dir):
-            self._save_store_safely()
-            self._refresh_table()
-            self._set_status(
-                f"Removed {entry.name!r} from recents (project files left untouched)."
-            )
+        modal = RemoveRecentConfirmModal(name=entry.name, project_dir=entry.project_dir)
+
+        def _on_choice(confirmed: bool | None) -> None:
+            # ``None`` arrives if the modal is dismissed without an
+            # explicit choice (Esc is mapped to cancel above, so this
+            # is just defensive).
+            if not confirmed:
+                self._set_status("Remove cancelled.")
+                return
+            if self._store.remove(entry.project_dir):
+                self._save_store_safely()
+                self._refresh_table()
+                self._set_status(
+                    f"Removed {entry.name!r} from recents "
+                    "(project files left untouched)."
+                )
+
+        self.app.push_screen(modal, _on_choice)
+
+    def action_delete_project(self) -> None:
+        """Push the destructive delete-project flow.
+
+        Differs from :meth:`action_remove_selected` in three ways:
+
+        * The modal requires the curator to type the project's name.
+        * It deletes the project folder + every file inside it.
+        * It also drops the recents row (so the now-missing folder
+          doesn't show up as a "missing" ghost on the next refresh).
+        """
+
+        entry = self._selected_entry()
+        if entry is None:
+            self._set_status("Nothing selected to delete.")
+            return
+        modal = DeleteProjectConfirmModal(
+            name=entry.name, project_dir=entry.project_dir
+        )
+
+        def _on_choice(confirmed: bool | None) -> None:
+            if not confirmed:
+                self._set_status("Delete cancelled.")
+                return
+            self._delete_project_files(entry)
+
+        self.app.push_screen(modal, _on_choice)
+
+    def _delete_project_files(self, entry: RecentProject) -> None:
+        """Wipe the on-disk project folder and drop its recents row.
+
+        Errors are surfaced in the status bar but never raise: a
+        missing folder still results in a "remove from recents" win
+        so the curator isn't stuck with a phantom row, and a
+        permission error keeps the recents row in place so they can
+        retry from the same place once they've fixed the perms.
+        """
+
+        path = Path(entry.project_dir)
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+        except OSError as exc:
+            _logger.exception("could not delete project folder %s", path)
+            self._set_status(f"Could not delete {entry.name!r}: {exc}")
+            return
+        # Always drop the recents row even if the folder was already
+        # gone — better than leaving a dangling pointer.
+        self._store.remove(entry.project_dir)
+        self._save_store_safely()
+        self._refresh_table()
+        self._set_status(f"Deleted {entry.name!r} (folder + recents row).")
 
     # ------------------------------------------------------------------
     # Modal callbacks

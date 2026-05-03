@@ -534,9 +534,10 @@ def export(
     default=True,
     show_default=True,
     help=(
-        "Batch short, placeholder-free segments (e.g. table of contents, "
-        "index entries) into a single LLM call to cut round-trips. "
-        "Disable if your provider doesn't play nicely with list-style JSON."
+        "Batch short, lightly-marked-up segments (e.g. table of contents, "
+        "index entries — including those wrapped in <a> links) into a "
+        "single LLM call to cut round-trips. Disable if your provider "
+        "doesn't play nicely with list-style JSON."
     ),
 )
 @click.option(

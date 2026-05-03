@@ -32,8 +32,8 @@ from lxml import etree
 
 from epublate import __version__
 from epublate.core.segmentation import (
-    PLACEHOLDER_RE,
     apply_parts_to_host,
+    is_trivially_empty,
     placeholderize,
 )
 from epublate.core.validators import validate_segment_placeholders
@@ -264,14 +264,12 @@ class EpubAdapter:
         segments: list[Segment] = []
         for host in _find_translatable_hosts(doc.tree, target_lang=self.target_lang):
             source_text, skeleton = placeholderize(host)
-            if not source_text.strip():
-                continue
-            # ``<p><img/></p>`` and friends placeholderize to a single
-            # ``[[T0]]`` (or ``[[T0]][[/T0]]`` for empty inline pairs)
-            # with no human-readable text. They round-trip fine when
-            # left untouched in the DOM, so segmenting them just bloats
-            # the queue and confuses the Reader (PRD §4.6).
-            if not PLACEHOLDER_RE.sub("", source_text).strip():
+            # ``<p>&#160;</p>``, ``<p><img/></p>``, ``<p><a>&#160;</a></p>``
+            # and friends placeholderize to text that is wholly placeholders
+            # plus invisible glue (NBSP, BOM, zero-width spaces). They
+            # round-trip fine when left untouched in the DOM, so segmenting
+            # them just bloats the queue and confuses the Reader (PRD §4.6).
+            if is_trivially_empty(source_text):
                 continue
             host_path = _xpath_to(host)
             seg = Segment(

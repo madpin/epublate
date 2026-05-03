@@ -46,6 +46,7 @@ from epublate.core.extractor import (
 )
 from epublate.core.pipeline import (
     GROUP_DEFAULT_MAX_ITEMS,
+    GROUP_DEFAULT_MAX_PLACEHOLDERS,
     GROUP_DEFAULT_MAX_SOURCE_CHARS,
     TranslateOptions,
     TranslateOutcome,
@@ -99,9 +100,16 @@ class BatchOptions:
     # conservative; reliability of the JSON response degrades faster
     # than linearly as the group grows, and a parse failure falls
     # back per-segment (so the maximum win is bounded by this cap).
+    # ``group_max_placeholders`` caps how much inline markup an item
+    # can carry and still join a group: a TOC link wraps its label in
+    # one ``<a>`` and ends up with one ``[[T0]]…[[/T0]]`` pair; an
+    # index entry with multiple page-number anchors carries more.
+    # Past the cap we route the segment through the per-segment path
+    # so the more-context prompt handles the heavier markup.
     group_small_segments: bool = True
     group_max_items: int = GROUP_DEFAULT_MAX_ITEMS
     group_max_source_chars: int = GROUP_DEFAULT_MAX_SOURCE_CHARS
+    group_max_placeholders: int = GROUP_DEFAULT_MAX_PLACEHOLDERS
 
 
 @dataclass(slots=True)
@@ -167,6 +175,21 @@ class BatchPaused(EpublateError):
         self.summary = summary
 
 
+class BatchCancelled(EpublateError):
+    """Batch stopped because the curator hit the Cancel binding.
+
+    Differs from :class:`BatchPaused` in two ways: the partial summary
+    has no ``paused_reason`` (cancellation is a curator action, not a
+    cap-and-resume condition), and the audit log gets a
+    ``batch.cancelled`` event so the recent-activity strip shows
+    "cancelled by user" rather than "paused by budget".
+    """
+
+    def __init__(self, message: str, *, summary: BatchSummary) -> None:
+        super().__init__(message)
+        self.summary = summary
+
+
 def run_batch(
     *,
     engine: Engine,
@@ -177,6 +200,7 @@ def run_batch(
     options: BatchOptions,
     on_progress: ProgressCallback | None = None,
     segments: Sequence[repo.SegmentRow] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> BatchSummary:
     """Translate every pending segment in scope, returning the summary.
 
@@ -198,6 +222,12 @@ def run_batch(
       exceed ``effective_budget`` (project budget if any, overridden
       by ``options.budget_usd``); raises :class:`BatchPaused` after
       draining in-flight tasks.
+    * Stops accepting new work when ``cancel_event`` is set
+      (the curator pressed Cancel from the Dashboard); raises
+      :class:`BatchCancelled` after draining in-flight tasks. We
+      can't kill a request mid-flight on the OpenAI SDK's blocking
+      ``post`` call, so cancellation is best-effort: in-flight LLM
+      calls finish, no new ones start.
     * Per-segment failures don't abort: they're recorded on the
       summary and emitted as ``batch.segment_failed`` events.
     """
@@ -301,6 +331,7 @@ def run_batch(
     concurrency = max(1, options.concurrency)
     paused = False
     pause_reason: str | None = None
+    cancelled = False
 
     # Lock guards every mutation of ``summary`` since Futures complete on
     # worker threads. Cheap: we only hold it for a few field updates.
@@ -370,16 +401,22 @@ def run_batch(
 
     work_items = _build_work_items(pending, options=options)
 
+    def _cancel_requested() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         in_flight: set[Future[WorkerResult]] = set()
         queue: list[list[repo.SegmentRow]] = list(work_items)
         # Prime the pool with up to ``concurrency`` tasks. After that
         # we submit one new task per completion (sliding window) so the
         # budget cap can short-circuit further submissions cleanly.
-        while queue and len(in_flight) < concurrency:
+        while queue and len(in_flight) < concurrency and not _cancel_requested():
             in_flight.add(
                 _submit_work_item(pool, queue.pop(0), _worker_single, _worker_group)
             )
+        if _cancel_requested():
+            cancelled = True
+            queue.clear()
 
         while in_flight:
             done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
@@ -433,8 +470,13 @@ def run_batch(
                             f"at ${summary.cost_usd:.4f}"
                         )
                         queue.clear()  # stop submitting new work
-            # Top up the pool only if we haven't paused.
-            while not paused and queue and len(in_flight) < concurrency:
+            if _cancel_requested() and not cancelled:
+                cancelled = True
+                queue.clear()
+            # Top up the pool only if we haven't paused or cancelled.
+            while (
+                not paused and not cancelled and queue and len(in_flight) < concurrency
+            ):
                 in_flight.add(
                     _submit_work_item(pool, queue.pop(0), _worker_single, _worker_group)
                 )
@@ -454,6 +496,22 @@ def run_batch(
             },
         )
         raise BatchPaused(pause_reason or "batch paused", summary=summary)
+
+    if cancelled:
+        # Cancellation is curator-initiated; we treat it like a
+        # successful early-exit for accounting purposes (everything
+        # already charged stays charged) but emit a distinct event so
+        # the activity panel can label the run accurately.
+        repo.append_event(
+            engine,
+            project_id=project_id,
+            kind="batch.cancelled",
+            payload={
+                **_summary_payload(summary),
+                "reason": "cancelled by user",
+            },
+        )
+        raise BatchCancelled("batch cancelled by user", summary=summary)
 
     repo.append_event(
         engine,
@@ -553,7 +611,9 @@ def _build_work_items(
 
     for seg in pending:
         eligible = is_group_eligible(
-            seg, max_source_chars=options.group_max_source_chars
+            seg,
+            max_source_chars=options.group_max_source_chars,
+            max_placeholders=options.group_max_placeholders,
         )
         if not eligible:
             _flush()
@@ -645,6 +705,7 @@ def _select_pending(
 
 
 __all__ = [
+    "BatchCancelled",
     "BatchOptions",
     "BatchPaused",
     "BatchProgressEvent",

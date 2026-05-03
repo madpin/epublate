@@ -26,32 +26,52 @@ class BatchSnapshot:
     cache hits / failures count toward it so the bar fills to 100% as
     the worker drains the queue. ``elapsed_s`` is the worker's own
     wall clock (the meter never reads ``time.monotonic()`` itself).
+
+    ``chapter_count`` is the number of distinct chapters touched by
+    this run, surfaced to the curator as "across N chapters" so they
+    have both granularities at a glance (PRD §4.6 / batch UI).
+
+    ``project_total_cost_usd`` is the running project-wide spend —
+    the sum of the project's pre-batch spend snapshot and this batch's
+    accumulated cost — so curators can compare "this batch" vs
+    "the whole project" at a glance.
+
+    ``cancelled`` is set in the final snapshot when the curator
+    stopped the run; ``cancelling`` is set on intermediate snapshots
+    while the worker is draining in-flight LLM calls after the curator
+    pressed cancel.
     """
 
     attempted: int = 0
     total: int = 0
+    chapter_count: int = 0
     translated: int = 0
     cached: int = 0
     flagged: int = 0
     failed: int = 0
     cost_usd: float = 0.0
+    project_total_cost_usd: float | None = None
     elapsed_s: float = 0.0
     paused: bool = False
     paused_reason: str | None = None
+    cancelled: bool = False
+    cancelling: bool = False
 
 
 class BatchProgressMeter(Static):
-    """One-line meter for the running batch.
+    """Multi-line meter for the running batch.
 
-    The rendered line has three sections:
+    The rendered block has four sections:
 
-    * ``attempted/total`` plus a 24-cell bar.
-    * Per-status counters (translated / cached / flagged / failed) and
-      cumulative cost.
-    * Elapsed wall clock, ETA, and throughput in segments-per-second.
+    * Header: "Batch <state>" + the active chapter / segment scope.
+    * Bar: ``attempted/total`` plus a 24-cell progress bar.
+    * Counters: translated / cached / flagged / failed; cost line
+      with both the current batch and the running project total.
+    * Wall clock: elapsed, ETA, throughput.
 
-    When idle the widget renders an explicit "Idle" so curators always
-    know whether a batch is currently running.
+    State badges (``running`` / ``cancelling…`` / ``paused`` /
+    ``cancelled`` / ``done``) help the curator see at a glance whether
+    a batch is still consuming budget or has wound down.
     """
 
     DEFAULT_CSS = """
@@ -64,6 +84,12 @@ class BatchProgressMeter(Static):
     }
     BatchProgressMeter.-paused {
         color: $warning;
+    }
+    BatchProgressMeter.-cancelling {
+        color: $warning;
+    }
+    BatchProgressMeter.-cancelled {
+        color: $error;
     }
     """
 
@@ -81,6 +107,8 @@ class BatchProgressMeter(Static):
             self.update("[b]Batch[/b]: idle")
             self.remove_class("-active")
             self.remove_class("-paused")
+            self.remove_class("-cancelling")
+            self.remove_class("-cancelled")
             return
         ratio = snap.attempted / snap.total if snap.total else 0.0
         bar = self._bar(ratio)
@@ -90,28 +118,68 @@ class BatchProgressMeter(Static):
             if snap.elapsed_s > 0 and snap.attempted > 0
             else "—"
         )
-        line1 = (
-            f"[b]Batch[/b]: {snap.attempted}/{snap.total} ({ratio * 100:5.1f}%) {bar}"
+
+        state_badge, css_class = self._state_badge(snap)
+        scope = self._scope_line(snap)
+        cost_line = self._cost_line(snap)
+
+        header = f"[b]Batch[/b]  {state_badge}{scope}"
+        bar_line = (
+            f"  {snap.attempted} / {snap.total} segments ({ratio * 100:5.1f}%) {bar}"
         )
-        line2 = (
-            f"  translated {snap.translated}, cached {snap.cached}, "
-            f"flagged {snap.flagged}, failed {snap.failed} — "
-            f"cost ${snap.cost_usd:.4f}"
+        counters = (
+            f"  translated {snap.translated} · cached {snap.cached} · "
+            f"flagged {snap.flagged} · failed {snap.failed}"
         )
-        line3 = (
-            f"  elapsed {self._fmt_duration(snap.elapsed_s)} — "
-            f"ETA {eta} — speed {speed} seg/s"
+        clock = (
+            f"  elapsed {self._fmt_duration(snap.elapsed_s)} · "
+            f"ETA {eta} · speed {speed} seg/s"
         )
+        if snap.paused and snap.paused_reason:
+            clock = f"{clock}\n  [b]paused:[/b] {snap.paused_reason}"
+
+        self.remove_class("-active")
+        self.remove_class("-paused")
+        self.remove_class("-cancelling")
+        self.remove_class("-cancelled")
+        if css_class:
+            self.add_class(css_class)
+        self.update("\n".join([header, bar_line, counters, cost_line, clock]))
+
+    @staticmethod
+    def _state_badge(snap: BatchSnapshot) -> tuple[str, str]:
+        """Pick the human-readable state label + CSS class for the meter."""
+
+        if snap.cancelled:
+            return "[b][error]cancelled[/error][/b]", "-cancelled"
+        if snap.cancelling:
+            return "[b][warning]cancelling…[/warning][/b]", "-cancelling"
         if snap.paused:
-            line1 = f"{line1}  [b]paused[/b]"
-            if snap.paused_reason:
-                line3 = f"{line3}\n  [b]paused:[/b] {snap.paused_reason}"
-            self.add_class("-paused")
-            self.remove_class("-active")
-        else:
-            self.add_class("-active")
-            self.remove_class("-paused")
-        self.update(f"{line1}\n{line2}\n{line3}")
+            return "[b][warning]paused[/warning][/b]", "-paused"
+        if snap.attempted >= snap.total:
+            return "[b]done[/b]", ""
+        return "[b]running[/b]", "-active"
+
+    @staticmethod
+    def _scope_line(snap: BatchSnapshot) -> str:
+        """Format "across N chapters · M segments" or "" if no chapters."""
+
+        if snap.chapter_count <= 0:
+            return f"  ·  [b]{snap.total}[/b] segments queued"
+        chapter_word = "chapter" if snap.chapter_count == 1 else "chapters"
+        return (
+            f"  ·  across [b]{snap.chapter_count}[/b] {chapter_word} · "
+            f"[b]{snap.total}[/b] segments queued"
+        )
+
+    @staticmethod
+    def _cost_line(snap: BatchSnapshot) -> str:
+        """Render "this batch: $X · project total: $Y" (or just batch)."""
+
+        batch_str = f"this batch ${snap.cost_usd:.4f}"
+        if snap.project_total_cost_usd is None:
+            return f"  {batch_str}"
+        return f"  {batch_str}  ·  project total ${snap.project_total_cost_usd:.4f}"
 
     @staticmethod
     def _eta(snap: BatchSnapshot) -> str:

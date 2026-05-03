@@ -140,11 +140,20 @@ Respond with a single JSON object and nothing else:
   "target": "<translated text with placeholders preserved>",
   "used_entries": ["<source_term you used a glossary entry for>", ...],
   "new_entities": [
-    {{"type": "character|place|...", "source": "...", "evidence": "..."}},
+    {{"type": "character|place|...",
+     "source": "<surface form in the source>",
+     "target": "<the exact target spelling you used in the translation above>",
+     "evidence": "..."}},
     ...
   ],
   "notes": "optional free-text notes for the curator, or omit"
 }}
+
+When you list a candidate in ``new_entities`` its ``target`` MUST be
+the literal spelling you used inside ``target`` for this segment —
+that's how the lore bible learns the canonical translation. If for
+some reason the entity does not appear in the translation (e.g. you
+elided it), set ``target`` to the form you would use next time.
 
 Do not wrap the JSON in code fences. Do not add commentary.\
 """
@@ -172,9 +181,14 @@ Hard rules — these are not negotiable:
    the glossary below. Locked glossary entries are non-negotiable,
    confirmed entries are strong defaults, proposed entries are
    suggestions.
-5. No inline placeholders (`[[T0]]`, etc.) should appear in the input
-   for this batch; if you see any, treat them as literal characters
-   that must survive verbatim in the output.
+5. Inline formatting in each item's source is encoded as opaque
+   placeholders of the form ``[[T0]]``, ``[[/T0]]``, ``[[T1]]``, etc.
+   For each item, every placeholder that appears in that item's
+   source MUST appear exactly once in that item's target, in the same
+   relative order. Do not invent new placeholders. Do not drop any.
+   Closing placeholders (``[[/T0]]``) must always pair with their
+   opener (``[[T0]]``). Placeholder ids are local to each item — do
+   not share or shift them across items.
 
 {style_guide_block}{glossary_block}{target_only_block}\
 Input format: the user message is a JSON object of the shape
@@ -185,10 +199,13 @@ single JSON object and nothing else:
   "translations": [
     {{
       "id": <the item id you were given>,
-      "target": "<translated text>",
+      "target": "<translated text with placeholders preserved>",
       "used_entries": ["<source_term you applied from the glossary>", ...],
       "new_entities": [
-        {{"type": "character|place|...", "source": "...", "evidence": "..."}},
+        {{"type": "character|place|...",
+         "source": "<surface form in the source>",
+         "target": "<the exact target spelling you used above>",
+         "evidence": "..."}},
         ...
       ],
       "notes": "optional, omit when empty"

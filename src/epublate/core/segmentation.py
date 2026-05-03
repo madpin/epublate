@@ -40,6 +40,16 @@ if TYPE_CHECKING:  # lxml is heavy; keep static-only at module load time
 
 PLACEHOLDER_RE = re.compile(r"\[\[(/?)T(\d+)\]\]")
 
+# Zero-width / formatting code points that ``str.isspace()`` treats as
+# *non*-whitespace but that carry no translatable content. Stripping them
+# alongside Unicode whitespace lets us detect "this segment is just an
+# invisible glue char" before paying for an LLM call (PRD F-LLM-7).
+# Common offenders in real-world ePubs: stray ZWSP/ZWNJ from copy-paste,
+# BOM left over from Windows-1252 → UTF-8 round-trips, WORD JOINER as a
+# soft separator. Keep the set conservative — anything *visible* (combining
+# marks, non-ASCII letters) must stay translatable.
+_INVISIBLE_FORMATTING_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff]")
+
 # HTML void elements: they never have child content or a closing tag in
 # well-formed XHTML. Anything else is treated as a "pair" token.
 VOID_LOCAL_NAMES: frozenset[str] = frozenset(
@@ -73,6 +83,39 @@ def count_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def is_trivially_empty(source_text: str) -> bool:
+    """True if ``source_text`` carries no content worth sending to the LLM.
+
+    A segment is "trivially empty" when, after stripping every inline-tag
+    placeholder and every Unicode whitespace + zero-width formatting
+    code point, nothing remains. Examples that match:
+
+    * ``""`` — a wholly empty string.
+    * ``" \u00a0\t"`` — a paragraph with only spacing (the classic
+      ``<p>&#160;</p>`` separator from Calibre-converted ePubs).
+    * ``"[[T0]]\u00a0[[/T0]]"`` — a link wrapping just a non-breaking
+      space (e.g. an empty TOC anchor).
+    * ``"\ufeff\u200b"`` — leftover BOM / zero-width space.
+
+    Examples that do *not* match (these still get translated):
+
+    * ``"1"`` — a chapter number is short but real text.
+    * ``"—"`` — a dash separator is real punctuation.
+    * ``"[[T0]]Title[[/T0]]"`` — a link with text inside.
+
+    The ePub segmenter uses this to keep noise out of the segment table at
+    intake time; the translation pipeline uses it as a defense-in-depth
+    check so projects segmented before this filter existed still avoid
+    spurious LLM round-trips on ``&nbsp;``-only paragraphs.
+    """
+
+    if not source_text:
+        return True
+    stripped = PLACEHOLDER_RE.sub("", source_text)
+    stripped = _INVISIBLE_FORMATTING_RE.sub("", stripped)
+    return not stripped.strip()
+
+
 def _local_name(tag: str) -> str:
     """Strip Clark-notation namespace from a tag name (``{ns}foo`` → ``foo``)."""
 
@@ -83,6 +126,51 @@ def _local_name(tag: str) -> str:
 
 def _is_void(tag: str) -> bool:
     return _local_name(tag).lower() in VOID_LOCAL_NAMES
+
+
+# Marker prefix we put on the ``InlineToken.tag`` of a "entity" token so
+# the rebuilder can tell entity tokens apart from regular tag names.
+# The format is ``"&name;"`` (the entity reference exactly as it would
+# appear in the source XHTML) so a quick visual scan of a stored
+# segment row makes the round-trip intent obvious. Real XML element
+# names cannot start with ``&`` so this prefix is unambiguous.
+_ENTITY_TAG_PREFIX: str = "&"
+
+
+def _is_real_element(child: object) -> bool:
+    """True iff ``child`` is a parsed Element node we can splice as an inline tag.
+
+    lxml exposes Comment / Processing-Instruction / Entity-Reference
+    nodes through the same iteration protocol as Element nodes, but
+    their ``.tag`` is a *Cython function* (``etree.Comment`` etc.),
+    not a string. Stringifying that cython object used to slip in here
+    via ``str(child.tag)``, producing absurd tag names like
+    ``"<cyfunction Entity at 0x108cefad0>"`` that crashed the
+    reassembler at export time. We now route those nodes through
+    dedicated helpers (or skip them) instead of letting them inherit
+    the regular element path.
+    """
+
+    from lxml import etree
+
+    if not etree.iselement(child):
+        return False
+    return isinstance(child.tag, str)  # type: ignore[attr-defined]
+
+
+def _entity_name_from_node(child: etree._Element) -> str:
+    """Extract the entity name from an lxml entity-reference node.
+
+    lxml stores the literal reference (e.g. ``"&nbsp;"``) on
+    ``child.text``. We strip the surrounding ``&`` / ``;`` to get the
+    bare name; a guard pass keeps us safe against unexpected text
+    shapes (we'd rather emit an empty entity ref than crash export).
+    """
+
+    raw = child.text or ""
+    if raw.startswith("&") and raw.endswith(";"):
+        raw = raw[1:-1]
+    return raw
 
 
 def placeholderize(host: etree._Element) -> tuple[str, list[InlineToken]]:
@@ -109,6 +197,9 @@ def _emit_child(
     parts: list[str],
     skeleton: list[InlineToken],
 ) -> None:
+    if not _is_real_element(child):
+        _emit_non_element_child(child, parts, skeleton)
+        return
     tag = str(child.tag)
     attrs = {str(k): str(v) for k, v in child.attrib.items()}
     my_idx = len(skeleton)
@@ -123,6 +214,39 @@ def _emit_child(
         for grandchild in child.iterchildren():
             _emit_child(grandchild, parts, skeleton)
         parts.append(f"[[/T{my_idx}]]")
+    if child.tail:
+        parts.append(child.tail)
+
+
+def _emit_non_element_child(
+    child: etree._Element,
+    parts: list[str],
+    skeleton: list[InlineToken],
+) -> None:
+    """Handle entity-reference / comment / PI children inside a host.
+
+    Entity references (`&nbsp;`, `&copy;`, ...) are preserved as
+    void-style placeholders so the exporter can rebuild the original
+    reference verbatim instead of emitting a literal Unicode char.
+    Comments and processing instructions are dropped here — they don't
+    affect rendered text and including them would force the LLM to
+    reason about non-content nodes.
+    """
+
+    from lxml import etree
+
+    tag = child.tag
+    if tag is etree.Entity:
+        name = _entity_name_from_node(child)
+        my_idx = len(skeleton)
+        skeleton.append(
+            InlineToken(
+                tag=f"{_ENTITY_TAG_PREFIX}{name};",
+                kind="entity",
+                attrs={"name": name},
+            )
+        )
+        parts.append(f"[[T{my_idx}]]")
     if child.tail:
         parts.append(child.tail)
 
@@ -177,6 +301,23 @@ def apply_parts_to_host(
                     )
                 closed = stack.pop()
                 last_text_target = (closed, "tail")
+            elif token.kind == "entity":
+                parent = stack[-1]
+                name = token.attrs.get("name") or _strip_entity_brackets(token.tag)
+                new_elem = _make_entity_node(name)
+                parent.append(new_elem)
+                last_text_target = (new_elem, "tail")
+            elif _looks_like_legacy_cyfunction_tag(token.tag):
+                # Older builds (pre-entity-fix) stored
+                # ``"<cyfunction Entity at 0x...>"`` as a token tag when
+                # they hit an entity reference. Rebuilding that as an
+                # element fails with ``ValueError("Invalid tag name")``
+                # at export time and breaks the curator's "Save ePub"
+                # flow. Skip the placeholder and keep the surrounding
+                # text intact so the rest of the segment still
+                # round-trips; re-segmenting the chapter regenerates a
+                # clean skeleton with proper entity tokens.
+                pass
             else:
                 parent = stack[-1]
                 new_elem = etree.SubElement(parent, token.tag, dict(token.attrs))
@@ -193,6 +334,38 @@ def apply_parts_to_host(
     if len(stack) > 1:
         unclosed = ", ".join(str(s.tag) for s in stack[1:])
         raise FormatError(f"placeholder text left open pairs: {unclosed}")
+
+
+def _strip_entity_brackets(tag: str) -> str:
+    """Pull the entity name out of an ``"&name;"``-style token tag."""
+
+    if tag.startswith("&") and tag.endswith(";"):
+        return tag[1:-1]
+    return tag
+
+
+def _make_entity_node(name: str) -> etree._Element:
+    """Build a fresh ``etree.Entity(name)`` node, robust to malformed input.
+
+    lxml rejects empty entity names with a ``ValueError``; the caller
+    already asks for that path on legacy data, so falling back to a
+    no-op text-bearing placeholder span keeps the export honest
+    rather than crashing it. Real entity references always carry a
+    name, so this is purely a defensive fallback.
+    """
+
+    from lxml import etree
+
+    try:
+        return etree.Entity(name)
+    except ValueError:
+        return etree.Element("span")
+
+
+def _looks_like_legacy_cyfunction_tag(tag: str) -> bool:
+    """True iff ``tag`` looks like ``str(etree.Entity)`` from old segmenter runs."""
+
+    return tag.startswith("<cyfunction ")
 
 
 def split_by_sentences(
@@ -309,6 +482,7 @@ __all__ = [
     "VOID_LOCAL_NAMES",
     "apply_parts_to_host",
     "count_tokens",
+    "is_trivially_empty",
     "placeholderize",
     "split_by_sentences",
 ]

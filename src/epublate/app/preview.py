@@ -113,6 +113,60 @@ def _void_marker(token: InlineToken) -> str:
     return f"[dim]<{safe}/>[/dim]"
 
 
+# Common XHTML named entities and the Unicode characters they expand to.
+# Used by the preview renderer so curators see ``\xa0`` for ``&nbsp;``
+# and ``©`` for ``&copy;`` instead of the raw entity reference (which
+# would render in the Reader as a literal ``&amp;nbsp;`` after Rich
+# escaping). Anything not in the table falls back to displaying the
+# entity reference as-is in dim ink — both honest and harmless.
+_ENTITY_PREVIEW: dict[str, str] = {
+    "nbsp": "\u00a0",
+    "ensp": "\u2002",
+    "emsp": "\u2003",
+    "thinsp": "\u2009",
+    "shy": "\u00ad",
+    "amp": "&",
+    "lt": "<",
+    "gt": ">",
+    "quot": '"',
+    "apos": "'",
+    "copy": "©",
+    "reg": "®",
+    "trade": "™",
+    "hellip": "…",
+    "mdash": "—",
+    "ndash": "–",  # noqa: RUF001 — EN DASH is the canonical &ndash; expansion.
+    "lsquo": "\u2018",
+    "rsquo": "\u2019",
+    "ldquo": "“",
+    "rdquo": "”",
+    "laquo": "«",
+    "raquo": "»",
+    "middot": "·",
+    "bull": "•",
+    "deg": "°",
+    "para": "¶",
+    "sect": "§",
+}
+
+
+def _entity_marker(token: InlineToken) -> str:
+    """Render an entity-reference placeholder (``&nbsp;``, ``&copy;`` …).
+
+    The reader screen wants to *show* the resolved character whenever
+    we can — readers don't think in terms of XHTML entities. The token
+    keeps the entity's name on ``token.attrs['name']`` so we can fall
+    back to the raw reference for unknown entities (rare, but possible
+    when a project's ePub declares custom entities).
+    """
+
+    name = (token.attrs.get("name") or _local_name(token.tag).strip("&;")).lower()
+    expanded = _ENTITY_PREVIEW.get(name)
+    if expanded:
+        return escape(expanded)
+    return f"[dim]&{escape(name)};[/dim]"
+
+
 def render_preview(text: str, skeleton: Sequence[InlineToken]) -> str:
     """Render placeholder text + skeleton as a Rich-markup string.
 
@@ -153,6 +207,10 @@ def render_preview(text: str, skeleton: Sequence[InlineToken]) -> str:
         token = skeleton[idx]
         if token.kind == "void":
             out.append(_void_marker(token))
+            pos = m.end()
+            continue
+        if token.kind == "entity":
+            out.append(_entity_marker(token))
             pos = m.end()
             continue
 

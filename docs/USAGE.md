@@ -23,16 +23,24 @@ uv run epublate --mock-llm
 
 ![Projects landing screen](screenshots/01-projects.png)
 
-| Key       | Action                                                          |
-| --------- | --------------------------------------------------------------- |
-| `n`       | New project (modal: source ePub, target / source lang, out dir) |
-| `o`       | Open an existing project by path                                |
-| `enter`   | Open the highlighted recent project                             |
-| `delete`  | Drop the highlighted entry from recents (project files kept)    |
-| `r`       | Refresh / prune entries whose folders no longer exist           |
-| `T`       | Cycle theme (dark → light → high-contrast)                      |
-| `? / F1`  | Cheat sheet for the current screen                              |
-| `q`       | Quit                                                            |
+| Key       | Action                                                                |
+| --------- | --------------------------------------------------------------------- |
+| `n`       | New project (modal: source ePub, target / source lang, out dir)       |
+| `o`       | Open an existing project by path                                      |
+| `enter`   | Open the highlighted recent project                                   |
+| `delete`  | Drop the highlighted entry from recents — confirm `y/n`; files kept   |
+| `D`       | **Delete project** — wipe folder + SQLite DB; confirm by typing name  |
+| `r`       | Refresh / prune entries whose folders no longer exist                 |
+| `T`       | Cycle theme (dark → light → high-contrast)                            |
+| `? / F1`  | Cheat sheet for the current screen                                    |
+| `q`       | Quit                                                                  |
+
+`delete` is reversible — it only forgets the entry in
+`~/.config/epublate/recents.json`. `D` (capital) is the destructive
+twin: it wipes the whole project folder (the SQLite DB, the
+`original.epub` copy, every export) after the curator types the
+project name back as a hard confirmation. Use it for abandoned
+experiments; reach for `delete` for anything you might still want.
 
 The recents list lives at `~/.config/epublate/recents.json` and is
 written every time you create or open a project (whether from the
@@ -94,14 +102,35 @@ Key bindings (PRD §4.6 / M6):
 | `g`       | Glossary curator                                                   |
 | `i`       | Inbox (flagged segments, proposed entries, alerts)                 |
 | `b`       | Run a batch translation                                            |
+| `c`       | **Cancel batch** — let in-flight calls finish, stop submitting more |
 | `x`       | **Save ePub** — write the translation to disk (works at any point) |
 | `B`       | Set / clear the project budget cap                                 |
 | `e`       | Helper-LLM book intake (M5)                                        |
+| `L`       | LLM activity (deep cost auditing, recent calls)                    |
 | `s`       | Settings (read-only LLM config, theme, budget)                     |
 | `r`       | Refresh                                                            |
 | `q` / `esc` | Back to the previous screen                                      |
 | `T`       | Cycle theme (`textual-dark` → `textual-light` → `epublate-contrast`) |
 | `?` / `F1`| Open the cheat sheet for the current screen                        |
+
+The batch worker lives on the App, not on the Dashboard. That means
+you can dispatch a batch with `b`, leave the project (back out to
+the Projects screen, even open a different project) and the run
+keeps progressing in the background until it finishes, hits the
+budget cap, or you press `c` to cancel. While a batch is active the
+Dashboard and Reader both render a live progress strip showing the
+chapter count, segment count, state badge (running / cancelling /
+paused / cancelled / done), and a two-token cost line — `this batch
+$X · project total $Y` — so you can tell at a glance how much the
+running batch added on top of the project's pre-batch spend.
+
+A slim **persistent batch status bar** docks at the bottom of every
+other main screen (Glossary, Inbox, Settings, LLM activity, and the
+Projects landing page) so wandering off the Dashboard never loses
+the running tally. The bar disappears the moment the worker drains
+and re-appears the moment a new batch starts, so an empty bar always
+means "no batch in flight". It mirrors the same state badge and
+counters as the Dashboard panel, just compressed onto a single line.
 
 `q` and `Escape` both back out of the current screen everywhere except
 the Projects landing screen, where `q` quits. The Escape variant is
@@ -178,6 +207,17 @@ uv run epublate inbox /tmp/epublate-sample
 
 The Dashboard shows the same numbers live; the CLI versions are
 useful for shell scripts and CI dashboards.
+
+For deeper LLM cost auditing — per-model spend, per-purpose
+breakdown (translate vs extract vs tone-sniff vs cascade), and a
+recent-calls table with timestamps and segment ids — open the
+**LLM activity** screen with **`L`** from the Dashboard. The
+Dashboard's compact panel surfaces the latest few calls inline; the
+full screen lifts the limit so you can see where the budget is
+going across an entire run. Both views also report input/output
+token counts (read from the API's ``usage`` block when present, or
+counted with ``tiktoken`` as a fallback) so a runaway prompt or
+output is obvious.
 
 ## 6. Export the translated ePub
 

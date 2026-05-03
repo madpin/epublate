@@ -597,6 +597,84 @@ def test_save_preserves_original_chapter_head(tmp_path: Path) -> None:
     assert "translatable prose" in body_text
 
 
+_HANDCRAFTED_ENTITY_CHAPTER = (
+    b'<?xml version="1.0" encoding="utf-8"?>'
+    b'<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" '
+    b'"http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">'
+    b'<html xmlns="http://www.w3.org/1999/xhtml">'
+    b"<head><title>Entity Page</title></head>"
+    b"<body>"
+    b"<p>Hello&nbsp;world &copy;2026 author.</p>"
+    b"<p>The <em>old</em>&nbsp;man saw a&mdash;sign.</p>"
+    b"</body></html>"
+)
+
+
+def _write_handcrafted_entity_epub(out: Path) -> Path:
+    """Build an ePub whose chapter declares an XHTML 1.1 DTD reference.
+
+    When lxml encounters ``&nbsp;`` / ``&copy;`` / ``&mdash;`` in
+    a document with an XHTML DTD reference (and our parser is set to
+    ``load_dtd=False`` for safety), the references stay as
+    ``etree.Entity`` nodes inside the parsed tree. Pre-fix, the
+    segmenter stringified those nodes' tags into nonsense like
+    ``"<cyfunction Entity at 0x108cefad0>"`` which crashed the
+    Save ePub flow.
+    """
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("mimetype", "application/epub+zip", zipfile.ZIP_STORED)
+        zf.writestr("META-INF/container.xml", _HANDCRAFTED_CONTAINER)
+        zf.writestr("OEBPS/content.opf", _HANDCRAFTED_OPF)
+        zf.writestr("OEBPS/toc.ncx", _HANDCRAFTED_NCX)
+        zf.writestr("OEBPS/Text/cover.xhtml", _HANDCRAFTED_ENTITY_CHAPTER)
+        zf.writestr("OEBPS/Styles/stylesheet.css", _HANDCRAFTED_CSS)
+        zf.writestr("OEBPS/Images/cover.png", _PNG_BYTES)
+    return out
+
+
+def test_save_round_trips_named_entity_references(tmp_path: Path) -> None:
+    """End-to-end guard for the cyfunction-Entity Save ePub bug.
+
+    Loading an ePub that uses ``&nbsp;`` / ``&copy;`` / ``&mdash;``
+    with an XHTML DTD prologue must:
+
+    * segment without crashing — entity refs become ``entity`` tokens;
+    * reassemble cleanly — the ``etree.Entity`` nodes are reconstructed;
+    * save without raising ``ValueError("Invalid tag name '<cyfunction
+      Entity at ...>'")``;
+    * produce an output where the original entity references survive.
+    """
+
+    src = _write_handcrafted_entity_epub(tmp_path / "in.epub")
+    adapter = EpubAdapter(target_lang="pt")
+    book = adapter.load(src)
+    book.extras["target_lang"] = "pt"
+    for doc in adapter.iter_chapters(book):
+        if doc.tree is None:
+            continue
+        segs = adapter.segment(doc, chapter_id=f"ch-{doc.spine_idx}")
+        # Untranslated round-trip — the source text is what should
+        # survive in the saved file (PRD F-IO-7 fallback path).
+        adapter.reassemble(doc, segs)
+
+    out = tmp_path / "out.epub"
+    adapter.save(book, out)
+
+    chapter_xml = _read_chapter_xml(out, "cover.xhtml")
+    text = chapter_xml.decode("utf-8")
+    # The entity references must round-trip verbatim; the writer must
+    # not have either dropped them or escaped them to literal
+    # ``&amp;nbsp;`` etc.
+    assert "&nbsp;" in text or "\u00a0" in text, text
+    assert "&copy;" in text or "©" in text, text
+    assert "&mdash;" in text or "—" in text, text
+    # And no cython-function junk leaked through anywhere.
+    assert "cyfunction" not in text
+    assert "Invalid tag name" not in text
+
+
 def test_save_updates_html_lang_on_chapter_root(tmp_path: Path) -> None:
     """``<html lang>`` and ``xml:lang`` must reflect the target
     language after export. We bypass ebooklib's chapter template (so

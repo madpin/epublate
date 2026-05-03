@@ -61,6 +61,7 @@ from epublate.app.config import (
     resolve_auto_tone_sniff,
 )
 from epublate.app.themes import EPUBLATE_THEME_ORDER
+from epublate.app.widgets import BatchStatusBar
 from epublate.core.project import Project
 from epublate.core.style import (
     DEFAULT_STYLE_PROFILE,
@@ -420,6 +421,7 @@ class SettingsScreen(Screen[None]):
             "Tab to switch panels · click a Save button to persist edits.",
             id="settings-status",
         )
+        yield BatchStatusBar(id="settings-batch-status")
         yield Footer()
 
     # ------------------------------------------------------------------
@@ -995,7 +997,7 @@ class SettingsScreen(Screen[None]):
         resolved = candidate.resolve(strict=False)
         chosen_mode = (
             str(mode_select.value)
-            if mode_select.value not in (None, Select.BLANK)
+            if mode_select.value not in (None, Select.NULL)
             else AttachedLoreMode.READ_ONLY
         )
         repo.attach_lore_book(

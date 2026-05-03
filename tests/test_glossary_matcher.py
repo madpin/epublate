@@ -103,3 +103,27 @@ def test_make_pattern_handles_empty() -> None:
 def test_match_object_is_frozen_dataclass() -> None:
     m = Match(entry_id="e", term="t", start=0, end=1)
     assert m.span == (0, 1)
+
+
+def test_hyphenated_compound_matches_as_single_term() -> None:
+    """A hyphenated compound entry like ``boot-lickers`` matches as one unit.
+
+    Regression test for the user-reported "boot-lickers" miss: once an
+    extractor proposes the compound term, the matcher must surface it
+    in segments that contain it.
+    """
+
+    entry = _entry("boot-lickers", "puxa-sacos", type_="phrase", status="proposed")
+    matches = match_source("Look at these boot-lickers around the king.", [entry])
+    assert len(matches) == 1
+    assert matches[0].term == "boot-lickers"
+    assert matches[0].span == (14, 26)
+
+    # And the bare suffix entry must still tokenize correctly when it
+    # is genuinely the only thing in the glossary — we accept the bare
+    # ``lickers`` matching inside a hyphenated compound (regex word
+    # boundary semantics) so the extractor's prompt remains the right
+    # place to ask for the longer canonical form.
+    bare = _entry("lickers", "lambedores", type_="phrase")
+    bare_matches = match_source("Look at these boot-lickers around the king.", [bare])
+    assert [m.term for m in bare_matches] == ["lickers"]

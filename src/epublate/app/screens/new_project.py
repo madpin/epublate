@@ -227,7 +227,7 @@ class NewProjectModal(ModalScreen[Project | None]):
         self,
         *,
         default_source_lang: str = "en",
-        default_target_lang: str = "pt",
+        default_target_lang: str = "pt-BR",
         recents_path: Path | None = None,
         projects_root: Path | None = None,
         auto_tone_sniff: bool = False,
@@ -285,8 +285,8 @@ class NewProjectModal(ModalScreen[Project | None]):
                 "Target language",
                 "new-project-target-lang",
                 value=self._default_target_lang,
-                placeholder="pt",
-                hint="BCP-47 code; e.g. pt, pt-BR, ja, fr",
+                placeholder="pt-BR",
+                hint="BCP-47 code; default pt-BR, also pt, ja, fr, es-ES, …",
             )
             yield from self._field(
                 "Source language",

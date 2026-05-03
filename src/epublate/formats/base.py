@@ -18,7 +18,7 @@ from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
-InlineKind = Literal["pair", "void"]
+InlineKind = Literal["pair", "void", "entity"]
 
 
 class InlineToken(BaseModel):
@@ -27,7 +27,13 @@ class InlineToken(BaseModel):
     Stored in :attr:`Segment.inline_skeleton` and referenced positionally by
     placeholder index. ``pair`` tags wrap text (``<em>old</em>`` →
     ``[[T0]]old[[/T0]]``); ``void`` tags are self-closing (``<br/>`` →
-    ``[[T0]]``).
+    ``[[T0]]``). ``entity`` tags are XML entity references the parser
+    couldn't resolve to text (e.g. ``&nbsp;`` or ``&copy;`` from an
+    ePub that ships an XHTML 1.1 DTD reference but expects the
+    consumer to load it). They round-trip as opaque single-position
+    placeholders, like void tags, but rebuild as ``etree.Entity``
+    nodes on reassembly so the original entity reference survives in
+    the exported XHTML.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")

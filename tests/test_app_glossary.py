@@ -169,3 +169,45 @@ async def test_glossary_cascade_no_op_when_no_segments_match(
             assert isinstance(pilot.app.screen, GlossaryScreen)
     finally:
         project.close()
+
+
+@pytest.mark.asyncio
+async def test_glossary_edit_modal_mounts_with_blank_gender(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """Regression for the ``InvalidSelectValueError: Illegal select value False``
+    that surfaced when ``Select.BLANK`` (a Widget-level constant equal to
+    ``False``) was passed as the initial value of the gender select for
+    an entry with no gender. The modal must use ``Select.NULL`` instead so
+    it mounts cleanly for entries without a stored gender (PRD F-LB-3).
+    """
+
+    from textual.widgets import Select
+
+    from epublate.app.screens.glossary import EntryEditScreen, _EntryDraft
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    try:
+        screen = GlossaryScreen(project)
+        app = EpublateApp(initial_screen=screen)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            modal: EntryEditScreen = EntryEditScreen(
+                _EntryDraft(
+                    source_term="Hugo",
+                    target_term="Hugo",
+                    type="character",
+                    status="confirmed",
+                    gender=None,
+                ),
+                title="Edit entry",
+            )
+            pilot.app.push_screen(modal)
+            await pilot.pause()
+            assert isinstance(pilot.app.screen, EntryEditScreen)
+            gender = pilot.app.screen.query_one("#entry-gender", Select)
+            assert gender.value is Select.NULL
+            pilot.app.pop_screen()
+            await pilot.pause()
+    finally:
+        project.close()

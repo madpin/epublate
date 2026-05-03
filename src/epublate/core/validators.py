@@ -41,10 +41,15 @@ def validate_segment_placeholders(seg: Segment) -> None:
             )
         is_close = m.group(1) == "/"
         token = seg.inline_skeleton[idx]
-        if token.kind == "void":
+        # ``entity`` tokens stand in for XML entity references the
+        # parser couldn't expand (PRD F-IO-1) — they're shaped like
+        # void tokens (single placeholder, no closer) so the same
+        # counting rules apply.
+        if token.kind in ("void", "entity"):
             if is_close:
                 raise FormatError(
-                    f"segment {seg.id}: void placeholder [[/T{idx}]] cannot close"
+                    f"segment {seg.id}: {token.kind} placeholder "
+                    f"[[/T{idx}]] cannot close"
                 )
             void_counts[idx] = void_counts.get(idx, 0) + 1
         elif is_close:
@@ -53,10 +58,10 @@ def validate_segment_placeholders(seg: Segment) -> None:
             open_counts[idx] = open_counts.get(idx, 0) + 1
 
     for idx, token in enumerate(seg.inline_skeleton):
-        if token.kind == "void":
+        if token.kind in ("void", "entity"):
             if void_counts.get(idx, 0) != 1:
                 raise FormatError(
-                    f"segment {seg.id}: void placeholder [[T{idx}]] "
+                    f"segment {seg.id}: {token.kind} placeholder [[T{idx}]] "
                     "missing or duplicated"
                 )
         else:

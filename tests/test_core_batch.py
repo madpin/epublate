@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from epublate.core.batch import (
+    BatchCancelled,
     BatchOptions,
     BatchPaused,
     BatchProgressEvent,
@@ -205,6 +206,113 @@ def test_run_batch_pauses_when_budget_cap_exceeded(
         from epublate.llm.pricing import reset_prices
 
         reset_prices()
+        project.close()
+
+
+def test_run_batch_can_be_cancelled_via_event(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """Setting ``cancel_event`` before submission stops the batch fast.
+
+    We pre-set the event so the orchestrator never primes the worker
+    pool — that way the assertion is deterministic across CI machines
+    (no race on whether the first future completes before the cancel
+    flag is observed).
+    """
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    try:
+        provider = MockLLMProvider()
+        provider.set_responder(_placeholder_safe_responder())
+
+        cancel_event = threading.Event()
+        cancel_event.set()
+
+        with pytest.raises(BatchCancelled) as exc_info:
+            run_batch(
+                engine=project.engine,
+                project_id=project.project_id,
+                source_lang=project.source_lang,
+                target_lang=project.target_lang,
+                provider=provider,
+                options=BatchOptions(model="gpt-mock"),
+                cancel_event=cancel_event,
+            )
+
+        summary = exc_info.value.summary
+        # Nothing should have actually translated.
+        assert summary.translated == 0
+        assert summary.attempted == 0
+
+        # The batch.cancelled event landed in the audit log; no
+        # batch.completed is emitted on this path so the activity
+        # panel can label the run accurately.
+        events = repo.list_events(project.engine, project.project_id)
+        kinds = {e.kind for e in events}
+        assert "batch.cancelled" in kinds
+        assert "batch.completed" not in kinds
+    finally:
+        project.close()
+
+
+def test_run_batch_cancel_after_first_completion_stops_remaining(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """Cancelling mid-flight drains in-flight work and stops new submissions.
+
+    Mirrors the dashboard's "Cancel" button: the curator may hit it
+    after a few segments have already gone through. We model that by
+    flipping the event the moment the first responder returns; the
+    runner must finish the in-flight one and then refuse to submit
+    the rest.
+    """
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    try:
+        cancel_event = threading.Event()
+
+        def _responder(messages: list[object], _model: str) -> str:
+            last = messages[-1]
+            content = getattr(last, "content", "")
+            cancel_event.set()
+            return json.dumps(
+                {
+                    "target": f"PT::{content}",
+                    "used_entries": [],
+                    "new_entities": [],
+                }
+            )
+
+        provider = MockLLMProvider()
+        provider.set_responder(_responder)
+
+        with pytest.raises(BatchCancelled) as exc_info:
+            run_batch(
+                engine=project.engine,
+                project_id=project.project_id,
+                source_lang=project.source_lang,
+                target_lang=project.target_lang,
+                provider=provider,
+                options=BatchOptions(
+                    model="gpt-mock",
+                    concurrency=1,
+                    # Force per-segment dispatch so this test asserts on
+                    # individual segment progress rather than the
+                    # short-segment grouping batch path (which would
+                    # finish multiple segments in one LLM call).
+                    group_small_segments=False,
+                ),
+                cancel_event=cancel_event,
+            )
+
+        # We let the in-flight task finish (concurrency=1, so just one)
+        # and then bailed; the remaining pending segments stay pending.
+        summary = exc_info.value.summary
+        assert summary.attempted == 1
+        assert summary.translated == 1
+        remaining = pending_segments(project.engine, project_id=project.project_id)
+        assert remaining
+    finally:
         project.close()
 
 

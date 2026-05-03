@@ -48,13 +48,10 @@ from textual.widgets import (
 
 from epublate.app.branding import ICON_ARROW
 from epublate.app.config import UIConfig
+from epublate.app.messages import BatchFinished, BatchTick
 from epublate.app.widgets import BatchProgressMeter, BatchSnapshot, CostMeter
 from epublate.core.batch import (
     BatchOptions,
-    BatchPaused,
-    BatchProgressEvent,
-    BatchSummary,
-    run_batch,
 )
 from epublate.core.book_metadata import (
     BookMetadata,
@@ -210,12 +207,18 @@ class BatchModal(ModalScreen[BatchRequest | None]):
             with Horizontal(classes="row"):
                 yield Label("Group max items (1-500):")
                 yield Input(value="50", id="batch-group-size")
+            with Horizontal(classes="row"):
+                yield Label("Force retranslate cached [y/n]:")
+                yield Input(value="n", id="batch-bypass-cache")
             yield Static(
                 "Press [b]Ctrl+S[/b] to start, [b]Escape[/b] to cancel. "
                 "Use [b]*[/b] for all chapters, [b]N[/b] for one, "
                 "[b]A-B[/b] for a 1-indexed range over translatable chapters. "
                 "Grouping batches short placeholder-free segments (TOCs, indices, "
                 "lists) into one LLM call to cut cost + latency. "
+                "[b]Force retranslate[/b] re-runs every segment even if a cached "
+                "translation exists — the default [b]n[/b] keeps cache hits "
+                "(fastest, free) and is what the curator usually wants. "
                 "Open the [b]Reader[/b] (key [b]o[/b]) once the batch starts "
                 "to watch segments translate live.",
                 id="batch-help",
@@ -291,6 +294,7 @@ class BatchModal(ModalScreen[BatchRequest | None]):
         budget_raw = self.query_one("#batch-budget", Input).value.strip()
         group_raw = self.query_one("#batch-group", Input).value.strip().lower()
         group_size_raw = self.query_one("#batch-group-size", Input).value.strip()
+        bypass_raw = self.query_one("#batch-bypass-cache", Input).value.strip().lower()
 
         try:
             concurrency = max(1, int(concurrency_raw or "1"))
@@ -314,6 +318,10 @@ class BatchModal(ModalScreen[BatchRequest | None]):
                 return
 
         group_enabled = group_raw in {"", "y", "yes", "true", "1", "on"}
+        # Default for bypass is *off*: re-running cached segments costs
+        # tokens and changes nothing in the common case. The curator
+        # opts in by typing "y".
+        bypass_cache = bypass_raw in {"y", "yes", "true", "1", "on"}
         try:
             group_size = int(group_size_raw or "50")
         except ValueError:
@@ -327,7 +335,7 @@ class BatchModal(ModalScreen[BatchRequest | None]):
                 concurrency=concurrency,
                 model=model,
                 budget_usd=budget,
-                bypass_cache=False,
+                bypass_cache=bypass_cache,
                 group_small_segments=group_enabled,
                 group_max_items=group_size,
             )
@@ -824,29 +832,6 @@ class ExportModal(ModalScreen[ExportRequest | None]):
 # ---------------------------------------------------------------------------
 
 
-class BatchTick(Message):
-    """One per-segment progress tick, posted from the batch worker."""
-
-    def __init__(self, event: BatchProgressEvent) -> None:
-        super().__init__()
-        self.event = event
-
-
-class BatchFinished(Message):
-    """Batch completed (or paused) successfully without crashing the worker."""
-
-    def __init__(self, summary: BatchSummary, *, paused: bool) -> None:
-        super().__init__()
-        self.summary = summary
-        self.paused = paused
-
-
-class BatchFailed(Message):
-    def __init__(self, error: str) -> None:
-        super().__init__()
-        self.error = error
-
-
 class IntakeFinished(Message):
     """Helper-LLM intake completed successfully."""
 
@@ -896,6 +881,12 @@ class DashboardScreen(Screen[None]):
         Binding("g", "open_glossary", "Glossary", show=True),
         Binding("i", "open_inbox", "Inbox", show=True),
         Binding("b", "batch", "Batch", show=True),
+        # ``c`` cancels an in-flight batch. Cancellation is best-effort
+        # (in-flight LLM calls finish, no new ones start) — see
+        # ``EpublateApp.cancel_batch``. Bound on the dashboard so the
+        # curator can stop a long run from the screen that started it
+        # without losing context.
+        Binding("c", "cancel_batch", "Cancel batch", show=True),
         # ``x`` = eXport. Save the (possibly partial) translated ePub
         # to disk at any point in the project's lifecycle (PRD §7.6 /
         # F-IO-7); untranslated segments fall back to source text so
@@ -903,6 +894,7 @@ class DashboardScreen(Screen[None]):
         Binding("x", "export", "Save ePub", show=True),
         Binding("B", "set_budget", "Budget", show=True),
         Binding("e", "intake", "Intake", show=True),
+        Binding("L", "open_llm_activity", "LLM activity", show=True),
         Binding("s", "open_settings", "Settings", show=True),
         Binding("r", "refresh", "Refresh", show=True),
         Binding("q", "app.pop_screen", "Back", show=True),
@@ -1116,9 +1108,13 @@ class DashboardScreen(Screen[None]):
                         )
                         yield chapter_table
                 with Vertical(classes="dashboard-col"):
-                    yield Static(
-                        "Progress: …", id="dashboard-progress", classes="panel"
-                    )
+                    with Vertical(id="dashboard-progress-panel", classes="panel"):
+                        yield Label("Progress", classes="panel-title")
+                        yield Static(
+                            "(loading progress…)",
+                            id="dashboard-progress",
+                            markup=True,
+                        )
                     with Vertical(id="dashboard-cost-panel", classes="panel"):
                         yield Label("Cost", classes="panel-title")
                         yield CostMeter(id="dashboard-cost")
@@ -1150,6 +1146,11 @@ class DashboardScreen(Screen[None]):
                             cursor_type="none",
                         )
                         yield llm_table
+                        yield Static(
+                            "[dim]Press [b]L[/b] for full deep-stats view.[/dim]",
+                            id="dashboard-llm-activity-hint",
+                            markup=True,
+                        )
                     yield Static(
                         "(no activity yet)",
                         id="dashboard-activity",
@@ -1201,15 +1202,28 @@ class DashboardScreen(Screen[None]):
         approved = stats.approved_count
         flagged = stats.flagged_count
         pending = stats.segment_count - translated
-        progress.update(
-            "[b]Progress[/b]: "
-            f"{translated}/{stats.segment_count} translated "
-            f"({stats.progress_ratio * 100:5.1f}%) — "
-            f"approved {approved}, flagged {flagged}, pending {pending}"
-        )
+        if stats.segment_count:
+            pct = stats.progress_ratio * 100.0
+            bar_filled = max(0, min(20, round(stats.progress_ratio * 20)))
+            bar = "[" + "#" * bar_filled + "·" * (20 - bar_filled) + "]"
+            progress_lines = [
+                f"[b]{translated}[/b] / {stats.segment_count} translated "
+                f"({pct:5.1f}%) {bar}",
+                f"approved {approved} · flagged {flagged} · pending {pending}",
+            ]
+        else:
+            progress_lines = ["[dim](no segments to translate)[/dim]"]
+        progress.update("\n".join(progress_lines))
 
         meter = self.query_one("#dashboard-cost", CostMeter)
-        meter.update_values(spend_usd=stats.spend_usd, budget_usd=stats.budget_usd)
+        meter.update_values(
+            spend_usd=stats.spend_usd,
+            budget_usd=stats.budget_usd,
+            prompt_tokens=stats.prompt_tokens,
+            completion_tokens=stats.completion_tokens,
+            llm_calls=stats.llm_calls,
+            cache_hits=stats.cache_hits,
+        )
 
         digest = self.query_one("#dashboard-inbox-digest", Static)
         proposed = self._count_proposed_entries()
@@ -1557,6 +1571,13 @@ class DashboardScreen(Screen[None]):
             self._on_child_screen_closed,
         )
 
+    def action_open_llm_activity(self) -> None:
+        from epublate.app.screens.llm_activity import LLMActivityScreen
+
+        self.app.push_screen(
+            LLMActivityScreen(self._project), self._on_child_screen_closed
+        )
+
     def action_open_settings(self) -> None:
         from epublate.app.screens.settings import SettingsScreen
 
@@ -1598,8 +1619,11 @@ class DashboardScreen(Screen[None]):
             self._set_status(f"Budget cap set to ${result.budget_usd:.4f}.")
 
     def action_batch(self) -> None:
-        if self._batch_running:
-            self._set_status("A batch is already running.")
+        from epublate.app.main import EpublateApp
+
+        app = self.app
+        if isinstance(app, EpublateApp) and app.batch_running:
+            self._set_status("A batch is already running. Press [b]c[/b] to cancel.")
             return
         try:
             shapes = compute_chapter_shapes(
@@ -1618,6 +1642,8 @@ class DashboardScreen(Screen[None]):
         self.app.push_screen(modal, self._on_batch_chosen)
 
     def _on_batch_chosen(self, result: BatchRequest | None) -> None:
+        from epublate.app.main import EpublateApp
+
         if result is None:
             self._set_status("Batch cancelled.")
             return
@@ -1627,19 +1653,13 @@ class DashboardScreen(Screen[None]):
                 f"Could not parse chapter range {result.chapters!r}; use '*' or '1-3'."
             )
             return
-        self._batch_running = True
-        self._set_status(
-            f"Batch dispatched: chapters={result.chapters}, "
-            f"concurrency={result.concurrency}, model={result.model}"
-        )
-        # Compute the upfront segment total so the progress meter knows
-        # what 100% means; cheaper to count once here than to track it
-        # per worker thread.
+        # Compute the upfront segment + chapter totals so the progress
+        # meter knows what 100% means and can render
+        # "translating N chapters". Cheaper to count once here than to
+        # track per worker thread.
         total_pending = self._count_pending_segments(chapter_ids)
-        self._show_batch_panel(total=total_pending)
-        self._publish_batch_progress(
-            active=True, summary=None, total=total_pending, paused=False
-        )
+        chapter_count = self._count_pending_chapters(chapter_ids)
+        starting_spend = self._stats.spend_usd if self._stats is not None else 0.0
         options = BatchOptions(
             model=result.model,
             concurrency=result.concurrency,
@@ -1649,7 +1669,49 @@ class DashboardScreen(Screen[None]):
             group_small_segments=result.group_small_segments,
             group_max_items=result.group_max_items,
         )
-        self._batch_worker(options=options)
+        app = self.app
+        if not isinstance(app, EpublateApp):
+            self._set_status("Batch can only run inside the full epublate app.")
+            return
+        # The App owns the worker thread + the SQLite engine reference
+        # (PRD §7.3 / TUI rule §1) so the batch survives navigating
+        # away from the Dashboard. We register *this* dashboard as
+        # the listener so per-segment messages still flow back here
+        # while it's mounted.
+        started = app.start_batch(
+            project=self._project,
+            options=options,
+            chapter_count=chapter_count,
+            total_segments=total_pending,
+            provider_factory=self._provider_factory,
+            starting_spend_usd=starting_spend,
+            listener=self,
+        )
+        if not started:
+            self._set_status("Could not start batch: another one is already running.")
+            return
+        self._batch_running = True
+        self._show_batch_panel(total=total_pending, chapter_count=chapter_count)
+        self._set_status(
+            f"Batch dispatched: chapters={result.chapters}, "
+            f"concurrency={result.concurrency}, model={result.model}"
+        )
+
+    def action_cancel_batch(self) -> None:
+        """Ask the App to stop the running batch (best-effort)."""
+
+        from epublate.app.main import EpublateApp
+
+        app = self.app
+        if not isinstance(app, EpublateApp):
+            return
+        if not app.is_batch_running_for(self._project.project_id):
+            self._set_status("No batch is running for this project.")
+            return
+        if not app.cancel_batch():
+            self._set_status("No batch is running.")
+            return
+        self._set_status("Cancelling batch — letting in-flight segments finish.")
 
     def _count_pending_segments(self, chapter_ids: tuple[str, ...] | None) -> int:
         rows = repo.list_segments_by_status(
@@ -1660,45 +1722,38 @@ class DashboardScreen(Screen[None]):
         )
         return len(rows)
 
-    def _show_batch_panel(self, *, total: int) -> None:
+    def _count_pending_chapters(self, chapter_ids: tuple[str, ...] | None) -> int:
+        """How many distinct chapters carry pending segments in the batch scope.
+
+        ``chapter_ids=None`` means "all chapters", so we walk every
+        pending segment and bucket by its chapter; otherwise we
+        intersect the explicit selection with the chapters that
+        actually still have pending work. Used by the dashboard
+        meter so curators see "translating 4 chapters · 137 segments"
+        instead of just the segment count (PRD §4.6 / batch UI).
+        """
+
+        rows = repo.list_segments_by_status(
+            self._project.engine,
+            project_id=self._project.project_id,
+            status="pending",
+            chapter_ids=chapter_ids,
+        )
+        return len({r.chapter_id for r in rows})
+
+    def _show_batch_panel(self, *, total: int, chapter_count: int = 0) -> None:
         panel = self.query_one("#dashboard-batch-panel", Vertical)
         panel.add_class("-visible")
         meter = self.query_one("#dashboard-batch-meter", BatchProgressMeter)
-        meter.update_snapshot(BatchSnapshot(attempted=0, total=total))
+        meter.update_snapshot(
+            BatchSnapshot(attempted=0, total=total, chapter_count=chapter_count)
+        )
 
     def _hide_batch_panel(self) -> None:
         panel = self.query_one("#dashboard-batch-panel", Vertical)
         panel.remove_class("-visible")
         meter = self.query_one("#dashboard-batch-meter", BatchProgressMeter)
         meter.update_snapshot(None)
-
-    def _publish_batch_progress(
-        self,
-        *,
-        active: bool,
-        summary: BatchSummary | None,
-        total: int,
-        paused: bool,
-    ) -> None:
-        """Mirror the batch state on the app so other screens can read it.
-
-        Other screens (Reader) treat the slot as advisory: they'll only
-        consult it on their refresh tick. Mutating an attribute is fine
-        because Textual's main loop is single-threaded.
-        """
-
-        from epublate.app.main import BatchProgress, EpublateApp
-
-        app = self.app
-        if not isinstance(app, EpublateApp):
-            return
-        app.batch_progress = BatchProgress(
-            active=active,
-            project_id=self._project.project_id if active else None,
-            summary=summary,
-            total=total,
-            paused=paused,
-        )
 
     def _resolve_chapter_range(self, expr: str) -> tuple[tuple[str, ...] | None, bool]:
         """Translate ``*`` / ``N`` / ``A-B`` into ``(chapter_ids, ok)``.
@@ -1728,126 +1783,135 @@ class DashboardScreen(Screen[None]):
             return None, False
         return tuple(chapters[i - 1].id for i in range(lo, hi + 1)), True
 
-    @work(exclusive=True, group="batch", thread=True)
-    def _batch_worker(self, *, options: BatchOptions) -> None:
-        provider = self._provider_factory()
-        try:
-            summary = run_batch(
-                engine=self._project.engine,
-                project_id=self._project.project_id,
-                source_lang=self._project.source_lang,
-                target_lang=self._project.target_lang,
-                provider=provider,
-                options=options,
-                on_progress=self._post_progress,
-            )
-        except BatchPaused as paused:
-            self.post_message(BatchFinished(paused.summary, paused=True))
-            return
-        except Exception as exc:
-            self.post_message(BatchFailed(str(exc)))
-            return
-        self.post_message(BatchFinished(summary, paused=False))
-
-    def _post_progress(self, event: BatchProgressEvent) -> None:
-        # Called from the worker thread; ``post_message`` is thread-safe.
-        self.post_message(BatchTick(event))
-
     @on(BatchTick)
     def _handle_tick(self, message: BatchTick) -> None:
         ev = message.event
+        from epublate.app.main import EpublateApp
+
+        app = self.app
+        progress = app.batch_progress if isinstance(app, EpublateApp) else None
+        if progress is None or progress.project_id != self._project.project_id:
+            # Tick belongs to a different project (we navigated and a
+            # different batch is now active). Ignore the noise.
+            return
         meter = self.query_one("#dashboard-cost", CostMeter)
-        meter.spend_usd = ev.summary.cost_usd
+        # Live-update the running totals so the cost panel reflects the
+        # batch's progress without waiting for the next ``compute_stats``
+        # poll. ``starting_spend_usd`` is the project's pre-batch spend
+        # snapshot the App captured when the batch started, so the
+        # cost line shows the running project-wide total ("project
+        # spend so far") rather than only this run's contribution.
+        starting_spend = progress.starting_spend_usd
+        base_stats = self._stats
+        if base_stats is not None:
+            meter.update_values(
+                spend_usd=starting_spend + ev.summary.cost_usd,
+                budget_usd=base_stats.budget_usd,
+                prompt_tokens=base_stats.prompt_tokens + ev.summary.prompt_tokens,
+                completion_tokens=(
+                    base_stats.completion_tokens + ev.summary.completion_tokens
+                ),
+                llm_calls=base_stats.llm_calls + ev.summary.attempted,
+                cache_hits=base_stats.cache_hits + ev.summary.cached,
+            )
+        else:
+            meter.spend_usd = starting_spend + ev.summary.cost_usd
         progress_meter = self.query_one("#dashboard-batch-meter", BatchProgressMeter)
         # Total is the upfront pending count; if we somehow attempted
         # more than that (e.g. the user retried) widen the bar so it
         # never visually exceeds 100%.
-        from epublate.app.main import EpublateApp
-
-        app = self.app
-        total = (
-            int(getattr(app.batch_progress, "total", 0))
-            if isinstance(app, EpublateApp)
-            else 0
-        )
-        total = max(total, ev.summary.attempted)
+        total = max(progress.total, ev.summary.attempted)
         progress_meter.update_snapshot(
             BatchSnapshot(
                 attempted=ev.summary.attempted,
                 total=total,
+                chapter_count=progress.chapter_count,
                 translated=ev.summary.translated,
                 cached=ev.summary.cached,
                 flagged=ev.summary.flagged,
                 failed=ev.summary.failed,
                 cost_usd=ev.summary.cost_usd,
+                project_total_cost_usd=starting_spend + ev.summary.cost_usd,
                 elapsed_s=ev.summary.elapsed_s,
                 paused=False,
+                cancelling=progress.cancelling,
             )
         )
-        self._publish_batch_progress(
-            active=True,
-            summary=ev.summary,
-            total=total,
-            paused=False,
-        )
+        chapter_label = ""
+        if progress.chapter_count:
+            chapter_label = f" across {progress.chapter_count} chapter"
+            chapter_label += "s" if progress.chapter_count != 1 else ""
         self._set_status(
-            f"Batch: {ev.summary.attempted}/{total} done — translated="
-            f"{ev.summary.translated}, cached={ev.summary.cached}, "
+            f"Batch: {ev.summary.attempted}/{total}{chapter_label} — "
+            f"translated={ev.summary.translated}, cached={ev.summary.cached}, "
             f"flagged={ev.summary.flagged}, failed={ev.summary.failed}, "
-            f"cost=${ev.summary.cost_usd:.4f}"
+            f"this batch ${ev.summary.cost_usd:.4f} · "
+            f"project total ${(starting_spend + ev.summary.cost_usd):.4f}"
         )
 
     @on(BatchFinished)
     def _handle_batch_finished(self, message: BatchFinished) -> None:
+        if message.project_id != self._project.project_id:
+            return
         self._batch_running = False
-        s = message.summary
-        kind = "Batch paused" if message.paused else "Batch complete"
-        reason = f" ({s.paused_reason})" if message.paused and s.paused_reason else ""
-        progress_meter = self.query_one("#dashboard-batch-meter", BatchProgressMeter)
         from epublate.app.main import EpublateApp
 
         app = self.app
-        total = (
-            int(getattr(app.batch_progress, "total", 0))
-            if isinstance(app, EpublateApp)
-            else max(s.attempted, 1)
+        progress = app.batch_progress if isinstance(app, EpublateApp) else None
+        if message.status == "failed":
+            self._hide_batch_panel()
+            self._set_status(f"Batch failed: {message.error or 'unknown error'}")
+            self._refresh_stats()
+            return
+        s = message.summary
+        if s is None:
+            self._refresh_stats()
+            return
+        kind_map = {
+            "completed": "Batch complete",
+            "paused": "Batch paused",
+            "cancelled": "Batch cancelled",
+        }
+        kind = kind_map.get(message.status, "Batch finished")
+        reason = (
+            f" ({s.paused_reason})"
+            if message.status == "paused" and s.paused_reason
+            else ""
         )
-        total = max(total, s.attempted)
+        progress_meter = self.query_one("#dashboard-batch-meter", BatchProgressMeter)
+        total = max(progress.total if progress is not None else 0, s.attempted) or max(
+            s.attempted, 1
+        )
+        chapter_count = progress.chapter_count if progress is not None else 0
+        starting_spend = progress.starting_spend_usd if progress is not None else 0.0
         progress_meter.update_snapshot(
             BatchSnapshot(
                 attempted=s.attempted,
                 total=total,
+                chapter_count=chapter_count,
                 translated=s.translated,
                 cached=s.cached,
                 flagged=s.flagged,
                 failed=s.failed,
                 cost_usd=s.cost_usd,
+                project_total_cost_usd=starting_spend + s.cost_usd,
                 elapsed_s=s.elapsed_s,
-                paused=message.paused,
+                paused=message.status == "paused",
                 paused_reason=s.paused_reason,
+                cancelled=message.status == "cancelled",
+                cancelling=False,
             )
-        )
-        self._publish_batch_progress(
-            active=False,
-            summary=s,
-            total=total,
-            paused=message.paused,
         )
         self._refresh_stats()
         self._set_status(
             f"{kind}: translated={s.translated}, cached={s.cached}, "
             f"flagged={s.flagged}, failed={s.failed}, "
-            f"cost=${s.cost_usd:.4f}, elapsed={s.elapsed_s:.2f}s{reason}"
+            f"this batch ${s.cost_usd:.4f}, "
+            f"project total ${(starting_spend + s.cost_usd):.4f}, "
+            f"elapsed={s.elapsed_s:.2f}s{reason}"
         )
         # Leave the panel visible after completion so the curator can
         # review the final tally; it is replaced on the next batch.
-
-    @on(BatchFailed)
-    def _handle_batch_failed(self, message: BatchFailed) -> None:
-        self._batch_running = False
-        self._publish_batch_progress(active=False, summary=None, total=0, paused=False)
-        self._hide_batch_panel()
-        self._set_status(f"Batch failed: {message.error}")
 
     # ------------- intake (M5) -------------
 
@@ -1991,11 +2055,8 @@ class DashboardScreen(Screen[None]):
 
 
 __all__ = [
-    "BatchFailed",
-    "BatchFinished",
     "BatchModal",
     "BatchRequest",
-    "BatchTick",
     "BudgetModal",
     "BudgetRequest",
     "DashboardScreen",

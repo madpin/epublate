@@ -18,6 +18,7 @@ from epublate.core.segmentation import (
     PLACEHOLDER_RE,
     apply_parts_to_host,
     count_tokens,
+    is_trivially_empty,
     placeholderize,
     split_by_sentences,
 )
@@ -167,6 +168,40 @@ def test_split_by_sentences_never_breaks_inside_pair() -> None:
         assert opens == closes
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "",
+        " ",
+        "\u00a0",  # NBSP from <p>&#160;</p>
+        "\u00a0\u00a0\t\n",  # mixed whitespace
+        "\u200b",  # zero-width space
+        "\ufeff\u200b\u200d",  # BOM + zero-width family
+        "[[T0]]",  # void placeholder, no text
+        "[[T0]][[/T0]]",  # empty pair
+        "[[T0]]\u00a0[[/T0]]",  # link wrapping NBSP only
+        "  [[T0]]\u200b[[/T0]]\t",  # mix of whitespace + zero-width inside pair
+    ],
+)
+def test_is_trivially_empty_catches_blank_segments(source: str) -> None:
+    assert is_trivially_empty(source) is True
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "Hello",
+        "1",
+        "—",
+        "[[T0]]Chapter 1[[/T0]]",
+        "[[T0]]\u00a0Title[[/T0]]",
+        "  word  ",
+    ],
+)
+def test_is_trivially_empty_keeps_real_content(source: str) -> None:
+    assert is_trivially_empty(source) is False
+
+
 def test_split_renumbers_placeholders_within_chunk() -> None:
     skeleton = [
         InlineToken(tag="em", kind="pair"),
@@ -184,3 +219,109 @@ def test_split_renumbers_placeholders_within_chunk() -> None:
     assert first_skel == [skeleton[0]]
     assert "[[T0]]" in second_text and "[[/T0]]" in second_text
     assert second_skel == [skeleton[1]]
+
+
+# ---------------------------------------------------------------------------
+# Entity reference handling — guards the "Save ePub" / cyfunction Entity bug
+# ---------------------------------------------------------------------------
+
+ENTITY_DOCTYPE = (
+    '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" '
+    '"http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">'
+)
+
+
+def _parse_entity_paragraph(inner: str) -> etree._Element:
+    """Parse a paragraph that contains XHTML named entity references.
+
+    Real-world ePubs frequently inline ``&nbsp;`` / ``&copy;`` next to
+    text and reference the XHTML 1.1 DTD in the chapter prologue.
+    Without ``load_dtd=True`` (which we deliberately avoid for safety
+    + reproducibility) lxml leaves those references as
+    ``etree.Entity`` nodes inside the parsed tree.
+    """
+
+    parser = etree.XMLParser(
+        resolve_entities=False, no_network=True, load_dtd=False, recover=False
+    )
+    xml = (
+        f'<?xml version="1.0"?>{ENTITY_DOCTYPE}<p xmlns="{XHTML_NS}">{inner}</p>'
+    ).encode()
+    return etree.fromstring(xml, parser)
+
+
+def test_placeholderize_handles_entity_reference_round_trip() -> None:
+    original = _parse_entity_paragraph("hello&nbsp;world")
+    text, skeleton = placeholderize(original)
+
+    assert len(skeleton) == 1
+    assert skeleton[0].kind == "entity"
+    assert skeleton[0].attrs.get("name") == "nbsp"
+    assert "[[T0]]" in text and "[[/T0]]" not in text
+
+    target = _parse_entity_paragraph("")
+    apply_parts_to_host(target, [(text, skeleton)])
+    assert _serialize(target) == _serialize(original)
+
+
+def test_placeholderize_preserves_entity_alongside_inline_tags() -> None:
+    """Mixing pair tags with entity refs round-trips both cleanly.
+
+    Calibre-converted ePubs commonly produce ``<p>The
+    <em>old</em>&nbsp;man saw &copy;Author.</p>`` shapes; the
+    pre-fix code was crashing the Save ePub path on these.
+    """
+
+    original = _parse_entity_paragraph("The <em>old</em>&nbsp;man saw &copy;Author.")
+    text, skeleton = placeholderize(original)
+
+    kinds = [tok.kind for tok in skeleton]
+    assert kinds == ["pair", "entity", "entity"]
+    assert skeleton[1].attrs.get("name") == "nbsp"
+    assert skeleton[2].attrs.get("name") == "copy"
+
+    target = _parse_entity_paragraph("")
+    apply_parts_to_host(target, [(text, skeleton)])
+    assert _serialize(target) == _serialize(original)
+
+
+def test_apply_parts_skips_legacy_cyfunction_tag() -> None:
+    """Old segmenter runs persisted ``"<cyfunction Entity at 0x..>"`` tags.
+
+    Re-running ``apply_parts_to_host`` on a freshly opened project
+    must not crash on those legacy tokens — the curator should still
+    be able to export their (possibly partial) translation. We
+    silently skip the broken placeholder; the surrounding text is
+    preserved.
+    """
+
+    target = _parse(_wrap_paragraph(""))
+    text = "before [[T0]] after"
+    legacy = InlineToken(tag="<cyfunction Entity at 0x108cefad0>", kind="void")
+    apply_parts_to_host(target, [(text, [legacy])])
+    rendered = _serialize(target)
+    assert "before " in rendered
+    assert " after" in rendered
+    assert "<cyfunction" not in rendered
+
+
+def test_placeholderize_skips_xml_comments() -> None:
+    """XML comments inside a host don't end up in the segment.
+
+    Comments are non-content nodes; sending them to the LLM (or
+    asking the validator to round-trip them) just adds noise. We
+    drop them from the placeholder text and the skeleton.
+    """
+
+    parser = etree.XMLParser(
+        resolve_entities=False, no_network=True, load_dtd=False, recover=False
+    )
+    xml = (
+        f'<?xml version="1.0"?><p xmlns="{XHTML_NS}">before<!--editor note-->after</p>'
+    ).encode()
+    original = etree.fromstring(xml, parser)
+    text, skeleton = placeholderize(original)
+    assert "[[T" not in text
+    assert skeleton == []
+    assert "before" in text
+    assert "after" in text

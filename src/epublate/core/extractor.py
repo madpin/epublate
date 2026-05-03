@@ -503,7 +503,7 @@ def _auto_propose(
         candidate = _normalize_entity(ent)
         if candidate is None:
             continue
-        source_term, type_, notes = candidate
+        source_term, type_, notes, target_term = candidate
         entry_id, created = glossary_io.upsert_proposed(
             conn,
             project_id=project_id,
@@ -511,6 +511,7 @@ def _auto_propose(
             type=type_,
             first_seen_segment_id=first_seen_segment_id,
             notes=notes,
+            target_term=target_term,
         )
         if not created:
             continue
@@ -532,12 +533,17 @@ def _auto_propose(
 
 def _normalize_entity(
     ent: ExtractedEntity,
-) -> tuple[str, EntityType, str | None] | None:
-    """Coerce one :class:`ExtractedEntity` into ``(source, type, notes)``.
+) -> tuple[str, EntityType, str | None, str | None] | None:
+    """Coerce one :class:`ExtractedEntity` into ``(source, type, notes, target)``.
 
     The pydantic model already validated the shape (the prompt parser
     rejects garbage); we only need to drop empties and downcast the
-    type literal to :data:`EntityType` for the glossary-IO call.
+    type literal to :data:`EntityType` for the glossary-IO call. ``target``
+    is best-effort — the helper LLM is asked for an idiomatic
+    translation but unreliable endpoints may still omit it; in that
+    case we hand ``None`` to the glossary IO layer and the entry stays
+    in placeholder form until the translator observes a real
+    translation in a segment.
     """
 
     source_term = ent.source.strip()
@@ -547,7 +553,8 @@ def _normalize_entity(
     if type_str not in _VALID_ENTITY_TYPES:
         type_str = "term"
     notes = ent.evidence.strip() if ent.evidence else None
-    return source_term, cast(EntityType, type_str), notes
+    target = ent.target.strip() if ent.target else None
+    return source_term, cast(EntityType, type_str), notes, target or None
 
 
 # ---------------------------------------------------------------------------

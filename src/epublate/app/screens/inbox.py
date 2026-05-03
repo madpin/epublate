@@ -31,6 +31,7 @@ from textual.reactive import reactive
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Static
 
+from epublate.app.widgets import BatchStatusBar
 from epublate.app.widgets.cost_meter import CostMeter
 from epublate.core.project import Project
 from epublate.core.stats import (
@@ -137,6 +138,7 @@ class InboxScreen(Screen[None]):
             table.add_columns("Kind", "When", "What", "Detail")
             yield table
             yield Static("Ready.", id="inbox-status")
+        yield BatchStatusBar(id="inbox-batch-status")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -225,6 +227,10 @@ class InboxScreen(Screen[None]):
             meter.update_values(
                 spend_usd=stats.spend_usd,
                 budget_usd=stats.budget_usd,
+                prompt_tokens=stats.prompt_tokens,
+                completion_tokens=stats.completion_tokens,
+                llm_calls=stats.llm_calls,
+                cache_hits=stats.cache_hits,
             )
 
         flagged_count = sum(1 for r in self._rows if r.kind == "flagged")

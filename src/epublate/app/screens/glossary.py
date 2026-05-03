@@ -39,6 +39,7 @@ from textual.widgets import (
     TextArea,
 )
 
+from epublate.app.widgets import BatchStatusBar
 from epublate.core.project import Project
 from epublate.db import repo
 from epublate.db.schema import GlossaryStatus
@@ -224,7 +225,7 @@ class EntryEditScreen(ModalScreen[_EntryDraftResult | None]):
                 yield Label("Gender:")
                 yield Select(
                     [(g, g) for g in _GENDERS],
-                    value=self._draft.gender or Select.BLANK,
+                    value=self._draft.gender or Select.NULL,
                     id="entry-gender",
                     allow_blank=True,
                 )
@@ -266,7 +267,7 @@ class EntryEditScreen(ModalScreen[_EntryDraftResult | None]):
         status_value = self.query_one("#entry-status", Select).value
         gender_select = self.query_one("#entry-gender", Select).value
         gender: GenderTag | None
-        if gender_select is Select.BLANK:
+        if gender_select is Select.NULL:
             gender = None
         else:
             gender = cast(GenderTag, gender_select)
@@ -508,6 +509,7 @@ class GlossaryScreen(Screen[None]):
                 yield table
                 yield Static("(select an entry)", id="glossary-detail", markup=True)
             yield Static("Ready.", id="glossary-status")
+        yield BatchStatusBar(id="glossary-batch-status")
         yield Footer()
 
     def on_mount(self) -> None:

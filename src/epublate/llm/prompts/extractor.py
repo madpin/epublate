@@ -82,6 +82,7 @@ class ExtractedEntity(BaseModel):
 
     type: EntityTypeLiteral = "term"
     source: str
+    target: str | None = None
     evidence: str | None = None
     confidence: float = 0.0
 
@@ -124,8 +125,12 @@ What to surface:
 * events (battles, festivals, ceremonies),
 * items (named weapons, artifacts, vehicles, books),
 * date_or_time markers (named eras, calendars, recurring holidays),
-* recurring phrases or in-world terms the translator must spell the
-  same way every time,
+* recurring phrases, in-world terms, slang, epithets, idiomatic
+  insults, or compound coinages that recur and must spell the same
+  way every time. Hyphenated compounds (e.g. ``boot-lickers``,
+  ``half-elf``, ``self-aware``) and multi-word phrases
+  (e.g. ``Council of Five``) count — keep the hyphen / spaces in
+  the ``source`` exactly as written,
 * anything else worth keeping in the lore bible — use ``other``.
 
 Hard rules:
@@ -133,15 +138,22 @@ Hard rules:
 1. Only list entities that actually appear in the text I give you.
 2. Skip entries that are already in the existing glossary below — they
    are settled. Do not propose synonyms or aliases of locked terms.
-3. Do not invent translations. The ``source`` field must be the exact
-   surface form as it appears in the source text.
-4. ``confidence`` is a number between 0.0 and 1.0; use 1.0 only when the
-   text makes the entity unambiguous.
-5. Best-effort narrative metadata: detect the dominant point-of-view
+3. The ``source`` field must be the exact surface form as it appears
+   in the source text — keep capitalization, hyphens, punctuation,
+   and spacing.
+4. The ``target`` field is your best-effort translation of the source
+   term in {target_lang} — apply the language's spelling and
+   capitalization conventions (e.g. ``Julius Caesar`` → ``Júlio
+   César`` in Brazilian Portuguese). Leave it as an empty string
+   only when no idiomatic translation exists (proper nouns that
+   stay identical across languages).
+5. ``confidence`` is a number between 0.0 and 1.0; use 1.0 only when
+   the text makes the entity unambiguous.
+6. Best-effort narrative metadata: detect the dominant point-of-view
    (``first``, ``second``, ``third_limited``, ``third_omniscient``, ...)
    and tense (``past``, ``present``, ...) from the chunk. Leave them
    ``null`` if the chunk is too short or mixed.
-6. Best-effort style observations for the curator (used to co-propose
+7. Best-effort style observations for the curator (used to co-propose
    a tone preset): ``register`` is a short tag for the tone of the
    prose — pick from ``literary``, ``genre`` (thriller / fantasy /
    SF / mystery), ``romance``, ``explicit`` (sexually explicit /
@@ -159,6 +171,7 @@ Respond with a single JSON object and nothing else:
   "entities": [
     {{"type": "character|place|organization|event|item|date_or_time|phrase|term|other",
      "source": "<surface form as in the text>",
+     "target": "<best-effort translation in {target_lang}, or empty string>",
      "evidence": "<short quote or paraphrase>",
      "confidence": 0.0}}
   ],
@@ -329,6 +342,15 @@ def _normalize_entity(raw: Any) -> ExtractedEntity | None:
     if type_str not in _VALID_TYPES:
         type_str = "term"
 
+    target_raw = raw.get("target") or raw.get("target_term")
+    target: str | None
+    if target_raw is None:
+        target = None
+    elif isinstance(target_raw, str):
+        target = target_raw.strip() or None
+    else:
+        raise LLMResponseError("entity 'target' must be a string or null")
+
     evidence_raw = raw.get("evidence")
     evidence: str | None
     if evidence_raw is None:
@@ -355,6 +377,7 @@ def _normalize_entity(raw: Any) -> ExtractedEntity | None:
     return ExtractedEntity(
         type=type_str,  # type: ignore[arg-type]
         source=source,
+        target=target,
         evidence=evidence,
         confidence=confidence,
     )

@@ -199,6 +199,96 @@ def test_upsert_proposed_dedups(project_db: Engine) -> None:
     assert eid1 == eid2
 
 
+def test_upsert_proposed_records_target(project_db: Engine) -> None:
+    """A first-sighting upsert with an explicit ``target_term`` keeps it.
+
+    Regression test for the user-reported "Julius Caesar" → "Julius
+    Caesar" cold-start bug: the translator now surfaces the actual
+    translation it used and the auto-proposer must persist it instead
+    of mirroring the source.
+    """
+
+    pid = _project(project_db)
+    eid, created = glossary_io.upsert_proposed(
+        project_db,
+        project_id=pid,
+        source_term="Julius Caesar",
+        type="character",
+        target_term="Júlio César",
+    )
+    assert created is True
+    entry = repo.find_glossary_entry_by_source_term(
+        project_db, project_id=pid, source_term="Julius Caesar", type="character"
+    )
+    assert entry is not None and entry.id == eid
+    assert entry.target_term == "Júlio César"
+
+
+def test_upsert_proposed_backfills_placeholder_target(project_db: Engine) -> None:
+    """An existing placeholder ``target_term == source_term`` gets backfilled.
+
+    Mirrors the production flow where the extractor proposes an entity
+    cold (no target), then the translator later surfaces the same
+    entity with the actual translation it used. We must update the
+    placeholder so the lore bible reflects the real translation.
+    """
+
+    pid = _project(project_db)
+    eid_first, _ = glossary_io.upsert_proposed(
+        project_db,
+        project_id=pid,
+        source_term="Julius Caesar",
+        type="character",
+    )
+    eid_second, created = glossary_io.upsert_proposed(
+        project_db,
+        project_id=pid,
+        source_term="Julius Caesar",
+        type="character",
+        target_term="Júlio César",
+    )
+    assert eid_second == eid_first
+    assert created is False
+    entry = repo.find_glossary_entry_by_source_term(
+        project_db, project_id=pid, source_term="Julius Caesar", type="character"
+    )
+    assert entry is not None
+    assert entry.target_term == "Júlio César"
+
+
+def test_upsert_proposed_does_not_clobber_curator_target(
+    project_db: Engine,
+) -> None:
+    """Once the curator has edited the target, auto-propose must back off."""
+
+    pid = _project(project_db)
+    eid, _ = glossary_io.upsert_proposed(
+        project_db,
+        project_id=pid,
+        source_term="Julius Caesar",
+        type="character",
+        target_term="Júlio César",
+    )
+    repo.update_glossary_entry(
+        project_db,
+        entry_id=eid,
+        target_term="Iulius Caesar",
+        reason="manual:test",
+    )
+    glossary_io.upsert_proposed(
+        project_db,
+        project_id=pid,
+        source_term="Julius Caesar",
+        type="character",
+        target_term="Júlio César",
+    )
+    entry = repo.find_glossary_entry_by_source_term(
+        project_db, project_id=pid, source_term="Julius Caesar", type="character"
+    )
+    assert entry is not None
+    assert entry.target_term == "Iulius Caesar"
+
+
 def test_read_payload_validates(tmp_path: Path) -> None:
     p = tmp_path / "garbage.json"
     p.write_text("{not json", encoding="utf-8")
