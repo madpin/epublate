@@ -675,6 +675,239 @@ def test_save_round_trips_named_entity_references(tmp_path: Path) -> None:
     assert "Invalid tag name" not in text
 
 
+def test_segment_hoists_orphan_inline_runs_in_mixed_content_blocks(
+    tiny_epub_factory: Callable[..., Path],
+) -> None:
+    """Calibre often emits prose alongside nested blocks inside one wrapper
+    div::
+
+        <div class="calibre22">
+          <span>...prose...</span>
+          <div class="calibre26"><blockquote>...</blockquote></div>
+        </div>
+
+    The default segmenter walked block-host descendants only, so the
+    leading ``<span>`` was orphaned and never reached the LLM. After
+    the fix, the wrapper splits into two block hosts (one for the prose
+    span, one for the blockquote) and both are translatable.
+    """
+
+    src = tiny_epub_factory(
+        chapters=[
+            (
+                "Mixed",
+                "<h1>Mixed</h1>"
+                '<div class="calibre22">'
+                '<span class="calibre10">First, the prose paragraph.</span>'
+                '<div class="calibre26">'
+                "<blockquote>An indented quote inside.</blockquote>"
+                "</div>"
+                "</div>",
+            ),
+        ]
+    )
+    adapter = EpubAdapter(target_lang="pt")
+    segs = _segments_for(adapter, src)
+    sources = [s.source_text for s in segs]
+    assert any("First, the prose paragraph." in s for s in sources), sources
+    assert any("An indented quote inside." in s for s in sources), sources
+
+
+def test_orphan_hoist_marks_synthetic_wrappers(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """The synthetic wrappers must carry ``data-epublate-orphan="1"`` so
+    the repair flow (and any future re-segment pass) can tell them apart
+    from authored ``<div>`` elements that happen to have the same class.
+    """
+
+    src = tiny_epub_factory(
+        chapters=[
+            (
+                "Mixed",
+                '<div class="calibre22">'
+                "<span>orphan prose</span>"
+                '<div class="calibre26">quoted</div>'
+                "</div>",
+            )
+        ]
+    )
+    adapter = EpubAdapter(target_lang="pt")
+    book = adapter.load(src)
+    for doc in adapter.iter_chapters(book):
+        if doc.tree is None:
+            continue
+        adapter.segment(doc, chapter_id=f"ch-{doc.spine_idx}")
+        wrappers = doc.tree.xpath('//*[@data-epublate-orphan="1"]')
+        if "Mixed" in (doc.title or ""):
+            assert len(wrappers) == 1
+            wrapper = wrappers[0]
+            assert wrapper.get("class") == "calibre22"
+            assert (wrapper.text or "").strip() == "" or "orphan" in "".join(
+                wrapper.itertext()
+            )
+            assert "orphan prose" in "".join(wrapper.itertext())
+
+
+def test_orphan_hoist_is_idempotent(
+    tiny_epub_factory: Callable[..., Path],
+) -> None:
+    """Running the segmenter twice must not double-wrap. Same in / same
+    out is what makes the export path safe (it loads the original ePub
+    fresh and re-runs the hoist before XPath lookups).
+    """
+
+    src = tiny_epub_factory(
+        chapters=[
+            (
+                "Mixed",
+                '<div class="calibre22">'
+                "<span>orphan</span>"
+                '<div class="calibre26">quoted</div>'
+                "</div>",
+            )
+        ]
+    )
+    adapter = EpubAdapter(target_lang="pt")
+    book = adapter.load(src)
+    for doc in adapter.iter_chapters(book):
+        if doc.tree is None:
+            continue
+        adapter.segment(doc, chapter_id=f"ch-{doc.spine_idx}")
+        first_pass = etree.tostring(doc.tree)
+        adapter.segment(doc, chapter_id=f"ch-{doc.spine_idx}-again")
+        second_pass = etree.tostring(doc.tree)
+        if "Mixed" in (doc.title or ""):
+            assert first_pass == second_pass
+
+
+def test_orphan_hoist_does_not_wrap_pure_whitespace(
+    tiny_epub_factory: Callable[..., Path],
+) -> None:
+    """Indentation-only siblings of a nested block must not become their
+    own (empty) translatable host — that just bloats the queue.
+    """
+
+    src = tiny_epub_factory(
+        chapters=[
+            (
+                "Mixed",
+                "<div>\n  <p>Just a paragraph.</p>\n</div>",
+            )
+        ]
+    )
+    adapter = EpubAdapter(target_lang="pt")
+    segs = _segments_for(adapter, src)
+    sources = [s.source_text for s in segs]
+    # Only the paragraph is translatable; the wrapping div has no
+    # orphan prose to hoist.
+    assert any("Just a paragraph." in s for s in sources)
+    assert not any(s.strip() == "" for s in sources)
+
+
+def test_orphan_hoist_handles_multiple_runs(
+    tiny_epub_factory: Callable[..., Path],
+) -> None:
+    """Two prose runs with a block in between → two wrappers, two segments
+    in the LLM queue, and the block sits as a sibling between them.
+    """
+
+    src = tiny_epub_factory(
+        chapters=[
+            (
+                "Multi",
+                "<div>"
+                "<span>First orphan run.</span>"
+                "<blockquote>The middle quote.</blockquote>"
+                "<span>Second orphan run.</span>"
+                "</div>",
+            )
+        ]
+    )
+    adapter = EpubAdapter(target_lang="pt")
+    segs = _segments_for(adapter, src)
+    sources = [s.source_text for s in segs]
+    assert any("First orphan run." in s for s in sources), sources
+    assert any("Second orphan run." in s for s in sources), sources
+    assert any("The middle quote." in s for s in sources), sources
+
+
+def test_orphan_hoist_uses_div_inside_phrasing_only_parent(
+    tiny_epub_factory: Callable[..., Path],
+) -> None:
+    """When the parent is a phrasing-only block (``<p>``, headings, ``<dt>``)
+    the wrapper still has to be a ``<div>``: nesting ``<p>`` inside ``<p>``
+    is invalid HTML and the parser would auto-close the outer one,
+    silently moving the orphan run out of the parent.
+    """
+
+    src = tiny_epub_factory(
+        chapters=[
+            (
+                "Pp",
+                "<p>orphan inline<div>nested block</div></p>",
+            )
+        ]
+    )
+    adapter = EpubAdapter(target_lang="pt")
+    book = adapter.load(src)
+    for doc in adapter.iter_chapters(book):
+        if doc.tree is None:
+            continue
+        adapter.segment(doc, chapter_id=f"ch-{doc.spine_idx}")
+        if "Pp" not in (doc.title or ""):
+            continue
+        wrappers = doc.tree.xpath('//*[@data-epublate-orphan="1"]')
+        for wrapper in wrappers:
+            local = etree.QName(wrapper.tag).localname
+            assert local == "div", local
+
+
+def test_reassemble_restores_outer_whitespace_lost_by_llm(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """LLMs typically ``.strip()`` chat responses, so a host like
+    ``"\\n    [[T0]]Title[[/T0]]\\n  "`` comes back as
+    ``"[[T0]]Título[[/T0]]"``. The reassembler must put the leading /
+    trailing whitespace back so each chapter's per-host indentation
+    survives unchanged in the saved file.
+    """
+
+    # Mimic real-world ePub markup where the leaf host has surrounding
+    # whitespace AROUND an inline child: ``<div>\n    <span>X</span>\n  </div>``
+    # placeholderizes to ``"\n    [[T0]]X[[/T0]]\n  "`` — exactly the
+    # case where LLMs strip the outer whitespace on return.
+    body = '<div class="cal">\n    <span class="span">Hello world.</span>\n  </div>'
+    src = tiny_epub_factory(chapters=[("WS", body)])
+    adapter = EpubAdapter(target_lang="pt")
+    book = adapter.load(src)
+    book.extras["target_lang"] = "pt"
+    found_target_seg = False
+    for doc in adapter.iter_chapters(book):
+        if doc.tree is None:
+            continue
+        segs = adapter.segment(doc, chapter_id=f"ch-{doc.spine_idx}")
+        target_seg = next((s for s in segs if "Hello world" in s.source_text), None)
+        if target_seg is not None:
+            assert target_seg.source_text.startswith("\n    ")
+            assert target_seg.source_text.endswith("\n  ")
+            # Simulate the LLM stripping outer whitespace, the way
+            # real OpenAI-compatible endpoints do.
+            target_seg.target_text = "[[T0]]Olá mundo.[[/T0]]"
+            found_target_seg = True
+        adapter.reassemble(doc, segs)
+    assert found_target_seg, "test fixture didn't yield the target segment"
+    out = tmp_path / "out.epub"
+    adapter.save(book, out)
+
+    chapter_xml = _read_chapter_xml(out, "ch01.xhtml")
+    text = chapter_xml.decode("utf-8")
+    # The translated host must keep its leading / trailing whitespace
+    # ("\n    " before <span>, "\n  " after </span>) — not the
+    # LLM-stripped densely-packed form.
+    assert '\n    <span class="span">Olá mundo.</span>\n  ' in text, text
+
+
 def test_save_updates_html_lang_on_chapter_root(tmp_path: Path) -> None:
     """``<html lang>`` and ``xml:lang`` must reflect the target
     language after export. We bypass ebooklib's chapter template (so

@@ -32,6 +32,7 @@ from typing import Any, cast
 
 from epublate.core.cache import cache_key_for_messages
 from epublate.core.segmentation import PLACEHOLDER_RE, is_trivially_empty
+from epublate.core.typography import strip_leading_orphan_apostrophes
 from epublate.core.validators import validate_segment_placeholders
 from epublate.db import repo, schema
 from epublate.errors import EpublateError
@@ -51,7 +52,9 @@ from epublate.glossary.matcher import Match, match_source
 from epublate.glossary.models import EntityType, GlossaryEntryWithAliases
 from epublate.llm.base import LLMProvider, ResponseFormat
 from epublate.llm.pricing import estimate_cost
+from epublate.llm.prompts.extractor import _violates_extractor_caps
 from epublate.llm.prompts.translator import (
+    ContextSegment,
     GlossaryConstraint,
     GroupTranslatorItem,
     TargetOnlyConstraint,
@@ -100,6 +103,45 @@ _VALID_ENTITY_TYPES: frozenset[str] = frozenset(
 
 
 @dataclass(slots=True, frozen=True)
+class ContextOptions:
+    """Knobs for including preceding segments as translator context.
+
+    The pipeline loads up to ``max_segments`` preceding segments from
+    the same chapter (in book order) and renders them in the
+    translator's system prompt. When ``max_chars`` is positive, the
+    pipeline drops the *oldest* of those segments that would push the
+    cumulative source-text length past the cap — but never splits a
+    single segment to fit. Setting both knobs to zero disables the
+    feature entirely (the prompt has no context block).
+
+    The defaults disable context. Curators opt in per-batch /
+    per-call: a chatty conversation translation might want
+    ``ContextOptions(max_segments=4, max_chars=600)`` so the LLM sees
+    the last few exchanges; a long-paragraph narrative might use
+    ``ContextOptions(max_segments=1, max_chars=1500)`` or stay at the
+    default. The "never split a segment" rule means raising
+    ``max_chars`` past a single paragraph's length tends to give
+    diminishing returns — the pipeline will still drop a paragraph
+    that, taken whole, would push the budget over.
+    """
+
+    max_segments: int = 0
+    max_chars: int = 0
+
+    @property
+    def enabled(self) -> bool:
+        """Whether this options bundle would surface any context at all.
+
+        ``max_segments`` is the gating knob — without it we have no
+        upper bound on how many preceding segments the prompt would
+        list, which we never want. ``max_chars`` is a refinement on
+        top of an already-enabled bundle.
+        """
+
+        return self.max_segments > 0
+
+
+@dataclass(slots=True, frozen=True)
 class TranslateOptions:
     """Per-call knobs that don't live on the project row.
 
@@ -112,6 +154,13 @@ class TranslateOptions:
     loads the project's glossary from the DB (the normal path).
     ``auto_propose`` controls whether ``trace.new_entities`` candidates
     are upserted as ``proposed`` entries (M3 default: on).
+
+    ``context`` opts the translator into using previous-segment
+    context (PRD §8.1 follow-up). The pipeline fetches the preceding
+    segments from the same chapter, renders them in a "Preceding
+    segments" block in the system prompt, and folds the resulting
+    block into the cache key so a context change doesn't return a
+    stale translation. Defaults to ``ContextOptions()`` (disabled).
     """
 
     model: str
@@ -121,6 +170,7 @@ class TranslateOptions:
     bypass_cache: bool = False
     response_format: ResponseFormat | None = None
     auto_propose: bool = True
+    context: ContextOptions = field(default_factory=ContextOptions)
 
 
 @dataclass(slots=True)
@@ -221,6 +271,9 @@ def translate_segment(
     # translations downstream of the cascade.
     g_hash = glossary_hash(project_entries)
 
+    context_segments = _load_context_segments(
+        engine, segment=segment, options=options.context
+    )
     messages = build_translator_messages(
         source_lang=source_lang,
         target_lang=target_lang,
@@ -228,6 +281,7 @@ def translate_segment(
         style_guide=style_guide,
         glossary=constraints,
         target_only_glossary=target_only_constraints,
+        context=context_segments,
     )
     key = cache_key_for_messages(
         model=options.model, messages=messages, glossary_hash=g_hash
@@ -281,6 +335,8 @@ def translate_segment(
     except EpublateError:
         # Re-raise — the LLM-integration rule says past the retry budget
         # we surface a typed error. Persist the failed call for audit.
+        # Sanitisation is intentionally below the parse — a malformed
+        # response should still raise, not silently rewrite the bytes.
         _record_failed_call(
             engine,
             project_id=project_id,
@@ -297,6 +353,9 @@ def translate_segment(
         glossary_view.close()
         raise
 
+    trace.target = strip_leading_orphan_apostrophes(
+        trace.target, target_lang=target_lang
+    )
     spliced = _splice_target(segment, target=trace.target)
     validate_segment_placeholders(spliced)
 
@@ -499,6 +558,15 @@ def _replay_from_cache(
         trace = parse_translator_response(content)
     else:
         trace = TranslatorTrace.model_validate(trace_data)
+
+    # Cache-replay path — apply the same target-language sanitiser as
+    # the live path so cached entries written before the sanitiser
+    # was introduced (or by an older code revision) are transparently
+    # cleaned up on replay. Cache keys do not include ``target``, so
+    # rewriting the trace doesn't invalidate the cache hit.
+    trace.target = strip_leading_orphan_apostrophes(
+        trace.target, target_lang=target_lang
+    )
 
     spliced = _splice_target(segment, target=trace.target)
     validate_segment_placeholders(spliced)
@@ -793,6 +861,85 @@ def estimate_segment_tokens(
         target_only_glossary=target_only_glossary,
     )
     return sum(count_tokens(m.content, model=model) for m in messages)
+
+
+def _load_context_segments(
+    engine: Any,
+    *,
+    segment: repo.SegmentRow,
+    options: ContextOptions,
+) -> list[ContextSegment]:
+    """Fetch preceding segments to surface as translator context.
+
+    Reads up to ``options.max_segments`` preceding segments from
+    ``segment``'s chapter (in book order), then — when
+    ``options.max_chars`` is positive — drops the *oldest* ones that
+    would push the cumulative source-text length past the cap. A
+    single segment is never split: when one preceding segment alone
+    exceeds the cap, the helper skips it (the prompt's "never split"
+    rule is the user-facing behaviour they explicitly asked for).
+    The result is oldest-first so the prompt renders the recency
+    gradient naturally.
+
+    Returns ``[]`` when:
+
+    * ``options.enabled`` is ``False`` (no context requested);
+    * ``segment`` is the first segment of its chapter (nothing
+      precedes it);
+    * the chapter has no preceding segments after the char-cap pass.
+    """
+
+    if not options.enabled:
+        return []
+
+    try:
+        chapter_segments = repo.list_segments(engine, segment.chapter_id)
+    except Exception:
+        # Defensive: we never want context-loading to abort a translation.
+        # A segment without context is always better than no translation.
+        _logger.warning(
+            "context: failed to list chapter %s; translating without context",
+            segment.chapter_id,
+            exc_info=True,
+        )
+        return []
+
+    preceding = [seg for seg in chapter_segments if seg.idx < segment.idx]
+    if not preceding:
+        return []
+    preceding.sort(key=lambda s: s.idx, reverse=True)  # newest first
+    preceding = preceding[: max(0, options.max_segments)]
+    if not preceding:
+        return []
+
+    if options.max_chars > 0:
+        kept: list[repo.SegmentRow] = []
+        total = 0
+        for seg in preceding:  # newest first
+            cost = len(seg.source_text)
+            if cost > options.max_chars:
+                # The "never split" contract: skip and keep walking
+                # backwards rather than truncate this segment to fit.
+                continue
+            if total + cost > options.max_chars:
+                break
+            kept.append(seg)
+            total += cost
+    else:
+        kept = list(preceding)
+
+    if not kept:
+        return []
+
+    kept.reverse()  # oldest first for prompt rendering
+    return [
+        ContextSegment(
+            source_text=seg.source_text,
+            target_text=seg.target_text,
+            segments_back=segment.idx - seg.idx,
+        )
+        for seg in kept
+    ]
 
 
 def _load_glossary(engine: Any, *, project_id: str) -> list[GlossaryEntryWithAliases]:
@@ -1172,6 +1319,14 @@ def _normalize_new_entity(
     optional and falls back to ``None`` when the model omitted it; the
     glossary IO layer treats ``None`` and ``source_term``-equal as
     "no real translation observed yet".
+
+    Sources that flunk :func:`_violates_extractor_caps` (sentences,
+    runaway-length phrases, broken parens, raw years) are dropped
+    here too — the translator's ``new_entities`` channel is the same
+    auto-propose pipe as the helper extractor and noisy proposals
+    have the same lore-bible cost. Targets that flunk the cap have
+    their target cleared, mirroring the extractor parser so the
+    source-side proposal still survives for curator review.
     """
 
     if not isinstance(raw, dict):
@@ -1182,6 +1337,14 @@ def _normalize_new_entity(
     source_term = source_term.strip()
     if not source_term:
         return None
+    cap_reason = _violates_extractor_caps(source_term)
+    if cap_reason is not None:
+        _logger.debug(
+            "auto_propose: dropped translator candidate source=%r (%s)",
+            source_term[:80],
+            cap_reason,
+        )
+        return None
     type_str = str(raw.get("type", "term")).strip().lower() or "term"
     if type_str not in _VALID_ENTITY_TYPES:
         type_str = "term"
@@ -1190,6 +1353,15 @@ def _normalize_new_entity(
         target_term: str | None = target_raw.strip() or None
     else:
         target_term = None
+    if target_term is not None:
+        target_cap_reason = _violates_extractor_caps(target_term)
+        if target_cap_reason is not None:
+            _logger.debug(
+                "auto_propose: dropped translator target=%r (%s); keeping source",
+                target_term[:80],
+                target_cap_reason,
+            )
+            target_term = None
     return source_term, cast(EntityType, type_str), target_term
 
 
@@ -1507,6 +1679,9 @@ def translate_segments_grouped(
             new_entities=target_item.new_entities,
             notes=target_item.notes,
         )
+        trace.target = strip_leading_orphan_apostrophes(
+            trace.target, target_lang=target_lang
+        )
         try:
             spliced = _splice_target(seg, target=trace.target)
             validate_segment_placeholders(spliced)
@@ -1795,6 +1970,7 @@ __all__ = [
     "GROUP_DEFAULT_MAX_PLACEHOLDERS",
     "GROUP_DEFAULT_MAX_SOURCE_CHARS",
     "PURPOSE_TRANSLATE",
+    "ContextOptions",
     "PipelineError",
     "TranslateOptions",
     "TranslateOutcome",

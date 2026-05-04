@@ -126,6 +126,253 @@ def _find_translatable_hosts(
     return hosts
 
 
+# Tags that may not contain block-level descendants per HTML5 content
+# rules (e.g. ``<p>`` is phrasing-only). When the parent of an orphan
+# inline run is one of these we must wrap with ``<div>`` rather than
+# duplicating the parent tag, otherwise the parser would auto-close the
+# outer element and the wrap would silently move the orphan out of the
+# parent — defeating the whole point of the hoist.
+_PHRASING_ONLY_BLOCK_HOSTS: frozenset[str] = frozenset(
+    {"p", "h1", "h2", "h3", "h4", "h5", "h6", "dt"}
+)
+
+
+def _is_orphan_wrapper(elem: etree._Element) -> bool:
+    """True iff ``elem`` is a wrapper inserted by :func:`_hoist_orphaned_inline_runs`.
+
+    Marked with ``data-epublate-orphan="1"`` so we can tell our wrappers
+    apart from authored ``<div>``s — needed for idempotency and for the
+    ``epublate repair`` flow that re-segments existing projects.
+    """
+
+    return bool(elem.get("data-epublate-orphan") == "1")
+
+
+def _is_mixed_content_block(elem: etree._Element) -> bool:
+    """True if ``elem`` has both block-host children AND non-trivial inline content.
+
+    "Inline content" here means: direct text on ``elem.text``, an inline
+    child element (or entity reference) that carries text, or trailing
+    text on a child's ``tail``. Pure-whitespace runs don't count — those
+    serialize fine and don't need a translatable wrapper.
+    """
+
+    has_block = False
+    has_inline = bool((elem.text or "").strip())
+    for child in elem.iterchildren():
+        if isinstance(child.tag, str):
+            child_tag = _local_name(str(child.tag))
+            if child_tag in _BLOCK_HOST_TAGS:
+                has_block = True
+            else:
+                # Non-block element. Any text it carries is orphaned.
+                if "".join(child.itertext()).strip():
+                    has_inline = True
+        else:
+            # Comment / PI / Entity-reference. Entities (``&nbsp;``,
+            # ``&copy;``) carry user-visible content; treat as inline.
+            text = child.text or ""
+            if text.strip():
+                has_inline = True
+        if child.tail and child.tail.strip():
+            has_inline = True
+    return has_block and has_inline
+
+
+def _wrapper_tag_for(parent: etree._Element) -> str:
+    """Choose the synthetic wrapper's tag, namespaced to match ``parent``.
+
+    Always emits a ``<div>`` (or namespaced equivalent) so we never produce
+    HTML5-invalid nesting like ``<p><p>…</p></p>``: even when the parent is
+    itself a phrasing-only host, the wrapper has to be the most permissive
+    block container we have.
+    """
+
+    parent_tag = str(parent.tag)
+    if "}" in parent_tag:
+        ns = parent_tag.split("}", 1)[0][1:]
+        return f"{{{ns}}}div"
+    return "div"
+
+
+def _hoist_orphaned_inline_runs(tree: etree._Element) -> int:
+    """Wrap orphaned inline siblings inside mixed-content blocks (PRD §4.1).
+
+    Real-world ePubs (especially Calibre conversions) frequently emit
+    block elements that mix inline-only siblings with nested block-level
+    descendants, e.g.::
+
+        <div class="calibre22">
+          <span class="calibre10">prose paragraph...</span>
+          <div class="calibre26"><blockquote>quoted text</blockquote></div>
+        </div>
+
+    The default segmenter walks ``_BLOCK_HOST_TAGS`` and skips any host
+    with block-host descendants — which silently strands the leading
+    ``<span>``: it never gets a segment row, never reaches the LLM, and
+    surfaces as untranslated source-language text mid-chapter in the
+    exported ePub.
+
+    This pass runs before segmentation/reassembly and rewrites every
+    such mixed-content host so each contiguous inline run becomes its
+    own block-host (a synthetic ``<div>`` carrying the parent's
+    ``class`` and a ``data-epublate-orphan="1"`` marker). After the
+    pass, no block-host element has mixed content and the standard
+    ``_find_translatable_hosts`` walk picks the orphans up cleanly.
+
+    Idempotent: re-running on a tree that already has no mixed-content
+    hosts is a no-op. Same-input → same-output, so XPaths produced at
+    segment time still resolve at export time after a fresh load of the
+    original ePub.
+
+    Returns the number of synthetic wrappers inserted (mainly useful
+    for tests / repair tooling).
+    """
+
+    candidates: list[etree._Element] = []
+    for elem in tree.iter():
+        if not isinstance(elem.tag, str):
+            continue
+        if _local_name(str(elem.tag)) not in _BLOCK_HOST_TAGS:
+            continue
+        if _is_skipped(elem):
+            continue
+        if _is_mixed_content_block(elem):
+            candidates.append(elem)
+
+    inserted = 0
+    for parent in candidates:
+        inserted += _split_mixed_content_block(parent)
+    return inserted
+
+
+def _restore_outer_whitespace(source_text: str, target_text: str) -> str:
+    """Restore leading / trailing whitespace the LLM stripped from the target.
+
+    OpenAI-compatible chat endpoints almost universally ``.strip()`` the
+    response (or the model itself does), so a host like
+    ``"\\n    [[T0]]Title[[/T0]]\\n  "`` typically comes back as
+    ``"[[T0]]Título[[/T0]]"``. The lost whitespace is purely cosmetic —
+    browsers collapse it — but the source ePub's per-host indentation
+    is part of its identity, and putting it back keeps diffs against
+    the original small and reviews tractable. Re-introduces the source
+    side's leading and trailing whitespace runs only when the target
+    isn't already carrying its own (so we don't double up).
+    """
+
+    if not source_text or not target_text:
+        return target_text
+    src_lead_len = len(source_text) - len(source_text.lstrip())
+    src_trail_len = len(source_text) - len(source_text.rstrip())
+    tgt_lead_len = len(target_text) - len(target_text.lstrip())
+    tgt_trail_len = len(target_text) - len(target_text.rstrip())
+
+    out = target_text
+    if src_lead_len and not tgt_lead_len:
+        out = source_text[:src_lead_len] + out
+    if src_trail_len and not tgt_trail_len:
+        out = out + source_text[len(source_text) - src_trail_len :]
+    return out
+
+
+def _split_mixed_content_block(parent: etree._Element) -> int:
+    """Wrap every orphaned inline run inside ``parent`` into a synthetic block.
+
+    Implementation walks ``parent``'s direct children left-to-right,
+    routing each block-host child through unchanged and accumulating the
+    inline-only ones into a buffer. When a block-host arrives the buffer
+    is flushed into a fresh wrapper element. The wrapper inherits the
+    parent's ``class`` so styling stays close to what the browser
+    rendered as an anonymous block before the change.
+
+    Whitespace-only buffers don't get a wrapper (they're cosmetic
+    indentation in the source XHTML); the whitespace is appended to the
+    preceding block's ``tail`` so the file still serializes with the
+    same line breaks at the top level.
+
+    Returns how many wrappers this call inserted.
+    """
+
+    from lxml import etree
+
+    children = list(parent)
+    if not children:
+        return 0
+
+    wrapper_qtag = _wrapper_tag_for(parent)
+    parent_class = parent.get("class")
+
+    new_top_level: list[etree._Element] = []
+    pending_text: str = parent.text or ""
+    pending_inlines: list[etree._Element] = []
+    inserted = 0
+
+    def _child_textual(child: etree._Element) -> str:
+        # Inline elements (string tag) contribute their full text run;
+        # comments / PIs only have ``.text``. Either way we just need a
+        # quick "is there any non-whitespace content here?" check.
+        if isinstance(child.tag, str):
+            return "".join(child.itertext())
+        return child.text or ""
+
+    def flush_inline_run() -> None:
+        nonlocal pending_text, pending_inlines, inserted
+        if not pending_text.strip() and not any(
+            _child_textual(c).strip() for c in pending_inlines
+        ):
+            # Nothing meaningful to wrap. Preserve any trivial
+            # whitespace by attaching it to the previous block's tail
+            # so the file's line-by-line shape stays close to the
+            # original XHTML — pure cosmetics, but the byte-level diff
+            # against the source stays smaller.
+            if pending_text and new_top_level:
+                last = new_top_level[-1]
+                last.tail = (last.tail or "") + pending_text
+            elif pending_text and not new_top_level:
+                # leading whitespace before any block: drop it; the
+                # parent's ``.text`` was already cleared and we cannot
+                # safely re-set it without confusing the wrapper logic.
+                pass
+            pending_text = ""
+            pending_inlines = []
+            return
+        wrapper = etree.Element(wrapper_qtag, nsmap=parent.nsmap)
+        if parent_class:
+            wrapper.set("class", parent_class)
+        wrapper.set("data-epublate-orphan", "1")
+        wrapper.text = pending_text or None
+        for child in pending_inlines:
+            wrapper.append(child)
+        new_top_level.append(wrapper)
+        inserted += 1
+        pending_text = ""
+        pending_inlines = []
+
+    for child in children:
+        is_block = (
+            isinstance(child.tag, str)
+            and _local_name(str(child.tag)) in _BLOCK_HOST_TAGS
+        )
+        if is_block:
+            flush_inline_run()
+            tail = child.tail
+            child.tail = None
+            new_top_level.append(child)
+            pending_text = tail or ""
+        else:
+            pending_inlines.append(child)
+
+    flush_inline_run()
+
+    for child in list(parent):
+        parent.remove(child)
+    parent.text = None
+    for child in new_top_level:
+        parent.append(child)
+
+    return inserted
+
+
 def _matches_lang(elem: etree._Element, target_lang: str) -> bool:
     """True if the element (or its inherited xml:lang) equals ``target_lang``."""
 
@@ -261,6 +508,13 @@ class EpubAdapter:
     ) -> list[Segment]:
         if doc.tree is None:
             return []
+        # Lift orphaned inline runs in mixed-content blocks into their
+        # own ``<div>`` hosts BEFORE selecting hosts, so the LLM gets a
+        # shot at every visible piece of prose. The transform is
+        # deterministic and idempotent so the same XPath survives a
+        # re-load at export time (where this exact pass runs again on
+        # the freshly-loaded original ePub before reassembly).
+        _hoist_orphaned_inline_runs(doc.tree)
         segments: list[Segment] = []
         for host in _find_translatable_hosts(doc.tree, target_lang=self.target_lang):
             source_text, skeleton = placeholderize(host)
@@ -290,6 +544,11 @@ class EpubAdapter:
     def reassemble(self, doc: ChapterDoc, translated: list[Segment]) -> ChapterDoc:
         if doc.tree is None:
             return doc
+        # Re-run the orphan hoist so the synthetic wrappers exist on
+        # the freshly-loaded original tree before any XPath lookup. The
+        # transform is idempotent — if segmentation already created
+        # them in this process, this is a no-op.
+        _hoist_orphaned_inline_runs(doc.tree)
         by_path: dict[str, list[Segment]] = {}
         for seg in translated:
             by_path.setdefault(seg.host_path, []).append(seg)
@@ -305,7 +564,12 @@ class EpubAdapter:
             for seg in segs:
                 validate_segment_placeholders(seg)
             parts = [
-                (seg.target_text or seg.source_text, seg.inline_skeleton)
+                (
+                    _restore_outer_whitespace(seg.source_text, seg.target_text)
+                    if seg.target_text is not None
+                    else seg.source_text,
+                    seg.inline_skeleton,
+                )
                 for seg in segs
             ]
             apply_parts_to_host(host, parts)

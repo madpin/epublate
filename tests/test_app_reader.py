@@ -1102,3 +1102,160 @@ async def test_reader_scroll_sync_guard_outlives_synchronous_clear(
             )
     finally:
         project.close()
+
+
+@pytest.mark.asyncio
+async def test_reader_cancel_chapter_batch_via_c_keystroke(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """Pressing ``c`` while a chapter batch is running flips the cancel event.
+
+    Curators need a "stop" affordance for long chapter batches that
+    mirrors the Dashboard's cancel binding. The contract: pressing
+    ``c`` sets the same ``cancel_event`` ``run_batch`` is watching,
+    so the worker bails out cleanly between segments and the batch
+    raises :class:`BatchCancelled`. We patch ``run_batch`` to wait on
+    the cancel event so the test deterministically exercises the
+    "press c → worker sees it → BatchCancelled bubbles up → screen
+    state cleared" path without a real LLM round-trip.
+    """
+
+    import threading
+
+    from epublate.app.screens import reader as reader_module
+    from epublate.core.batch import BatchCancelled
+    from epublate.core.batch import BatchSummary as RealBatchSummary
+
+    project = _make_two_chapter_project(tiny_epub_factory, tmp_path)
+    try:
+        provider = MockLLMProvider()
+        provider.set_responder(_placeholder_safe_responder())
+        screen = ReaderScreen(project, provider_factory=lambda: provider)
+
+        worker_started = threading.Event()
+        observed_events: list[object] = []
+
+        def _capture_run_batch(**kwargs: object) -> RealBatchSummary:
+            cancel_event = kwargs.get("cancel_event")
+            observed_events.append(cancel_event)
+            assert cancel_event is not None, (
+                "Reader must hand the worker a cancel event so the "
+                "cancellation binding can stop the run mid-flight."
+            )
+            worker_started.set()
+            # Block until the curator's ``c`` keystroke flips the
+            # event. Bounded wait so a wiring bug fails the test
+            # in < 5 s rather than hanging the suite.
+            cancel_event.wait(timeout=5.0)  # type: ignore[union-attr]
+            assert cancel_event.is_set(), (  # type: ignore[union-attr]
+                "cancel event never fired; the ``c`` binding did not "
+                "propagate to the worker."
+            )
+            raise BatchCancelled("cancelled in test", summary=RealBatchSummary())
+
+        from unittest.mock import patch
+
+        with patch.object(reader_module, "run_batch", _capture_run_batch):
+            app = EpublateApp(initial_screen=screen)
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                current = pilot.app.screen
+                assert isinstance(current, ReaderScreen)
+
+                await pilot.press("b")
+                # Wait for the worker to actually enter ``run_batch``
+                # (it spawned in a background thread); only then can
+                # the cancel binding race meaningfully against it.
+                assert worker_started.wait(timeout=5.0), (
+                    "Reader's chapter-batch worker never reached run_batch"
+                )
+
+                await pilot.press("c")
+                await pilot.app.workers.wait_for_complete()
+                await pilot.pause()
+
+                assert observed_events, "run_batch was never called"
+                # After ``BatchCancelled`` bubbles up the slot is
+                # cleared so the next chapter batch starts with a
+                # fresh event.
+                current = pilot.app.screen
+                assert isinstance(current, ReaderScreen)
+                assert (
+                    current._chapter_batch_cancel_event is None  # type: ignore[reportPrivateUsage]
+                )
+                assert (
+                    current._active_batch_chapter_id is None  # type: ignore[reportPrivateUsage]
+                )
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
+async def test_reader_unmount_signals_chapter_batch_cancel(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """Popping the Reader while a chapter batch is in flight signals cancel.
+
+    The graceful-shutdown contract: the worker survives the screen
+    pop (it's a daemon thread on the SQLite engine), but it must stop
+    submitting *new* LLM calls so a popped screen doesn't keep
+    burning tokens. The signal is just ``cancel_event.set()`` on the
+    event the worker is watching.
+    """
+
+    project = _make_two_chapter_project(tiny_epub_factory, tmp_path)
+    try:
+        provider = MockLLMProvider()
+        provider.set_responder(_placeholder_safe_responder())
+        screen = ReaderScreen(project, provider_factory=lambda: provider)
+
+        app = EpublateApp(initial_screen=screen)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            current = pilot.app.screen
+            assert isinstance(current, ReaderScreen)
+
+            import threading
+
+            slot = threading.Event()
+            current._chapter_batch_cancel_event = slot  # type: ignore[reportPrivateUsage]
+            assert not slot.is_set()
+
+            current.on_unmount()
+            assert slot.is_set(), (
+                "on_unmount must flip the cancel event so the worker "
+                "stops submitting new LLM calls after the screen pops."
+            )
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
+async def test_reader_action_cancel_noop_without_active_batch(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """Cancel binding with no batch running just sets a status hint."""
+
+    from textual.widgets import Static
+
+    project = _make_two_chapter_project(tiny_epub_factory, tmp_path)
+    try:
+        provider = MockLLMProvider()
+        provider.set_responder(_placeholder_safe_responder())
+        screen = ReaderScreen(project, provider_factory=lambda: provider)
+
+        app = EpublateApp(initial_screen=screen)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            current = pilot.app.screen
+            assert isinstance(current, ReaderScreen)
+            assert (
+                current._active_batch_chapter_id is None  # type: ignore[reportPrivateUsage]
+            )
+            current.action_cancel_chapter_batch()
+            await pilot.pause()
+            status_widget = current.query_one("#reader-status", Static)
+            content = str(status_widget.render())
+            assert "No chapter batch running" in content
+    finally:
+        project.close()

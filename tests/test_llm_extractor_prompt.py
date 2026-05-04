@@ -41,6 +41,36 @@ def test_system_prompt_lists_languages_and_entity_taxonomy() -> None:
     assert "JSON" in system.content
 
 
+def test_extractor_prompt_warns_against_raw_year_proposals() -> None:
+    """The extractor prompt explicitly bans raw year references.
+
+    The parser-side filter (:func:`_violates_extractor_caps` /
+    :func:`_is_year_like`) is the load-bearing guard, but spelling
+    the rule out in the prompt cuts the failure rate at the
+    extractor: the model gets a worked example of "this isn't an
+    entity" instead of being silently filtered out downstream. Lock
+    the wording in so prompt drift is auditable, the same way the
+    "no full sentences" rule is audited.
+    """
+
+    [system, _] = build_extractor_messages(
+        source_lang="en",
+        target_lang="pt",
+        source_text="The Battle of 1066 changed everything.",
+    )
+    body = " ".join(system.content.split())
+    assert "Never propose a raw year reference" in body
+    # The example anchors what counts as "raw year" so the model
+    # has zero ambiguity on year ranges and decades.
+    assert "1066" in body
+    assert "1939-1945" in body
+    # The carve-out for *named* eras / phrases must travel too —
+    # without it the model could over-correct and drop legitimate
+    # entries like ``Year of the Four Emperors``.
+    assert "named" in body
+    assert "Year of the Four Emperors" in body
+
+
 def test_glossary_block_lists_existing_locked_and_confirmed() -> None:
     glossary = [
         GlossaryConstraint(source_term="Élise", target_term="Elisa", status="locked"),

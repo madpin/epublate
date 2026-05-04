@@ -127,6 +127,11 @@ Hard rules:
    expression — at most 10 words and 100 characters. Never propose a
    full sentence, a clause with a verb chain, a description, or a
    quoted line of dialogue** even if it recurs.
+   **Never propose a raw year reference** (``1066``, ``1939-1945``,
+   ``1990s``, ``c. 1066``, ``45 BC``) as an entity. ``date_or_time``
+   is reserved for *named* eras, calendars, and recurring holidays
+   (``the Long Night``, ``Yule``); plain years are inline date
+   references the translator handles automatically.
 2. **When a name is commonly written ``Full Name (ACRONYM)``** (e.g.
    ``Federação Internacional de Futebol (FIFA)``): use the ACRONYM
    as the canonical ``target`` and put the long form in ``aliases``.

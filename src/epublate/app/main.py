@@ -182,6 +182,37 @@ class EpublateApp(App[None]):
         )
         self.push_screen(screen)
 
+    async def action_quit(self) -> None:
+        """Quit the app, cancelling any running batch first.
+
+        The user expects "leave the app" to stop ongoing translations
+        rather than abandon the worker thread to keep spending tokens
+        on a process that no longer has a UI. Cancellation is best
+        effort: in-flight LLM calls finish in their daemon thread (we
+        can't kill a blocking ``httpx.post``), but the runner's
+        cancel-event check between segments stops the next batch step
+        from starting, and every committed segment is already durable
+        (WAL + per-segment transactions, PRD invariant §3).
+
+        Async because Textual's :class:`App` declares ``action_quit``
+        as a coroutine; we mirror the signature so we can call
+        ``self.exit()`` with the same lifecycle the framework expects
+        (otherwise mypy + the override-checker complain).
+        """
+
+        if self._batch_handle is not None:
+            self.cancel_batch()
+            try:
+                self.notify(
+                    "Stopping translation gracefully — already-completed "
+                    "segments are saved.",
+                    severity="warning",
+                    title="Quitting",
+                )
+            except Exception:  # pragma: no cover — defensive in headless tests
+                _logger.debug("notify failed during quit", exc_info=True)
+        self.exit()
+
     def action_cycle_theme(self) -> None:
         try:
             idx = EPUBLATE_THEME_ORDER.index(self.theme)

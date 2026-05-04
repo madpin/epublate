@@ -7,6 +7,525 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Human-readable language names in translator prompts
+
+The translator's "Translate from X to Y" sentence now renders the
+source and target languages as ``French (fr)`` /
+``Brazilian Portuguese (pt-BR)`` instead of the bare BCP-47 code.
+Curators reported that ``fr → pt-BR`` in isolation gave the LLM less
+to anchor on than the named pair: dialect cues, prose register, and
+typography conventions all click on the very first token when the
+prose name is present. The BCP-47 code stays alongside so dialect
+distinctions (``en-GB`` vs ``en-US``) survive.
+
+* New ``_LANGUAGE_NAMES`` table in
+  ``epublate/llm/prompts/translator.py`` with ~80 BCP-47 codes and
+  their conventional English-language names. Hand-curated rather
+  than depending on ``babel`` so we keep the local-first invariant
+  trivially and can spell ``Brazilian Portuguese`` (not the more
+  clinical ``Portuguese (Brazil)``).
+* ``_format_language_label`` falls back to the primary subtag
+  (``pt`` for ``pt-BR``) when the full tag isn't registered, then
+  to the bare code when the family is unknown — adding a language
+  is a one-key PR.
+* Both the per-segment and grouped translator prompts pick up the
+  named labels in their main "Translate from X to Y" sentence. The
+  conditional ``Language-pair notes`` block (``fr → pt-BR``) keeps
+  bare codes for compactness; the names already anchor the prompt
+  header.
+
+### Added — Preceding-segment context in the translator prompt (PRD §8.1)
+
+Curators can now opt the translator into seeing the last few
+segments of the same chapter in its system prompt — useful for
+conversational chapters where short turns benefit from prior
+context, less so for long-paragraph narratives. The contract is
+explicit: a segment is *never* split to fit the char cap; the
+oldest segments that would push the budget over are dropped whole.
+
+* New ``ContextOptions`` dataclass in
+  ``epublate/core/pipeline.py`` with ``max_segments`` and
+  ``max_chars`` knobs. Defaults disable the feature so existing
+  batches see no prompt change.
+* New ``ContextSegment`` dataclass in
+  ``epublate/llm/prompts/translator.py`` carries source +
+  curator-approved target text plus a ``segments_back`` distance
+  marker.
+* ``translate_segment`` reads ``options.context``, fetches
+  preceding segments via the new ``_load_context_segments``
+  helper, and renders them oldest-first in the prompt under a
+  ``Preceding segments`` block fenced with a "DO NOT translate
+  them" reminder so the model doesn't try to retranslate context.
+* ``BatchOptions.context`` plumbs the same options through batch
+  runs (per-segment path only — the grouped path is independent
+  by construction).
+* CLI: new ``--context-segments`` and ``--context-chars`` options
+  on ``epublate batch``.
+* Dashboard ``BatchModal`` exposes "Context segments" and
+  "Context char cap" inputs that flow through ``BatchRequest``
+  into the dispatched ``BatchOptions``.
+
+### Added — Cancel a Reader chapter batch with ``c``
+
+The Reader's chapter-batch worker now exposes the same cancel
+affordance the Dashboard's batch already had:
+
+* New ``c`` binding on ``ReaderScreen`` calls
+  ``action_cancel_chapter_batch``, which sets a
+  ``threading.Event`` shared with ``run_batch``. The worker drains
+  any in-flight LLM call (we can't preempt a blocking ``post``)
+  and raises :class:`BatchCancelled`; the meter shows
+  ``cancelling…`` until the cancel propagates.
+* ``BatchCancelled`` is now caught in
+  ``ReaderScreen._chapter_batch_worker`` so the UI transitions to
+  a clean "cancelled" state with the queued chapters dropped (a
+  cancel means "stop the run", not "skip this chapter").
+
+### Added — Graceful translation shutdown on app quit
+
+Quitting the app (``ctrl+c`` / the Projects screen's ``q``) now
+cancels any running batch first instead of leaving the worker
+thread to keep spending tokens on a process that no longer has a
+UI. ``EpublateApp.action_quit`` calls ``cancel_batch()`` and
+notifies the curator before invoking ``self.exit()``. The
+``ReaderScreen.on_unmount`` hook also flips the chapter-batch
+cancel event so backing out of the screen mid-batch stops the
+worker cleanly. Cancellation is best-effort (in-flight LLM calls
+finish in their daemon thread because ``httpx.post`` is blocking),
+but every committed segment is already durable (WAL +
+per-segment transactions, PRD invariant §3).
+
+### Fixed — Typographic entity references no longer fail the placeholder validator
+
+When the source ePub used named XHTML entities for apostrophes
+(``&rsquo;``), narrow non-breaking spaces (``&nbsp;``), em/en dashes
+(``&mdash;`` / ``&ndash;``), ellipses (``&hellip;``), or curly
+quotes (``&ldquo;`` / ``&rdquo;`` / ``&laquo;`` / ``&raquo;``), the
+segmenter encoded each one as an ``entity`` token plus a ``[[Tn]]``
+placeholder. The translator prompt then asked the model to drop the
+underlying character as part of target-language typography
+normalization (French elision apostrophes do not survive in
+Portuguese; the French narrow space before ``:`` is not used in
+Portuguese / Spanish / English / German). Two contradictory hard
+rules — "preserve every placeholder exactly once" vs. "do not carry
+source-language typography over" — meant the model picked one and
+the structural validator hard-failed:
+
+```
+Translation failed: segment 33e2…: entity placeholder [[T0]]
+missing or duplicated
+```
+
+Real curator-reported failure on the *Le Petit Prince* dedication
+(15 ``&rsquo;`` + ``&nbsp;`` entities in a single paragraph).
+
+#### Segmenter (`epublate/core/segmentation.py`)
+
+* New ``_TEXT_ENTITY_EXPANSIONS`` whitelist: entities whose
+  resolved Unicode code point is text content (apostrophes,
+  quotes, dashes, ellipsis, NBSP / EN SPACE / EM SPACE / THIN
+  SPACE / HAIR SPACE, plus ``&amp;``) are expanded inline to the
+  literal Unicode character at parse time. The skeleton no longer
+  carries an entity token for them, the LLM no longer sees a
+  ``[[Tn]]`` placeholder, and the structural validator no longer
+  has anything to enforce around them.
+* Symbol entities (``&copy;``, ``&reg;``, ``&trade;``, ``&deg;``,
+  ``&para;``, ``&sect;``, ``&shy;``, ``&bull;``, ``&middot;``)
+  keep the entity-placeholder treatment because the LLM does not
+  drop them as part of typography normalization.
+* ``&lt;`` and ``&gt;`` are intentionally excluded from the
+  whitelist so the LLM never receives bare ``<`` / ``>`` it might
+  read as malformed tag markup.
+* Reassembly emits the literal Unicode character (e.g. U+2019
+  instead of ``&rsquo;``) for unmodified segments containing one of
+  these entities. Visually identical in any reader; the
+  format-handling round-trip property still holds at the character
+  level for these specific code points.
+
+#### Existing-project migration (`epublate expand-entities`)
+
+Projects already segmented with the old behavior keep their
+``[[Tn]]`` entity placeholders in the DB. The new
+``epublate expand-entities <project>`` CLI applies the fix in
+place without losing translations or curator decisions:
+
+```
+$ uv run epublate expand-entities path/to/project
+Found 47 segment(s) with typographic entity placeholders that
+would be expanded.
+  - [Chapter 1] 33e26094: Je demande pardon aux enfants d'avoir…
+  - [Chapter 1] 8a91c3f2: Et l'autre, à droite…
+  ...
+Dry run — re-run with --apply to rewrite the segments above.
+
+$ uv run epublate expand-entities path/to/project --apply
+Rewrote 47 segment(s) across 12 chapter(s):
+  - Chapter 1: 14 segment(s) rewritten
+  - Chapter 2: 9 segment(s) rewritten
+  ...
+```
+
+The migration is implemented as
+``Project.expand_typographic_entities()`` (``core/project.py``),
+backed by the pure helper
+``expand_text_entity_placeholders`` (``core/segmentation.py``).
+Per affected row it:
+
+* expands the entity placeholders in ``source_text`` to literal
+  Unicode characters and recomputes ``source_hash``;
+* applies the same substitution to ``target_text`` so any stored
+  translation that preserved the placeholder reads cleanly
+  afterwards (and translations that had legitimately dropped it,
+  triggering the original error, are now valid against the new
+  skeleton);
+* drops the entity tokens from ``inline_skeleton`` and renumbers
+  surviving placeholders so indices stay contiguous from 0;
+* leaves ``status`` alone — a previously ``flagged`` segment
+  stays ``flagged`` until the curator re-runs translation, since
+  the migration is a pure-text rewrite and curator decisions
+  must not silently revert.
+
+Idempotent: re-running the command on an already-migrated project
+returns "nothing to do". Each rewritten chapter writes a single
+``chapter.entities_expanded`` event row so the Logs screen can
+surface the migration in the project's activity feed.
+
+#### Tests (`tests/test_segmentation.py`)
+
+* ``test_placeholderize_expands_typographic_entities_inline`` —
+  guards the new behavior with a mixed apostrophe / dash / NBSP /
+  guillemet fragment.
+* ``test_placeholderize_petit_prince_dedication_is_translatable``
+  — exact reproduction of the original failure shape; asserts the
+  skeleton is empty and the source contains literal U+2019 / U+00A0
+  characters.
+* The existing entity round-trip tests now exercise ``&copy;`` /
+  ``&reg;`` (kept as entity placeholders) so the legacy
+  cyfunction-Entity guard stays meaningful.
+
+### Fixed — Leading orphan apostrophes (French → Portuguese)
+
+The translator was carrying French / Italian / Catalan elision
+apostrophes (``j'avais``, ``s'appelait``, ``l'enfant``, ``qu'a``,
+``d'avoir``) over to the target as a leading apostrophe stranded in
+front of an otherwise correct Portuguese word. Real curator-reported
+output:
+
+```
+French:      Je demande pardon aux enfants d'avoir dédié ce livre…
+                                          ^^^^^^^^^
+Portuguese:  Peço desculpas às crianças por ’ter dedicado este livro…
+                                          ^^^^^^^
+                                          (orphaned apostrophe)
+```
+
+The previous fix added an abstract typography rule and language-pair
+notes to the prompt, but the model still produced the artefact in
+practice. This release adds the load-bearing deterministic guard.
+
+#### Sanitiser (`epublate/core/typography.py` — new module)
+
+* New ``strip_leading_orphan_apostrophes(text, *, target_lang)`` —
+  removes apostrophe characters that are stranded as leading
+  orthography in front of a Unicode letter.
+* Catches ASCII straight (``'``), left/right curly (``\u2018`` /
+  ``\u2019``), and modifier letter (``\u02bc``) apostrophes.
+* Conservative on purpose:
+  * the apostrophe must be preceded by whitespace (or sit at the
+    start of the string), so embedded apostrophes in proper nouns
+    (``O'Higgins``, ``D'Água``, ``L'Oréal``, ``M'Bappe``) are kept;
+  * the next character must be a Unicode letter (``unicodedata``
+    category ``L*``), so year references (``'90s``, ``'42``) and
+    English contractions inside double-quoted foreign content
+    (``"don't panic"``) are kept;
+  * adjacent whitespace is preserved verbatim so XHTML reassembly
+    doesn't drift.
+* Language-gated via the new ``_TARGET_LANGS_WITHOUT_LEADING_APOSTROPHE``
+  set: only languages where leading apostrophes are wrong in modern
+  prose (Portuguese, Spanish, German, Russian, Japanese, Chinese,
+  Korean, Arabic, Hebrew, Turkish, Polish, Czech, Hungarian,
+  Romanian, Greek, Thai, Vietnamese, Hindi, Persian, Dutch,
+  Swedish, Norwegian, Danish, Icelandic, Finnish, …) are eligible.
+  French / Italian / English / Catalan targets keep their valid
+  leading apostrophes intact.
+* Idempotent; runs of consecutive apostrophes
+  (``\u2019\u2019tenho``) collapse in a single pass.
+
+#### Pipeline integration (`core/pipeline.py`)
+
+The sanitiser runs at every point where a ``TranslatorTrace`` is
+constructed:
+
+* live single-segment path (``translate_segment``);
+* cache-replay path (``_replay_from_cache``) — historical caches
+  written before this fix are transparently cleaned up on replay;
+* grouped translator path (``translate_segments_grouped``).
+
+Cache keys do not include ``target``, so rewriting the trace
+doesn't invalidate the cache hit. The trivial-segment path
+(source = target) is unaffected.
+
+#### Stronger prompt guardrails (`llm/prompts/translator.py`)
+
+The fr/pt language-pair notes were rewritten with concrete worked
+examples that pin the bad shape alongside the good shape:
+
+```
+- j'avais       → eu tinha       (NOT eu'tinha, NOT eu 'tinha)
+- J'ai une excuse. → Tenho uma desculpa. (NOT Eu 'tenho uma desculpa.)
+- s'appelait    → se chamava     (NOT 'se chamava)
+- d'avoir dédié → por ter dedicado (NOT por 'ter dedicado)
+```
+
+The Portuguese target note adds the explicit "leading apostrophes
+are ALWAYS wrong" instruction. The prompt-side hints reduce the
+failure rate at the source; the sanitiser is the safety net for
+when the model still slips.
+
+#### Retroactive cleanup CLI (`epublate sanitize-typography`)
+
+A new CLI subcommand applies the sanitiser to existing translated
+segments in a project, so books translated before the fix can be
+cleaned without re-running the LLM:
+
+```
+$ uv run epublate sanitize-typography path/to/project
+Found 8 segment(s) with leading orphan apostrophes (target_lang='pt-BR').
+  - a1b2c3d4:
+      before: Eu ’tenho uma desculpa séria...
+      after : Eu tenho uma desculpa séria...
+  - ... and 7 more.
+
+Dry run — re-run with --apply to rewrite the segments above.
+```
+
+Defaults to a read-only preview; pass ``--apply`` to commit. Uses
+the new ``repo.update_segment_target_text`` helper which preserves
+the segment's ``status`` column (so curator decisions like
+``flagged`` survive the rewrite).
+
+#### Tests
+
+* ``tests/test_core_typography.py`` (new) — 43 cases covering the
+  user-reported bug shapes, language gating, conservatism on
+  legitimate apostrophes, whitespace preservation, modifier-letter
+  apostrophes, idempotency, and consecutive-apostrophe collapse.
+* ``tests/test_core_pipeline_glossary.py`` — pipeline integration
+  test for both the strip-on-PT and keep-on-FR paths.
+* ``tests/test_llm_translator_prompt.py`` — audit test for the
+  worked-example anti-patterns in the fr→pt language-pair notes.
+* ``tests/test_cli.py`` — three tests for ``sanitize-typography``
+  (dry-run, ``--apply`` with status preservation, no-op message).
+
+### Fixed — Year-only proposals no longer pollute the lore bible
+
+The auto-proposer was occasionally surfacing plain year references
+(`1066`, `1939-1945`, `1990s`, `c. 1066`) as `date_or_time` glossary
+entries, which the curator then had to reject one by one. The lore
+bible only earns its keep when it tracks *named* eras, recurring
+holidays, and proper-noun calendars (`Yule`, `the Long Night`,
+`Founding Era`); raw years are inline date references the translator
+handles automatically and tracking them just bloats the review queue.
+
+#### Parser-side guard (`llm/prompts/extractor.py`)
+
+* New `is_year_like` predicate (with `_is_year_like` private alias)
+  that catches:
+  * pure 1-4 digit years (`1066`, `1905`, `2024`),
+  * year ranges with hyphen / en-dash / em-dash (`1939-1945`,
+    `1939–45`, `1939—45`, `1939-45`),
+  * decades (`1990s`, `1990S`),
+  * era-qualified years (`1066 AD`, `44 BC`, `476 CE`,
+    `44 a.C.`, `1066 d.C.`, `44 v. Chr.`),
+  * circa-qualified years (`c. 1066`, `ca. 1905`, `circa 1905`,
+    `approx. 2024`),
+  * parenthesised year notations (`(1066)`, `(1939-1945)`).
+* Wired into `_violates_extractor_caps`, so both the source-language
+  extractor parser and the target-language extractor parser (which
+  reuse the same predicate) now reject year-shaped sources, targets,
+  and aliases at the parser boundary — exactly where the existing
+  sentence / paren / length caps live (per
+  `glossary-invariants.mdc` §7).
+* The filter is conservative: terms that contain non-numeric text
+  alongside a year are kept, so `Year of the Four Emperors`,
+  `Battle of 1066`, `World War 1939`, `Apollo 11`, `Order 66`, and
+  `Catch-22` all survive.
+
+#### Auto-propose-side guard (`core/pipeline.py`)
+
+`_normalize_new_entity` (the gatekeeper for the translator's
+`new_entities` channel) now applies the same `_violates_extractor_caps`
+predicate as the helper-LLM extractor parser. Previously the
+translator could mint a year-shaped proposed entry that flew under
+the radar; the two channels now share a single rejection contract.
+A year-shaped target is cleared (matching the existing cap behaviour)
+so the source-side proposal still surfaces for curator review when
+the source itself is a real entity.
+
+#### Prompt-side guard
+
+The extractor prompt (`extractor.py`), target-language extractor
+prompt (`extractor_target.py`), and translator prompt (`translator.py`,
+both single and grouped) gained an explicit "Never propose a raw
+year reference" rule with worked examples. The instruction includes
+the carve-out for *named* eras and longer phrases so the model
+doesn't over-correct and drop legitimate entries. Per
+`glossary-invariants.mdc` §7, the parser-side filter is the
+load-bearing guard; the prompt rule cuts the failure rate at the
+source so the parser sees less noise.
+
+#### Cleanup CLI for historical entries (`epublate glossary cleanup-years`)
+
+A new CLI subcommand surfaces (and optionally deletes) `proposed`
+glossary entries whose `source_term` is year-like. Locked and
+confirmed entries are NEVER touched (the curator promoted them on
+purpose). The command defaults to a read-only preview; pass
+`--apply` to actually delete the matched entries.
+
+```
+$ uv run epublate glossary cleanup-years path/to/project
+Found 2 proposed glossary entries that look like raw year references:
+  - [date_or_time] '1066' → '1066'  (id=...)
+  - [date_or_time] '1939-1945' → '1939-1945'  (id=...)
+Dry run — re-run with --apply to delete the entries above.
+```
+
+#### Tests
+
+* `tests/test_extractor_caps.py` — 28 new parametrised cases for
+  `_is_year_like` coverage (every era / circa / decade variant the
+  user is likely to hit), plus the "year alongside text is kept"
+  half-suite to lock in the conservative behaviour.
+* `tests/test_llm_extractor_prompt.py` — extractor prompt audit
+  for the new rule.
+* `tests/test_llm_extractor_target_prompt.py` — same audit on the
+  target-language extractor prompt.
+* `tests/test_llm_translator_prompt.py` — translator prompt audit
+  for both single and grouped templates.
+* `tests/test_core_pipeline_glossary.py` — end-to-end test on the
+  translator's `new_entities` auto-propose path: years are dropped,
+  real entities survive.
+* `tests/test_cli.py` — three tests for `glossary cleanup-years`
+  (dry-run, `--apply`, no-op message).
+
+### Fixed — Orphan paragraphs, outer whitespace, and translator prompt rigor
+
+Three closely-related bugs were causing the exported ePub to drop or
+mis-render translated content:
+
+1. **Orphan paragraphs.** Calibre-style chapters often emit
+   ``<div><span>prose</span><div>nested block</div></div>`` shapes
+   where a leading inline run shares a parent with a nested block.
+   The segmenter's host-walker correctly skipped the outer ``<div>``
+   (it has block descendants), but never emitted a segment for the
+   stranded ``<span>``, so the ePub came out with untranslated
+   source-language paragraphs in the middle of otherwise translated
+   chapters.
+2. **Outer whitespace stripping.** OpenAI-compatible chat endpoints
+   (and the models behind them) almost universally ``.strip()`` the
+   completion, so a host like ``"\n    [[T0]]Title[[/T0]]\n  "``
+   came back as ``"[[T0]]Título[[/T0]]"``. Browsers collapse the
+   missing whitespace, but byte-level diffs against the original
+   were noisy and the on-disk XHTML's per-host indentation drifted.
+3. **Embedded English passages.** Quotes, asides, footnotes, and
+   embedded book titles were occasionally left in the source
+   language because the translator prompt didn't make
+   "translate every textual passage" an explicit hard rule.
+
+#### Workstream A — Orphan-hoist preprocessor (`formats/epub.py`)
+
+- New ``_is_mixed_content_block`` / ``_split_mixed_content_block`` /
+  ``_hoist_orphaned_inline_runs`` pass walks every chapter document
+  before segmentation *and* before reassembly, identifies block
+  elements whose direct children mix inline content with nested
+  block hosts, and wraps each contiguous inline run in a synthetic
+  ``<div data-epublate-orphan="1">``.
+- Wrappers inherit the parent's ``class`` so styling stays close to
+  what the browser rendered as an anonymous block.
+- The ``data-epublate-orphan="1"`` attribute also lets us tell our
+  wrappers from authored ``<div>``s, keeping the pass idempotent
+  (running twice yields the same DOM).
+- Whitespace-only buffers don't get a wrapper — pure cosmetic
+  indentation is appended to the preceding block's ``tail`` so the
+  file still serializes with the same line breaks.
+
+#### Workstream B — Outer-whitespace restoration (`formats/epub.py`)
+
+- New ``_restore_outer_whitespace`` re-introduces leading and
+  trailing whitespace runs from the source segment when the LLM
+  stripped them and the target isn't already carrying its own.
+- Wired into ``EpubAdapter.reassemble`` on the ``set_target_text``
+  path so every translated segment goes through the restorer
+  regardless of whether the model honored the prompt.
+
+#### Workstream C — Translator prompt hardening (`llm/prompts/translator.py`)
+
+- ``_SYSTEM_PROMPT_TEMPLATE`` and ``_GROUP_SYSTEM_PROMPT_TEMPLATE``
+  gain two new hard rules:
+  - **Translate every textual passage end-to-end.** Embedded
+    quotations, asides, footnotes, and book/chapter titles are part
+    of the segment and must be translated. Code snippets and proper
+    names are the only allowed exceptions.
+  - **Preserve outer whitespace verbatim.** No stripping,
+    collapsing, or "tidying" the segment's leading/trailing
+    whitespace — it's load-bearing for byte-level diff fidelity.
+- The "translate naturally" rule (rule 2 of the single-segment
+  template, rule 3 of the grouped template) is extended with explicit
+  guidance about target-language typography. Curators reported a
+  French → Portuguese run where ``j'avais`` round-tripped as
+  ``eu'tinha`` (and ``s'appelait`` as ``se'chamava``) because the
+  model mechanically transcribed the French apostrophe contraction.
+  The new clause spells out that punctuation, contractions, and
+  orthography follow target-language conventions; concrete examples
+  live in the new ``Language-pair notes`` block (below) so the rule
+  itself stays language-agnostic.
+- New conditional ``Language-pair notes`` block. Two small dicts
+  (``_SOURCE_LANG_NOTES`` and ``_TARGET_LANG_NOTES``) keyed by BCP-47
+  primary subtag (``fr``, ``de``, ``pt``, …) carry short, pair-aware
+  reminders. The block renders only when at least one side has notes
+  on file — pairs we have nothing to say about (e.g. ``ja → ko``)
+  pay zero token tax. Initial entries cover the common pitfalls
+  curators have hit so far: French / Italian apostrophe contractions
+  on the source side, German noun capitalization, Spanish inverted
+  ``¿``/``¡``, plus the corresponding target-language conventions
+  for Portuguese, English, French, Spanish, and Italian. Adding a
+  new pair is a two-line PR that doesn't touch the universal
+  hard-rules block. Lookup falls back from the full tag (``pt-BR``)
+  to the primary subtag (``pt``) so regional variants share the
+  family note unless they explicitly diverge.
+
+#### Workstream D — Repair command for existing projects
+
+- New ``Project.repair_segmentation`` walks every chapter, re-runs
+  segmentation against the original ePub, **inserts** segment rows
+  for previously-missed orphan inline runs, and **rewrites**
+  ``host_path`` on existing rows whose XPath shifted under the
+  hoist (without touching ``target_text``). Translations are never
+  discarded; re-running the method on an up-to-date project is a
+  no-op.
+- New CLI surface: ``epublate repair PROJECT_DIR`` — emits a
+  per-chapter "+N added, M re-hosted" summary so the curator sees
+  exactly what changed. Pre-fix projects can now be brought current
+  with one command.
+- Per-chapter ``chapter.segments_repaired`` events are appended to
+  the event log for audit and Inbox surfacing.
+
+#### Tests
+
+- ``tests/test_formats_epub.py`` gains six tests covering the
+  orphan-hoist pass (synthetic wrapper marking, idempotency,
+  whitespace-only handling, multi-run splits) and the outer
+  whitespace restorer (LLM-strip simulation).
+- ``tests/test_llm_translator_prompt.py`` gains two tests asserting
+  the new hard rules are present in both single-segment and grouped
+  prompt builders.
+- ``tests/test_core_project_repair.py`` (new, 5 tests) covers the
+  repair flow: no-op idempotency, orphan insertion, host_path
+  re-hosting with translation preserved, event-log emission, and
+  append-after-max-idx ordering.
+- ``tests/test_cli.py`` gains a smoke test for ``epublate repair``
+  on a fresh project.
+
 ### Added — Logs screen, app-wide toasts, glossary cleanup, batch-progress polish
 
 Four user-reported pain points addressed in one pass:

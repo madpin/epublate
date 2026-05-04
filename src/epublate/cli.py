@@ -473,6 +473,232 @@ def export(
     "project_dir",
     type=_PROJECT_DIR_TYPE,
 )
+def repair(project_dir: Path) -> None:
+    """Re-segment chapters to recover orphan paragraphs (PRD §7.6).
+
+    Older runs of the segmenter dropped inline content nested inside
+    mixed-content blocks (typical of Calibre-styled chapters with a
+    ``<div><span>prose</span><div>nested block</div></div>`` shape),
+    which surfaced as untranslated source-language paragraphs in the
+    exported ePub. The current segmenter hoists those orphans into
+    their own ``<div>`` hosts, but existing projects need a one-shot
+    repass to:
+
+    * insert segment rows for the previously-missed inline runs, and
+    * refresh the ``host_path`` on already-translated rows whose XPath
+      shifted because the hoist added new sibling wrappers.
+
+    Existing translations are preserved verbatim. Re-running this
+    command is a no-op once the project is up to date.
+    """
+
+    from epublate.core.project import open_project
+
+    with open_project(project_dir) as project:
+        summary = project.repair_segmentation()
+
+    click.echo(
+        f"Repaired segmentation: {summary.added} new segment(s) inserted, "
+        f"{summary.rehosted} existing row(s) re-hosted."
+    )
+    if not summary.chapters:
+        click.echo("  (project was already up to date — nothing to do)")
+        return
+    for outcome in summary.chapters:
+        title = outcome.chapter_title or outcome.chapter_id[:8]
+        click.echo(f"  - {title}: +{outcome.added} added, {outcome.rehosted} re-hosted")
+
+
+@main.command(name="expand-entities")
+@click.argument(
+    "project_dir",
+    type=_PROJECT_DIR_TYPE,
+)
+@click.option(
+    "--apply",
+    "apply_changes",
+    is_flag=True,
+    default=False,
+    help="Actually rewrite the segments (default: dry-run preview).",
+)
+def expand_entities(project_dir: Path, apply_changes: bool) -> None:
+    """Expand typographic entity placeholders in stored segments.
+
+    Projects segmented before the typographic-entity-expansion fix
+    carry an ``entity`` token + ``[[Tk]]`` placeholder for every
+    ``&rsquo;`` / ``&nbsp;`` / ``&hellip;`` / curly-quote / dash in
+    the source. The translator prompt asks the LLM to drop the
+    underlying character as part of target-language typography
+    normalization (French elision apostrophes do not survive into
+    Portuguese / Spanish / German), the model legitimately drops the
+    ``[[Tk]]`` along with it, and the structural validator hard-fails
+    on the resulting "missing entity placeholder" error — surfacing
+    in the Reader as ``Translation failed: ... entity placeholder
+    [[Tk]] missing or duplicated``.
+
+    This command rewrites just the affected segment rows in place:
+    ``source_text`` (and ``source_hash``) get the entity placeholders
+    replaced with their literal Unicode characters, ``target_text``
+    is rewritten in lockstep, and ``inline_skeleton`` drops the
+    entity tokens with surviving placeholders renumbered. ``status``
+    is intentionally untouched (a previously ``flagged`` segment
+    stays ``flagged`` until the curator re-runs translation —
+    pure-text rewrites must not silently revert curator decisions).
+
+    Without ``--apply`` the command lists how many rows would change
+    and exits, so you can sanity-check the count before committing.
+
+    Idempotent: a project that's already migrated returns
+    "nothing to do".
+    """
+
+    from epublate.core.project import open_project
+
+    with open_project(project_dir) as project:
+        if not apply_changes:
+            # Dry-run: walk the same data without writing anything by
+            # checking each row through the pure rewrite function.
+            from epublate.core.segmentation import expand_text_entity_placeholders
+            from epublate.db import repo as repo_mod
+
+            chapter_rows = repo_mod.list_chapters(project.engine, project.project_id)
+            preview: list[tuple[str, str | None, str, str]] = []
+            for chapter in chapter_rows:
+                seg_rows = repo_mod.list_segments(project.engine, chapter.id)
+                for seg in seg_rows:
+                    new_source, _new_target, _new_skel, changed = (
+                        expand_text_entity_placeholders(
+                            source_text=seg.source_text,
+                            target_text=seg.target_text,
+                            skeleton=seg.inline_skeleton,
+                        )
+                    )
+                    if changed:
+                        preview.append((chapter.id, chapter.title, seg.id, new_source))
+            if not preview:
+                click.echo(
+                    "No segments contain typographic entity placeholders — "
+                    "nothing to do."
+                )
+                return
+
+            click.echo(
+                f"Found {len(preview)} segment(s) with typographic entity "
+                f"placeholders that would be expanded."
+            )
+            preview_count = min(5, len(preview))
+            for _chapter_id, chapter_title, seg_id, new_source in preview[
+                :preview_count
+            ]:
+                title = chapter_title or "(untitled)"
+                click.echo(f"  - [{title}] {seg_id[:8]}: {new_source[:100]}")
+            if len(preview) > preview_count:
+                click.echo(f"  ... and {len(preview) - preview_count} more.")
+            click.echo("\nDry run — re-run with --apply to rewrite the segments above.")
+            return
+
+        summary = project.expand_typographic_entities()
+        if summary.rewritten == 0:
+            click.echo(
+                "No segments contain typographic entity placeholders — nothing to do."
+            )
+            return
+        click.echo(
+            f"Rewrote {summary.rewritten} segment(s) across "
+            f"{len(summary.chapters)} chapter(s):"
+        )
+        for outcome in summary.chapters:
+            title = outcome.chapter_title or outcome.chapter_id[:8]
+            click.echo(f"  - {title}: {outcome.rewritten} segment(s) rewritten")
+
+
+@main.command(name="sanitize-typography")
+@click.argument(
+    "project_dir",
+    type=_PROJECT_DIR_TYPE,
+)
+@click.option(
+    "--apply",
+    "apply_changes",
+    is_flag=True,
+    default=False,
+    help="Actually rewrite the segments (default: dry-run preview).",
+)
+def sanitize_typography(project_dir: Path, apply_changes: bool) -> None:
+    """Strip leading orphan apostrophes from existing translated segments.
+
+    The translator occasionally carries source-language elision
+    apostrophes (``j'avais``, ``s'appelait`` from French / Italian /
+    Catalan) over to the target as a leading apostrophe in front of
+    a Portuguese / Spanish / German / etc. word
+    (``Eu 'tenho``, ``por 'ter dedicado``, ``'se chamava``). Going
+    forward those are stripped at the parser, but segments
+    translated before the fix sit in the project DB with the
+    artefact in their ``target_text`` and surface in the exported
+    ePub.
+
+    This command applies
+    :func:`epublate.core.typography.strip_leading_orphan_apostrophes`
+    to every translated / flagged segment in the project. It only
+    rewrites rows that actually change (so the audit trail stays
+    quiet for already-clean translations) and leaves the
+    ``status`` column alone.
+
+    Without ``--apply`` the command lists how many rows would
+    change and exits, so you can sanity-check the count before
+    committing.
+    """
+
+    from epublate.core.project import open_project
+    from epublate.core.typography import strip_leading_orphan_apostrophes
+    from epublate.db import repo as repo_mod
+
+    with open_project(project_dir) as project:
+        target_lang = project.target_lang
+        rows = repo_mod.list_segments_for_project(project.engine, project.project_id)
+        changes: list[tuple[str, str, str]] = []
+        for seg in rows:
+            current = seg.target_text or ""
+            if not current:
+                continue
+            cleaned = strip_leading_orphan_apostrophes(current, target_lang=target_lang)
+            if cleaned != current:
+                changes.append((seg.id, current, cleaned))
+
+        if not changes:
+            click.echo(
+                "No segments contain leading orphan apostrophes — nothing to do."
+            )
+            return
+
+        click.echo(
+            f"Found {len(changes)} segment(s) with leading orphan "
+            f"apostrophes (target_lang={target_lang!r})."
+        )
+        preview_count = min(5, len(changes))
+        for seg_id, before, after in changes[:preview_count]:
+            click.echo(f"  - {seg_id[:8]}:")
+            click.echo(f"      before: {before[:100]}")
+            click.echo(f"      after : {after[:100]}")
+        if len(changes) > preview_count:
+            click.echo(f"  ... and {len(changes) - preview_count} more.")
+
+        if not apply_changes:
+            click.echo("\nDry run — re-run with --apply to rewrite the segments above.")
+            return
+
+        for seg_id, _before, after in changes:
+            repo_mod.update_segment_target_text(
+                project.engine, segment_id=seg_id, target_text=after
+            )
+        click.echo(f"\nRewrote {len(changes)} segment(s).")
+
+
+@main.command()
+@click.argument(
+    "project_dir",
+    type=_PROJECT_DIR_TYPE,
+)
 @click.option(
     "--chapters",
     "chapters",
@@ -551,6 +777,32 @@ def export(
         "parse failure more expensive to re-fan-out."
     ),
 )
+@click.option(
+    "--context-segments",
+    "context_segments",
+    type=click.IntRange(min=0),
+    default=0,
+    show_default=True,
+    help=(
+        "Surface up to N preceding segments from the same chapter in the "
+        "translator's prompt as context. 0 disables. Useful for "
+        "conversational chapters where short turns benefit from prior "
+        "context (try 3-4); long-paragraph narratives usually want 0-1."
+    ),
+)
+@click.option(
+    "--context-chars",
+    "context_chars",
+    type=click.IntRange(min=0),
+    default=0,
+    show_default=True,
+    help=(
+        "Cap on the cumulative source-text length of the preceding "
+        "segments shown to the translator. 0 means no cap. A segment "
+        "is never split to fit — when a single segment exceeds the cap "
+        "it's skipped entirely, keeping the next-most-recent ones."
+    ),
+)
 @click.pass_context
 def batch(
     ctx: click.Context,
@@ -564,6 +816,8 @@ def batch(
     helper_model: str | None,
     group_small: bool,
     group_max_items: int | None,
+    context_segments: int,
+    context_chars: int,
 ) -> None:
     """Headless batch translation (PRD §7.3 / M4).
 
@@ -576,7 +830,7 @@ def batch(
 
     from epublate.app.screens.reader import DEFAULT_MODEL
     from epublate.core.batch import BatchOptions, BatchPaused, run_batch
-    from epublate.core.pipeline import GROUP_DEFAULT_MAX_ITEMS
+    from epublate.core.pipeline import GROUP_DEFAULT_MAX_ITEMS, ContextOptions
     from epublate.core.project import open_project
     from epublate.db import repo as repo_mod
     from epublate.llm.factory import ENV_MODEL, build_provider
@@ -607,6 +861,10 @@ def batch(
             helper_model=chosen_helper,
             group_small_segments=group_small,
             group_max_items=group_max_items or GROUP_DEFAULT_MAX_ITEMS,
+            context=ContextOptions(
+                max_segments=context_segments,
+                max_chars=context_chars,
+            ),
         )
         paused = False
         try:
@@ -1052,6 +1310,70 @@ def glossary_import(project_dir: Path, in_path: Path, conflict: str) -> None:
         f"{summary.updated} updated, "
         f"{summary.skipped} skipped"
     )
+
+
+@glossary_cmd.command(name="cleanup-years")
+@click.argument(
+    "project_dir",
+    type=_PROJECT_DIR_TYPE,
+)
+@click.option(
+    "--apply",
+    "apply_changes",
+    is_flag=True,
+    default=False,
+    help="Actually delete the matched entries (default: dry-run preview).",
+)
+def glossary_cleanup_years(project_dir: Path, apply_changes: bool) -> None:
+    """Remove proposed glossary entries that are just raw year references.
+
+    Earlier builds of the auto-proposer occasionally surfaced plain
+    years (``1066``, ``1939-1945``, ``1990s``, ``c. 1066``) as
+    ``date_or_time`` glossary entries. Going forward those are
+    rejected at the parser, but historical entries that landed
+    before the fix sit around in the lore bible and clutter the
+    curator's review queue. This command clears them out.
+
+    Only ``proposed`` entries are eligible — locked / confirmed
+    entries were promoted by the curator deliberately, so we never
+    touch them. Without ``--apply`` the command is read-only: it
+    lists the candidates and exits, so you can sanity-check the
+    match list before committing.
+    """
+
+    from epublate.core.project import open_project
+    from epublate.db import repo as repo_mod
+    from epublate.llm.prompts.extractor import is_year_like
+
+    with open_project(project_dir) as project:
+        proposed = repo_mod.list_glossary_entries(
+            project.engine, project.project_id, status="proposed"
+        )
+        candidates = [e for e in proposed if is_year_like(e.source_term or "")]
+
+        if not candidates:
+            click.echo("No proposed glossary entries match the year-like filter.")
+            return
+
+        click.echo(
+            f"Found {len(candidates)} proposed glossary "
+            f"entr{'y' if len(candidates) == 1 else 'ies'} "
+            f"that look like raw year references:"
+        )
+        for entry in candidates:
+            click.echo(
+                f"  - [{entry.entry.type}] {entry.source_term!r} "
+                f"→ {entry.target_term!r}  (id={entry.entry.id[:8]})"
+            )
+
+        if not apply_changes:
+            click.echo("\nDry run — re-run with --apply to delete the entries above.")
+            return
+
+        for entry in candidates:
+            repo_mod.delete_glossary_entry(project.engine, entry.entry.id)
+        suffix = "y" if len(candidates) == 1 else "ies"
+        click.echo(f"\nDeleted {len(candidates)} entr{suffix}.")
 
 
 def _record_recent(project: object) -> None:

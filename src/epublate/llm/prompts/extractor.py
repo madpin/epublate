@@ -89,13 +89,100 @@ def _has_unbalanced_parens(term: str) -> bool:
     )
 
 
+# Era / calendar markers we strip before checking "year-only".
+# Covers English (AD/BC/BCE/CE), French/Spanish/Portuguese (a.C./d.C.),
+# German (n.Chr./v.Chr.). Generous on whitespace and dot placement so
+# ``45 BC``, ``45 B.C.``, ``45 a. C.``, ``45 d.C.`` all normalize the
+# same way.
+_ERA_MARKER_RE = re.compile(
+    r"\b(?:AD|BC|BCE|CE|"
+    r"a\.?\s*C\.?|d\.?\s*C\.?|"
+    r"n\.?\s*Chr\.?|v\.?\s*Chr\.?)\b",
+    re.IGNORECASE,
+)
+# Date qualifiers ("c.", "ca.", "circa", "approx."). These cling to
+# the front of a year reference in narrative prose ("circa 1066") and
+# never survive on a real entity name.
+_CIRCA_PREFIX_RE = re.compile(
+    r"^\s*(?:c\.?|ca\.?|circa|cca\.?|approx\.?|aprox\.?)\s+",
+    re.IGNORECASE,
+)
+# After we strip outer brackets, era / circa markers, and trailing
+# punctuation, what remains for a "this is just a year" candidate is
+# either a single 1-4 digit number, a 1-4 digit range
+# (``1939-1945``; en-dash / em-dash variants supported via the
+# Unicode escapes below), or a decade (``1990s``).
+_YEAR_LIKE_REMAINDER_RE = re.compile(
+    r"\d{1,4}(?:\s*[\-\u2013\u2014]\s*\d{1,4})?s?",
+    re.IGNORECASE,
+)
+# Trailing punctuation we always strip before the year check (mirror
+# of the dedup module's strip set).
+_YEAR_TRAILING_PUNCT = ".,;:!?"
+
+
+def is_year_like(term: str) -> bool:
+    """Public alias for :func:`_is_year_like`.
+
+    Re-exported under the underscore-free name for callers outside
+    ``llm/prompts/`` (the CLI ``glossary cleanup-years`` flow uses it
+    to decide which historical entries to surface) without changing
+    the existing extractor-internal call sites.
+    """
+
+    return _is_year_like(term)
+
+
+def _is_year_like(term: str) -> bool:
+    """True if ``term`` is just a year, year range, or decade.
+
+    Year references are common in narrative prose but are not entities
+    worth tracking in the lore bible — translators handle them
+    automatically and storing them only adds noise that the curator
+    has to clear out. Catches:
+
+    * pure 1-4 digit years (``1066``, ``1905``, ``2024``);
+    * year ranges with hyphen, en-dash, or em-dash
+      (``1939-1945``, plus the typographic-dash variants);
+    * decades (``1990s``);
+    * era-qualified years (``1066 AD``, ``45 BCE``, ``1066 d.C.``,
+      ``45 v. Chr.``);
+    * circa-qualified years (``c. 1066``, ``ca. 1905``,
+      ``circa 1905``, ``approx. 2024``);
+    * parenthesised year notations (``(1066)``, ``(1939-1945)``).
+
+    Does NOT drop entries that contain text alongside a year:
+    ``"World War 1939"``, ``"Apollo 11"``, ``"Order 66"`` are all
+    kept (the textual prefix carries entity meaning the curator may
+    want tracked). The trade-off is that a book whose title is just
+    a year (``1984``, ``2001``) gets dropped here too — recoverable
+    by the curator manually adding it to the glossary, which is
+    cheaper than wading through every chapter's date references.
+    """
+
+    cleaned = term.strip()
+    if not cleaned:
+        return False
+    # Strip a single layer of outer brackets / quotes so ``(1066)`` and
+    # ``"1066"`` reduce to ``1066`` for the remainder check.
+    cleaned = re.sub(
+        r"^[\(\[\"'\u2018\u201c]+|[\)\]\"'\u2019\u201d]+$", "", cleaned
+    ).strip()
+    cleaned = _ERA_MARKER_RE.sub("", cleaned).strip()
+    cleaned = _CIRCA_PREFIX_RE.sub("", cleaned).strip()
+    cleaned = cleaned.rstrip(_YEAR_TRAILING_PUNCT).strip()
+    if not cleaned:
+        return False
+    return _YEAR_LIKE_REMAINDER_RE.fullmatch(cleaned) is not None
+
+
 def _violates_extractor_caps(term: str) -> str | None:
     """Return a debug-level reason string when ``term`` should be dropped.
 
     Used by both extractor parsers (source-language and target-language)
-    so a sentence proposal, a runaway phrase, or a broken-paren
-    candidate dies at the parser boundary. Returns ``None`` when the
-    candidate is acceptable.
+    so a sentence proposal, a runaway phrase, a broken-paren
+    candidate, or a raw year reference dies at the parser boundary.
+    Returns ``None`` when the candidate is acceptable.
     """
 
     cleaned = term.strip()
@@ -109,6 +196,8 @@ def _violates_extractor_caps(term: str) -> str | None:
         return "looks like a sentence (punctuation pattern)"
     if _has_unbalanced_parens(cleaned):
         return "unbalanced brackets"
+    if _is_year_like(cleaned):
+        return "year-like (raw year, range, or decade)"
     return None
 
 
@@ -236,6 +325,15 @@ Hard rules:
    is fine; "First you will eat your chickens, then your goats" is
    not — the second is a sentence and must not be proposed even
    if it recurs.
+   **Never propose a raw year reference** (``1066``, ``1939-1945``,
+   ``1990s``, ``c. 1066``, ``45 BC``) as an entity, even if it
+   appears multiple times — the translator handles plain dates
+   automatically and they only add noise to the lore bible.
+   ``date_or_time`` is reserved for *named* eras, calendars, and
+   recurring holidays (e.g. ``the Long Night``, ``Yule``,
+   ``Founding Era``). When a year is part of a longer phrase the
+   phrase as a whole is fine (``Year of the Four Emperors``,
+   ``Battle of 1066``).
 4. **When a name is commonly written ``Full Name (ACRONYM)``** (e.g.
    ``Heavily Indebted Poor Country (HIPC)``,
    ``Fédération Internationale de Football Association (FIFA)``):

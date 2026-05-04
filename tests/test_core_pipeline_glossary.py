@@ -201,6 +201,153 @@ def test_auto_propose_dedupes_new_entities(
         project.close()
 
 
+def test_translate_segment_strips_leading_orphan_apostrophes(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """The translator's output is sanitised before splice / DB write.
+
+    Locks in the user-reported French→Portuguese bug pattern: the
+    LLM stranded apostrophes in front of words (``Eu 'tenho``,
+    ``por 'ter dedicado``) and they reached the on-disk XHTML and
+    the segment's ``target_text``. The pipeline now runs
+    :func:`epublate.core.typography.strip_leading_orphan_apostrophes`
+    after the parser, so neither path sees the orphans.
+    """
+
+    project = _basic_project(tiny_epub_factory, tmp_path)
+    try:
+        provider = MockLLMProvider()
+        provider.set_response(
+            json.dumps(
+                {
+                    "target": (
+                        "\u00c9lise \u2019sorriu para Hugo. Eu \u2019tenho "
+                        "uma desculpa."
+                    ),
+                }
+            )
+        )
+
+        seg = _segment_containing(project, "\u00c9lise")
+        outcome = translate_segment(
+            engine=project.engine,
+            project_id=project.project_id,
+            source_lang="en",
+            target_lang="pt",
+            style_guide=None,
+            segment=seg,
+            provider=provider,
+            options=TranslateOptions(model="gpt-mock"),
+        )
+
+        cleaned = "\u00c9lise sorriu para Hugo. Eu tenho uma desculpa."
+        # ``outcome.target_text`` is what landed in the segment row;
+        # it must already be cleaned.
+        assert outcome.target_text == cleaned
+        assert "\u2019" not in outcome.target_text
+        # Defensive re-read against the DB so we know the column was
+        # written with the cleaned bytes (not just the in-memory
+        # outcome).
+        refreshed = repo.list_segments(project.engine, seg.chapter_id)
+        target_now = next(s for s in refreshed if s.id == seg.id).target_text
+        assert target_now == cleaned
+    finally:
+        project.close()
+
+
+def test_translate_segment_keeps_apostrophes_for_french_target(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """When the target language IS French, leading apostrophes stay.
+
+    The strip is gated on the target-language code so legitimate
+    elision orthography (``j'ai``, ``l'enfant``) round-trips
+    untouched. Without this gate, every French translation would
+    have its valid apostrophes stripped — a far worse failure mode
+    than the original bug.
+    """
+
+    src = tiny_epub_factory(
+        chapters=[
+            ("Solo", "<h1>Solo</h1><p>I have an idea.</p>"),
+        ]
+    )
+    project = Project.create(
+        src, out_dir=tmp_path / "fr-proj", source_lang="en", target_lang="fr"
+    )
+    try:
+        provider = MockLLMProvider()
+        provider.set_response(json.dumps({"target": "J\u2019ai une id\u00e9e."}))
+        seg = _segment_containing(project, "I have")
+        outcome = translate_segment(
+            engine=project.engine,
+            project_id=project.project_id,
+            source_lang="en",
+            target_lang="fr",
+            style_guide=None,
+            segment=seg,
+            provider=provider,
+            options=TranslateOptions(model="gpt-mock"),
+        )
+        assert outcome.target_text == "J\u2019ai une id\u00e9e."
+    finally:
+        project.close()
+
+
+def test_auto_propose_drops_year_like_new_entities(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """Translator-side ``new_entities`` flow drops raw years too.
+
+    The helper-LLM extractor's parser was the obvious place to reject
+    raw year references (``1066``, ``1939-1945``), but the translator
+    can also propose noise via ``new_entities`` when it encounters a
+    date in a segment. This regression locks in that the same
+    :func:`_violates_extractor_caps` predicate runs on the
+    translator's auto-propose channel — proposals like ``"1066"`` and
+    ``"1990s"`` never reach the lore bible while real entities
+    sitting alongside them survive.
+    """
+
+    project = _basic_project(tiny_epub_factory, tmp_path)
+    try:
+        provider = MockLLMProvider()
+        provider.set_responder(
+            lambda msgs, model: json.dumps(
+                {
+                    "target": f"PT::{msgs[-1].content}",
+                    "new_entities": [
+                        {"type": "date_or_time", "source": "1066"},
+                        {"type": "date_or_time", "source": "1939-1945"},
+                        {"type": "date_or_time", "source": "1990s"},
+                        {"type": "date_or_time", "source": "c. 1066"},
+                        {"type": "place", "source": "Riverbend"},
+                    ],
+                }
+            )
+        )
+
+        _chap, seg = _open_translatable_segment(project)
+        outcome = translate_segment(
+            engine=project.engine,
+            project_id=project.project_id,
+            source_lang="en",
+            target_lang="pt",
+            style_guide=None,
+            segment=seg,
+            provider=provider,
+            options=TranslateOptions(model="gpt-mock"),
+        )
+        # Only the real proper noun (``Riverbend``) lands.
+        assert len(outcome.proposed_entry_ids) == 1
+        proposed = repo.list_glossary_entries(
+            project.engine, project.project_id, status="proposed"
+        )
+        assert [p.source_term for p in proposed] == ["Riverbend"]
+    finally:
+        project.close()
+
+
 def test_pipeline_records_mentions(
     tiny_epub_factory: Callable[..., Path], tmp_path: Path
 ) -> None:

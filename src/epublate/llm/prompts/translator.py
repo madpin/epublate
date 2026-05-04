@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -133,6 +134,25 @@ class GroupTranslatorTrace(BaseModel):
     notes: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ContextSegment:
+    """One preceding segment surfaced to the translator as context.
+
+    The pipeline assembles a list of these from the same chapter, in
+    book order, capped by the user's
+    :class:`epublate.core.pipeline.ContextOptions` knobs. Each carries
+    the *raw* source text (placeholders left in place) plus, when
+    available, the curator-approved target text. ``segments_back``
+    is the 1-based distance from the segment under translation
+    (``1`` = immediately preceding, ``2`` = two before, …) so the
+    prompt can render a stable, oldest-first ordering.
+    """
+
+    source_text: str
+    target_text: str | None
+    segments_back: int
+
+
 _SYSTEM_PROMPT_TEMPLATE = """\
 You are a literary translator working on a long ePub story book.
 
@@ -148,19 +168,40 @@ Hard rules — these are not negotiable:
    (`[[T0]]`).
 2. Translate naturally for the target audience but preserve narrative
    voice, tense, and POV. Do not paraphrase past the meaning of the
-   source. Do not summarize.
-3. Keep proper nouns, place names, and domain terms consistent across
+   source. Do not summarize. Render punctuation, contractions, and
+   orthography according to target-language conventions —
+   apostrophes, quotation mark style, dash usage, and similar
+   typographic patterns are language-specific, so do NOT mechanically
+   transcribe source-side punctuation that has no equivalent in the
+   target. When this run's source/target pair has known pitfalls,
+   they are listed under "Language-pair notes" below.
+3. Translate every textual passage end-to-end. Embedded quotations
+   (even when wrapped in placeholder pairs that mark italics or
+   blockquote runs), bracketed asides like ``[sic]`` / ``[Emphasis
+   added]``, parenthetical clauses, footnote text, and book / article
+   titles cited in the prose are all part of the segment and MUST be
+   translated. Do not leave any chunk in the source language to
+   "preserve the original quote" unless it is a code snippet or a
+   proper name. If you would normally render a cited title as a
+   parallel-text bilingual quote, instead translate it inline like
+   the rest of the text and let the curator add a footnote later.
+4. Preserve the leading and trailing whitespace of the source segment
+   verbatim. If the source begins with newlines and indentation
+   (e.g. ``"\\n    [[T0]]…"``) your target MUST begin with the same
+   characters; same for trailing whitespace. Do not strip, collapse,
+   or "tidy" the surrounding whitespace.
+5. Keep proper nouns, place names, and domain terms consistent across
    the book. The glossary below lists agreed translations.
-4. Locked glossary entries are non-negotiable. Confirmed entries are
+6. Locked glossary entries are non-negotiable. Confirmed entries are
    strong defaults. Proposed entries are suggestions.
-5. Apply a glossary entry only when the source term is used in the
+7. Apply a glossary entry only when the source term is used in the
    same sense as the entry. Some entries map a common noun to a
    specialized translation (e.g. ``House`` → ``Câmara`` for a
    parliamentary chamber) — when the source uses the same word in an
    ordinary, unrelated sense (a building, a family, …), translate
    it idiomatically and ignore the entry. The notes column on each
    entry, when present, hints at the intended sense.
-6. When a glossary entry carries a ``(gender: …)`` marker the
+8. When a glossary entry carries a ``(gender: …)`` marker the
    canonical target term has that grammatical gender. Surrounding
    articles, demonstratives, possessives, adjectives, and past
    participles MUST agree with that gender, including any preposition
@@ -168,7 +209,7 @@ Hard rules — these are not negotiable:
    ``o Senhor`` / ``do Senhor`` for masculine).
    When the source uses an article with a glossary term, your
    translation MUST keep the article and inflect it correctly.
-7. Glossary entries are recorded in a balanced shape: either both
+9. Glossary entries are recorded in a balanced shape: either both
    the source term and the target term carry a leading article /
    preposition (e.g. ``the USA → os EUA``), or neither does
    (``Europe → Europa``, ``USA → EUA``). When the entry has NO
@@ -180,7 +221,7 @@ Hard rules — these are not negotiable:
    entry HAS a leading article on both sides, treat the article as
    part of the canonical spelling and do not add another one.
 
-{style_guide_block}{glossary_block}{target_only_block}\
+{language_notes_block}{style_guide_block}{glossary_block}{target_only_block}{context_block}\
 Respond with a single JSON object and nothing else:
 
 {{
@@ -201,6 +242,13 @@ the literal spelling you used inside ``target`` for this segment —
 that's how the lore bible learns the canonical translation. If for
 some reason the entity does not appear in the translation (e.g. you
 elided it), set ``target`` to the form you would use next time.
+
+Do NOT propose raw year references (``1066``, ``1939-1945``,
+``1990s``, ``c. 1066``, ``45 BC``) in ``new_entities``. Plain dates
+are handled inline by the translation; the lore bible only tracks
+*named* eras and recurring holidays (``the Long Night``, ``Yule``).
+When a year is part of a longer named phrase the phrase as a whole
+is fine (``Year of the Four Emperors``, ``Battle of 1066``).
 
 Do not wrap the JSON in code fences. Do not add commentary.\
 """
@@ -223,24 +271,39 @@ Hard rules — these are not negotiable:
 2. Keep each translation scoped to its own item. Do NOT bleed context
    from one item into the next.
 3. Translate naturally for the target audience; do not paraphrase past
-   the meaning of the source and do not summarize.
-4. Keep proper nouns, place names, and domain terms consistent with
+   the meaning of the source and do not summarize. Render punctuation,
+   contractions, and orthography according to target-language
+   conventions — apostrophes, quotation mark style, dash usage, and
+   similar typographic patterns are language-specific, so do NOT
+   mechanically transcribe source-side punctuation that has no
+   equivalent in the target. When this run's source/target pair has
+   known pitfalls, they are listed under "Language-pair notes" below.
+4. Translate every textual passage end-to-end. Embedded quotations,
+   bracketed asides, parenthetical clauses, footnote text, and
+   book / article titles cited inside an item are all part of that
+   item and MUST be translated. Do not leave any chunk in the source
+   language to "preserve the original quote" unless it is a code
+   snippet or a proper name.
+5. Preserve the leading and trailing whitespace of each source item
+   verbatim in the matching target. Do not strip, collapse, or
+   "tidy" surrounding whitespace.
+6. Keep proper nouns, place names, and domain terms consistent with
    the glossary below. Locked glossary entries are non-negotiable,
    confirmed entries are strong defaults, proposed entries are
    suggestions.
-5. Apply a glossary entry only when the source term is used in the
+7. Apply a glossary entry only when the source term is used in the
    same sense as the entry. When the source uses the same word in an
    ordinary, unrelated sense, translate it idiomatically and ignore
    the entry. The notes column on each entry, when present, hints at
    the intended sense.
-6. When a glossary entry carries a ``(gender: …)`` marker the
+8. When a glossary entry carries a ``(gender: …)`` marker the
    canonical target term has that grammatical gender. Surrounding
    articles, demonstratives, possessives, adjectives, and past
    participles MUST agree with that gender, including any preposition
    contractions. When the source uses an article with a glossary
    term, your translation MUST keep the article and inflect it
    correctly.
-7. Glossary entries are recorded in a balanced shape: either both
+9. Glossary entries are recorded in a balanced shape: either both
    the source term and the target term carry a leading article /
    preposition (``the USA → os EUA``), or neither does
    (``Europe → Europa``). When the entry has NO leading article,
@@ -251,16 +314,16 @@ Hard rules — these are not negotiable:
    When the entry HAS a leading article on both sides, treat the
    article as part of the canonical spelling and do not add another
    one.
-8. Inline formatting in each item's source is encoded as opaque
-   placeholders of the form ``[[T0]]``, ``[[/T0]]``, ``[[T1]]``, etc.
-   For each item, every placeholder that appears in that item's
-   source MUST appear exactly once in that item's target, in the same
-   relative order. Do not invent new placeholders. Do not drop any.
-   Closing placeholders (``[[/T0]]``) must always pair with their
-   opener (``[[T0]]``). Placeholder ids are local to each item — do
-   not share or shift them across items.
+10. Inline formatting in each item's source is encoded as opaque
+    placeholders of the form ``[[T0]]``, ``[[/T0]]``, ``[[T1]]``, etc.
+    For each item, every placeholder that appears in that item's
+    source MUST appear exactly once in that item's target, in the same
+    relative order. Do not invent new placeholders. Do not drop any.
+    Closing placeholders (``[[/T0]]``) must always pair with their
+    opener (``[[T0]]``). Placeholder ids are local to each item — do
+    not share or shift them across items.
 
-{style_guide_block}{glossary_block}{target_only_block}\
+{language_notes_block}{style_guide_block}{glossary_block}{target_only_block}\
 Input format: the user message is a JSON object of the shape
 ``{{"items": [{{"id": 1, "source": "..."}}, ...]}}``. Respond with a
 single JSON object and nothing else:
@@ -285,8 +348,375 @@ single JSON object and nothing else:
   "notes": "optional batch-level note, omit when empty"
 }}
 
+Do NOT propose raw year references (``1066``, ``1939-1945``,
+``1990s``, ``c. 1066``, ``45 BC``) in ``new_entities``. Plain dates
+are handled inline by the translation; the lore bible only tracks
+*named* eras and recurring holidays.
+
 Do not wrap the JSON in code fences. Do not add commentary.\
 """
+
+
+_LANGUAGE_NAMES: dict[str, str] = {
+    # Western European
+    "en": "English",
+    "en-us": "American English",
+    "en-gb": "British English",
+    "en-au": "Australian English",
+    "en-ca": "Canadian English",
+    "fr": "French",
+    "fr-fr": "French (France)",
+    "fr-ca": "Canadian French",
+    "fr-be": "Belgian French",
+    "fr-ch": "Swiss French",
+    "es": "Spanish",
+    "es-es": "European Spanish",
+    "es-mx": "Mexican Spanish",
+    "es-ar": "Argentine Spanish",
+    "es-co": "Colombian Spanish",
+    "es-419": "Latin American Spanish",
+    "pt": "Portuguese",
+    "pt-pt": "European Portuguese",
+    "pt-br": "Brazilian Portuguese",
+    "it": "Italian",
+    "it-it": "Italian",
+    "de": "German",
+    "de-de": "German",
+    "de-at": "Austrian German",
+    "de-ch": "Swiss German",
+    "nl": "Dutch",
+    "nl-nl": "Dutch",
+    "nl-be": "Flemish",
+    "ca": "Catalan",
+    "gl": "Galician",
+    "eu": "Basque",
+    # Northern European
+    "no": "Norwegian",
+    "nb": "Norwegian Bokmål",
+    "nn": "Norwegian Nynorsk",
+    "sv": "Swedish",
+    "da": "Danish",
+    "fi": "Finnish",
+    "is": "Icelandic",
+    "et": "Estonian",
+    "lv": "Latvian",
+    "lt": "Lithuanian",
+    # Eastern European
+    "ru": "Russian",
+    "uk": "Ukrainian",
+    "be": "Belarusian",
+    "pl": "Polish",
+    "cs": "Czech",
+    "sk": "Slovak",
+    "hu": "Hungarian",
+    "ro": "Romanian",
+    "bg": "Bulgarian",
+    "hr": "Croatian",
+    "sr": "Serbian",
+    "sr-latn": "Serbian (Latin)",
+    "sr-cyrl": "Serbian (Cyrillic)",
+    "sl": "Slovenian",
+    "mk": "Macedonian",
+    "sq": "Albanian",
+    "el": "Greek",
+    # Middle East / RTL
+    "ar": "Arabic",
+    "ar-eg": "Egyptian Arabic",
+    "ar-sa": "Saudi Arabic",
+    "ar-lb": "Lebanese Arabic",
+    "he": "Hebrew",
+    "fa": "Persian",
+    "ur": "Urdu",
+    "ps": "Pashto",
+    "ku": "Kurdish",
+    "tr": "Turkish",
+    "az": "Azerbaijani",
+    "hy": "Armenian",
+    "ka": "Georgian",
+    # South Asian
+    "hi": "Hindi",
+    "bn": "Bengali",
+    "pa": "Punjabi",
+    "gu": "Gujarati",
+    "mr": "Marathi",
+    "ta": "Tamil",
+    "te": "Telugu",
+    "kn": "Kannada",
+    "ml": "Malayalam",
+    "si": "Sinhala",
+    "ne": "Nepali",
+    # East Asian
+    "zh": "Chinese",
+    "zh-cn": "Simplified Chinese",
+    "zh-tw": "Traditional Chinese",
+    "zh-hans": "Simplified Chinese",
+    "zh-hant": "Traditional Chinese",
+    "zh-hk": "Hong Kong Chinese",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "mn": "Mongolian",
+    # Southeast Asian
+    "id": "Indonesian",
+    "ms": "Malay",
+    "vi": "Vietnamese",
+    "th": "Thai",
+    "lo": "Lao",
+    "km": "Khmer",
+    "my": "Burmese",
+    "tl": "Tagalog",
+    "fil": "Filipino",
+    # African
+    "sw": "Swahili",
+    "am": "Amharic",
+    "yo": "Yoruba",
+    "ha": "Hausa",
+    "ig": "Igbo",
+    "zu": "Zulu",
+    "xh": "Xhosa",
+    "af": "Afrikaans",
+    # Constructed / classical
+    "la": "Latin",
+    "eo": "Esperanto",
+}
+"""BCP-47 → human-readable language name table.
+
+Used to render the prompt's source/target labels as
+``French (fr)`` / ``Brazilian Portuguese (pt-BR)`` instead of the bare
+code, so the LLM has both an unambiguous language identifier and the
+common name. Lookup is case-insensitive on the full tag first, then
+falls back to the primary subtag (``pt`` for ``pt-BR``) so a one-line
+addition covers every regional variant of a given language. Adding a
+language is a single key/value pair — keep entries short, capitalize
+the same way the language is conventionally written in English.
+
+Why a hand-rolled dict (no ``babel`` / locale dependency): we want a
+single source of truth for the prompt that we can curate (e.g. spell
+``Brazilian Portuguese`` rather than the more clinical
+``Portuguese (Brazil)``), and we want to be able to ship without an
+extra dependency. The PRD's local-first invariant is satisfied
+trivially by a dict; ``babel`` would require a 30+ MB locale corpus
+for a 100-line lookup.
+"""
+
+
+def _format_language_label(lang: str) -> str:
+    """Render a language code as ``Name (code)`` — or just the code.
+
+    Falls back to the full tag (``pt-BR``) when no name is registered
+    for either the full tag or the primary subtag. The output always
+    includes the original code so the LLM can disambiguate dialect
+    variants the prose name might glide over (e.g. ``en-US`` vs
+    ``en-GB`` both read as "English" in conversation but cue different
+    spelling conventions).
+    """
+
+    if not lang:
+        return lang
+    raw = lang.strip()
+    if not raw:
+        return raw
+    key = raw.lower()
+    name = _LANGUAGE_NAMES.get(key)
+    if name is None:
+        primary = key.split("-", 1)[0]
+        if primary != key:
+            name = _LANGUAGE_NAMES.get(primary)
+    if name is None:
+        return raw
+    return f"{name} ({raw})"
+
+
+_SOURCE_LANG_NOTES: dict[str, str] = {
+    "fr": (
+        "French uses apostrophe contractions for elision "
+        "(``j'avais``, ``s'appelait``, ``l'arbre``, ``qu'il``, "
+        "``d'avoir``, ``n'est``). The apostrophe is part of French "
+        "orthography ONLY — when the target language does not use "
+        "the same convention, the apostrophe MUST be removed entirely "
+        "(NOT moved, NOT preserved as a leading character on the "
+        "next word). Translate the elided forms into their full "
+        "target-language equivalents:\n"
+        "  - ``j'avais`` → ``eu tinha`` (NOT ``eu'tinha``, NOT "
+        "``eu 'tinha``).\n"
+        "  - ``J'ai une excuse.`` → ``Tenho uma desculpa.`` (NOT "
+        "``Eu 'tenho uma desculpa.``).\n"
+        "  - ``s'appelait`` → ``se chamava`` (NOT ``'se chamava``).\n"
+        "  - ``d'avoir dédié`` → ``por ter dedicado`` (NOT ``por "
+        "'ter dedicado``).\n"
+        "  - ``l'enfant qu'a été`` → ``a criança que foi`` (NOT "
+        "``à 'criança que 'foi``)."
+    ),
+    "it": (
+        "Italian uses apostrophe contractions for elision (``l'amico``, "
+        "``dell'amore``, ``un'idea``). Carry the apostrophe over only "
+        "when the target language uses the same convention; otherwise "
+        "render the full target-language form."
+    ),
+    "de": (
+        "German capitalizes every common noun. Do NOT preserve those "
+        "capitals in the target unless the target language also "
+        "capitalizes nouns; render proper-noun capitalization "
+        "according to target-language rules."
+    ),
+    "es": (
+        "Spanish opens questions and exclamations with ``¿`` / ``¡``. "
+        "Most other languages only use the closing mark, so translate "
+        "the punctuation to whatever the target language conventionally "
+        "uses for questions and exclamations."
+    ),
+}
+"""Source-language idiosyncrasies the model must NOT carry across.
+
+Keyed by the BCP-47 primary subtag (``fr``, ``de``, …). Lookup falls
+back from the full tag (``fr-CA``) to the primary subtag, so adding a
+``fr-CA``-specific note is a one-key override rather than a
+per-variant copy. Each value is a single short paragraph; the
+prompt-builder wraps it in a bullet line.
+
+The dict is intentionally narrow: it only holds patterns curators
+have observed mistranslated in the wild (or that come up reliably
+when reviewing competing translations). Adding a language pair is a
+two-line PR that doesn't touch the universal hard-rules block.
+"""
+
+
+_TARGET_LANG_NOTES: dict[str, str] = {
+    "pt": (
+        "Portuguese does NOT use apostrophe contractions in modern "
+        "prose: write ``eu tinha``, ``se chamava``, ``ele era`` as "
+        "two separate words with a normal space between them. "
+        "Preposition + article contractions use dedicated glyphs "
+        "(``de + a = da``, ``em + o = no``, ``por + a = pela``), "
+        "never an apostrophe. NEVER write an apostrophe directly "
+        "in front of a Portuguese word — leading apostrophes "
+        "(``'tenho``, ``'ser``, ``'criança``) are ALWAYS wrong, "
+        "even when carrying the pattern over from a French / "
+        "Italian / Catalan source that elides verbs with "
+        "apostrophes. Dialogue is conventionally introduced with "
+        "an em-dash (``— Olá!``). Quotation marks, when used, are "
+        "guillemets ``«…»`` or curly doubles ``\u201c\u2026\u201d``."
+    ),
+    "en": (
+        "English uses apostrophes for contractions (``don't``, "
+        "``it's``) and possessives (``Mary's``). Quotation marks are "
+        'typically straight ``"…"`` or curly ``"…"``; guillemets '
+        "``«…»`` read as foreign and should be replaced unless the "
+        "source-language flavor is deliberately preserved."
+    ),
+    "fr": (
+        "French uses apostrophe contractions for elision "
+        "(``j'avais``, ``l'arbre``). Quotation marks are conventionally "
+        "guillemets ``« … »`` with thin spaces inside; double straight "
+        "quotes are anglicisms in French prose."
+    ),
+    "es": (
+        "Spanish opens questions and exclamations with ``¿`` / ``¡`` "
+        "and closes them with ``?`` / ``!``. Dialogue is conventionally "
+        "introduced with an em-dash (``— Hola``)."
+    ),
+    "it": (
+        "Italian uses apostrophe contractions for elision (``l'amico``, "
+        "``dell'amore``). Quotation marks are conventionally guillemets "
+        "``« … »``; double straight quotes read as anglicisms."
+    ),
+}
+"""Target-language conventions the model SHOULD follow.
+
+Same shape and lookup rules as :data:`_SOURCE_LANG_NOTES`. The
+companion side: while the source-side notes warn against carrying
+patterns over, these notes prescribe the conventions the target
+language actually uses, so the model has a positive instruction
+rather than only a "don't do X" reminder.
+"""
+
+
+def _lookup_lang_note(lang: str, table: dict[str, str]) -> str | None:
+    """Look up a language note, trying the full tag then the primary subtag.
+
+    BCP-47 codes can carry region / script subtags (``pt-BR``,
+    ``zh-Hant``); we fall back to the primary subtag (``pt``, ``zh``)
+    so the common case is one entry per language. Add a regional
+    override (``pt-br``) only when its conventions actually diverge
+    from the family default.
+    """
+
+    if not lang:
+        return None
+    full = lang.strip().lower()
+    direct = table.get(full)
+    if direct is not None:
+        return direct
+    primary = full.split("-", 1)[0]
+    if primary != full:
+        return table.get(primary)
+    return None
+
+
+def _format_language_pair_notes(source_lang: str, target_lang: str) -> str:
+    """Render a conditional language-pair tips block.
+
+    Stays empty for the long tail of language pairs where we have no
+    notes on file. When either side has notes (or both), they're
+    rendered in a single block right above the style guide so the
+    model sees pair-specific guidance close to the rest of the
+    contextual context. Each line is a short bullet that complements
+    rule 2/3's abstract "render typography per target conventions"
+    instruction with a concrete cue for *this* run.
+
+    The block uses the bare BCP-47 codes — the named-label rendering
+    (``French (fr)``) belongs to the main "Translate from X to Y"
+    sentence at the top of the prompt, where the model first picks up
+    its working pair. Repeating the prose name in every bullet would
+    just inflate the prompt without giving the model new information,
+    and curators reading the rendered prompt have already been
+    "anchored" by the named header.
+    """
+
+    src_note = _lookup_lang_note(source_lang, _SOURCE_LANG_NOTES)
+    tgt_note = _lookup_lang_note(target_lang, _TARGET_LANG_NOTES)
+    if not src_note and not tgt_note:
+        return ""
+
+    lines = [f"Language-pair notes ({source_lang} → {target_lang}):"]
+    if src_note:
+        lines.append(f"  - When translating FROM {source_lang}: {src_note}")
+    if tgt_note:
+        lines.append(f"  - When translating TO {target_lang}: {tgt_note}")
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _format_context_block(context: Sequence[ContextSegment]) -> str:
+    """Render the preceding-segments block surfaced to the translator.
+
+    Stays empty when ``context`` is empty (the common case for
+    standalone reader translation, grouped batches, or when the user
+    has not opted in via :class:`epublate.core.pipeline.ContextOptions`).
+    Otherwise the block lists each preceding segment with its
+    source / curator-approved target side-by-side, oldest first, so
+    the LLM sees the recency gradient. We deliberately fence the block
+    with a "translate ONLY the user's segment" reminder so the model
+    doesn't try to retranslate the context.
+    """
+
+    if not context:
+        return ""
+    ordered = sorted(context, key=lambda c: c.segments_back, reverse=True)
+    lines = [
+        "Preceding segments (context only — DO NOT translate them; "
+        "translate ONLY the user's segment below):",
+    ]
+    for entry in ordered:
+        src = entry.source_text.strip() or "(empty)"
+        tgt = (
+            entry.target_text.strip()
+            if entry.target_text and entry.target_text.strip()
+            else "(not yet translated)"
+        )
+        lines.append(f"  - source: {src}")
+        lines.append(f"    target: {tgt}")
+    lines.append("")
+    return "\n".join(lines) + "\n"
 
 
 def build_translator_messages(
@@ -297,6 +727,7 @@ def build_translator_messages(
     style_guide: str | None = None,
     glossary: Sequence[GlossaryConstraint] = (),
     target_only_glossary: Sequence[TargetOnlyConstraint] = (),
+    context: Sequence[ContextSegment] = (),
 ) -> list[Message]:
     """Construct the chat messages for one translator call (PRD §8.1).
 
@@ -306,6 +737,21 @@ def build_translator_messages(
     asks the model to map source-language references it sees in the
     segment to the canonical target form. Validator-side these are
     soft-locked — a missed match is a warning, not a hard failure.
+
+    ``context`` carries up to N preceding segments from the same
+    chapter (oldest first in the rendered block). The pipeline picks
+    them based on the user's :class:`epublate.core.pipeline.ContextOptions`
+    knobs (``max_segments`` and ``max_chars``); a segment is *never*
+    split to fit the char cap. The block tells the model these are
+    context only — the user message still contains the single segment
+    to translate.
+
+    Language-pair labels are rendered as ``Name (code)`` (e.g.
+    ``French (fr)`` → ``Brazilian Portuguese (pt-BR)``) so the LLM
+    sees both the unambiguous BCP-47 tag and the human name. Pair-
+    specific typography notes only render when
+    :func:`_format_language_pair_notes` has guidance for the combo,
+    keeping the prompt compact for the long tail.
     """
 
     if not source_text:
@@ -316,13 +762,17 @@ def build_translator_messages(
     )
     glossary_block = _format_glossary_block(glossary)
     target_only_block = _format_target_only_block(target_only_glossary)
+    language_notes_block = _format_language_pair_notes(source_lang, target_lang)
+    context_block = _format_context_block(context)
 
     system_content = _SYSTEM_PROMPT_TEMPLATE.format(
-        source_lang=source_lang,
-        target_lang=target_lang,
+        source_lang=_format_language_label(source_lang),
+        target_lang=_format_language_label(target_lang),
         style_guide_block=style_guide_block,
         glossary_block=glossary_block,
         target_only_block=target_only_block,
+        language_notes_block=language_notes_block,
+        context_block=context_block,
     )
 
     return [
@@ -534,13 +984,15 @@ def build_group_translator_messages(
     )
     glossary_block = _format_glossary_block(glossary)
     target_only_block = _format_target_only_block(target_only_glossary)
+    language_notes_block = _format_language_pair_notes(source_lang, target_lang)
 
     system_content = _GROUP_SYSTEM_PROMPT_TEMPLATE.format(
-        source_lang=source_lang,
-        target_lang=target_lang,
+        source_lang=_format_language_label(source_lang),
+        target_lang=_format_language_label(target_lang),
         style_guide_block=style_guide_block,
         glossary_block=glossary_block,
         target_only_block=target_only_block,
+        language_notes_block=language_notes_block,
     )
 
     user_payload = {
@@ -625,9 +1077,11 @@ def parse_group_translator_response(
 
 
 __all__ = [
+    "ContextSegment",
     "GlossaryConstraint",
     "GroupTranslatorItem",
     "GroupTranslatorTrace",
+    "TargetOnlyConstraint",
     "TranslatorTrace",
     "build_group_translator_messages",
     "build_translator_messages",

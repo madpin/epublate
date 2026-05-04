@@ -48,10 +48,16 @@ strictness:
    The helper LLM is best-effort; `_violates_extractor_caps` in
    `llm/prompts/extractor.py` drops candidates that exceed 10
    words / 100 characters, contain multiple sentence-final
-   punctuations, or have unbalanced parentheses. The same
-   predicate runs on `extractor_target.py`. Don't relax the caps
-   to make a noisy endpoint's output land — sharpen the prompt or
-   wait for the curator to add the entry by hand.
+   punctuations, have unbalanced parentheses, or are pure year
+   references (`1066`, `1939-1945`, `1990s`, `c. 1066`, `45 BC` —
+   see `_is_year_like` / public alias `is_year_like`). The same
+   predicate runs on `extractor_target.py` and on
+   `core/pipeline._normalize_new_entity` (the translator's
+   `new_entities` channel). Don't relax the caps to make a noisy
+   endpoint's output land — sharpen the prompt or wait for the
+   curator to add the entry by hand. The `epublate glossary
+   cleanup-years` CLI surfaces (and optionally deletes) historical
+   year-shaped entries that landed before the filter was added.
 
 ## Don't
 

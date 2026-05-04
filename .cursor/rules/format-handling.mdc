@@ -59,3 +59,35 @@ class FormatAdapter(Protocol):
   validators.
 - Run `epubcheck` on export; warn-only by default, "strict export"
   toggle blocks on errors.
+
+## Target-text typography (post-LLM)
+
+The translator prompt asks the model to render typography per
+target-language conventions, but OpenAI-compatible endpoints
+occasionally carry source-language patterns over verbatim. The
+deterministic safety-net lives in `core/typography.py`:
+
+- `strip_leading_orphan_apostrophes(text, *, target_lang)` —
+  removes apostrophes that ended up stranded as leading orthography
+  in front of a Unicode letter (the French/Italian/Catalan
+  elision pattern carried into Portuguese / Spanish / German /
+  etc.). Language-gated: only languages where leading apostrophes
+  are wrong in modern prose are eligible. Conservative on
+  embedded apostrophes: `O'Higgins`, `D'Água`, `'90s`, and
+  English contractions inside foreign-language quotes are left
+  alone.
+- The pipeline runs the sanitiser at every `TranslatorTrace`
+  construction site (live, cache-replay, grouped) so the cleaned
+  bytes flow into both the spliced XHTML and the segment's
+  `target_text` column.
+- Retroactive cleanup for projects translated before this fix
+  ships as a CLI command: `epublate sanitize-typography <project>`
+  (dry-run by default; `--apply` rewrites). Uses
+  `repo.update_segment_target_text` which preserves
+  `segment.status` so curator decisions (locked / flagged) survive
+  the rewrite.
+
+When adding a new target-language typography fix, follow the same
+shape: a pure function in `core/typography.py`, language-gated via
+a small whitelist, called from every `TranslatorTrace` site, plus
+a retroactive-cleanup CLI for existing projects.

@@ -49,6 +49,7 @@ from epublate.core.pipeline import (
     GROUP_DEFAULT_MAX_ITEMS,
     GROUP_DEFAULT_MAX_PLACEHOLDERS,
     GROUP_DEFAULT_MAX_SOURCE_CHARS,
+    ContextOptions,
     TranslateOptions,
     TranslateOutcome,
     is_group_eligible,
@@ -111,6 +112,17 @@ class BatchOptions:
     group_max_items: int = GROUP_DEFAULT_MAX_ITEMS
     group_max_source_chars: int = GROUP_DEFAULT_MAX_SOURCE_CHARS
     group_max_placeholders: int = GROUP_DEFAULT_MAX_PLACEHOLDERS
+    # Preceding-segment context for the per-segment path (PRD §8.1
+    # follow-up). Defaults disabled so existing batches see no prompt
+    # change. Curators opt in when conversational chapters benefit
+    # from a few preceding turns of context, or pin a single
+    # preceding paragraph for long-prose chapters. The "never split a
+    # segment" rule is enforced inside the pipeline (see
+    # :func:`epublate.core.pipeline._load_context_segments`). Group
+    # workers ignore the field — each group item is independent by
+    # construction, so adding context across items would just confuse
+    # the per-item scoping.
+    context: ContextOptions = field(default_factory=ContextOptions)
 
 
 @dataclass(slots=True)
@@ -354,6 +366,7 @@ def run_batch(
                     model=options.model,
                     bypass_cache=options.bypass_cache,
                     auto_propose=options.auto_propose,
+                    context=options.context,
                 ),
             )
             return [(seg, outcome, None)]
@@ -883,8 +896,11 @@ __all__ = [
     "BatchCancelled",
     "BatchOptions",
     "BatchPaused",
+    "BatchPrePassProgress",
     "BatchProgressEvent",
     "BatchSummary",
+    "ContextOptions",
+    "PrePassProgressCallback",
     "ProgressCallback",
     "run_batch",
 ]

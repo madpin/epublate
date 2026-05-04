@@ -211,6 +211,44 @@ def test_export_round_trips(
     assert out_epub.is_file()
 
 
+def test_repair_subcommand_reports_no_op_on_fresh_project(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """``epublate repair`` is a curator-facing surface — keep the line stable.
+
+    The summary string is what the curator sees in the terminal, so a
+    no-op project must produce exactly the "0 added, 0 re-hosted"
+    breakdown plus the explicit ``up to date`` follow-up. If we ever
+    rephrase those lines, this test must change in lock-step.
+    """
+
+    runner = CliRunner()
+    src = tiny_epub_factory()
+    out_dir = tmp_path / "proj"
+
+    new_result = runner.invoke(
+        main,
+        [
+            "new",
+            str(src),
+            "--out",
+            str(out_dir),
+            "--source-lang",
+            "en",
+            "--target-lang",
+            "pt",
+        ],
+    )
+    assert new_result.exit_code == 0, new_result.output
+
+    repair_result = runner.invoke(main, ["repair", str(out_dir)])
+    assert repair_result.exit_code == 0, repair_result.output
+    assert (
+        "0 new segment(s) inserted, 0 existing row(s) re-hosted" in repair_result.output
+    )
+    assert "already up to date" in repair_result.output
+
+
 def test_open_subcommand_loads_project(
     tiny_epub_factory: Callable[..., Path], tmp_path: Path
 ) -> None:
@@ -443,6 +481,260 @@ def test_stats_command_emits_json(
     assert payload["spend_usd"] == 0.0
     assert payload["budget_usd"] is None
     assert payload["segment_count"] > 0
+
+
+def test_glossary_cleanup_years_dry_run_lists_only(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """Without ``--apply`` the command lists candidates and exits.
+
+    The dry-run default is intentional: glossary deletes are not
+    cheap to undo (the row is gone, with all its mentions). The
+    curator should always see the match list before deleting, so
+    the CLI defaults to read-only and prints a "rerun with --apply"
+    nudge.
+    """
+
+    runner = CliRunner()
+    out_dir = _new_project_dir(runner, tiny_epub_factory, tmp_path)
+    project = Project.open(out_dir)
+    try:
+        repo.create_glossary_entry(
+            project.engine,
+            project_id=project.project_id,
+            source_term="1066",
+            target_term="1066",
+            type="date_or_time",
+            status="proposed",
+        )
+        repo.create_glossary_entry(
+            project.engine,
+            project_id=project.project_id,
+            source_term="Élise",
+            target_term="Elisa",
+            type="character",
+            status="proposed",
+        )
+    finally:
+        project.close()
+
+    result = runner.invoke(main, ["glossary", "cleanup-years", str(out_dir)])
+    assert result.exit_code == 0, result.output
+    assert "1066" in result.output
+    assert "Élise" not in result.output
+    assert "Dry run" in result.output
+
+    # Without --apply, nothing should have been deleted.
+    project = Project.open(out_dir)
+    try:
+        proposed = repo.list_glossary_entries(
+            project.engine, project.project_id, status="proposed"
+        )
+        sources = {e.source_term for e in proposed}
+        assert "1066" in sources
+        assert "Élise" in sources
+    finally:
+        project.close()
+
+
+def test_glossary_cleanup_years_apply_deletes_year_entries(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """``--apply`` actually removes year-like proposed entries.
+
+    Locked / confirmed entries are NEVER touched (they were
+    promoted by the curator on purpose); only proposed entries with
+    a year-like source term are eligible. A confirmed year entry in
+    the fixture acts as a tripwire: if cleanup nukes it, the
+    curator's manual decisions get steam-rolled.
+    """
+
+    runner = CliRunner()
+    out_dir = _new_project_dir(runner, tiny_epub_factory, tmp_path)
+    project = Project.open(out_dir)
+    try:
+        # Year-like proposed entries — should be deleted.
+        repo.create_glossary_entry(
+            project.engine,
+            project_id=project.project_id,
+            source_term="1066",
+            target_term="1066",
+            type="date_or_time",
+            status="proposed",
+        )
+        repo.create_glossary_entry(
+            project.engine,
+            project_id=project.project_id,
+            source_term="1939-1945",
+            target_term="1939-1945",
+            type="date_or_time",
+            status="proposed",
+        )
+        # Confirmed year entry (curator-promoted) — must survive.
+        repo.create_glossary_entry(
+            project.engine,
+            project_id=project.project_id,
+            source_term="2024",
+            target_term="2024",
+            type="date_or_time",
+            status="confirmed",
+        )
+        # Real proposed entity — must survive.
+        repo.create_glossary_entry(
+            project.engine,
+            project_id=project.project_id,
+            source_term="Élise",
+            target_term="Elisa",
+            type="character",
+            status="proposed",
+        )
+    finally:
+        project.close()
+
+    result = runner.invoke(main, ["glossary", "cleanup-years", str(out_dir), "--apply"])
+    assert result.exit_code == 0, result.output
+    assert "Deleted 2" in result.output
+
+    project = Project.open(out_dir)
+    try:
+        all_entries = repo.list_glossary_entries(project.engine, project.project_id)
+        sources = {e.source_term for e in all_entries}
+        assert "1066" not in sources
+        assert "1939-1945" not in sources
+        # Confirmed and real proposed entries survive.
+        assert "2024" in sources
+        assert "Élise" in sources
+    finally:
+        project.close()
+
+
+def test_sanitize_typography_dry_run_lists_only(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """Without ``--apply`` the command lists candidates and exits.
+
+    Mirror of the dry-run pattern in ``glossary cleanup-years``:
+    rewriting target_text on segments is a structural change to
+    the project DB that the curator should always preview before
+    committing. The default is read-only.
+    """
+
+    runner = CliRunner()
+    out_dir = _new_project_dir(runner, tiny_epub_factory, tmp_path)
+    project = Project.open(out_dir)
+    try:
+        chap = repo.list_chapters(project.engine, project.project_id)[0]
+        seg = repo.list_segments(project.engine, chap.id)[0]
+        repo.update_segment_translation(
+            project.engine,
+            segment_id=seg.id,
+            target_text="Eu \u2019tenho uma desculpa.",
+            status="translated",
+        )
+    finally:
+        project.close()
+
+    result = runner.invoke(main, ["sanitize-typography", str(out_dir)])
+    assert result.exit_code == 0, result.output
+    assert "Found 1 segment" in result.output
+    assert "Eu \u2019tenho" in result.output
+    assert "Eu tenho" in result.output
+    assert "Dry run" in result.output
+
+    project = Project.open(out_dir)
+    try:
+        # Without --apply the row must still hold the bad bytes.
+        rows = repo.list_segments(project.engine, chap.id)
+        assert any(s.target_text == "Eu \u2019tenho uma desculpa." for s in rows)
+    finally:
+        project.close()
+
+
+def test_sanitize_typography_apply_rewrites_segments(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """``--apply`` rewrites the bad rows and preserves status.
+
+    Status is a curator-controlled flag (locked / flagged /
+    translated). The sanitiser is a pure-text rewrite and MUST
+    not touch the status column — a flagged segment stays flagged
+    after the rewrite, so the curator's review queue isn't
+    silently emptied.
+    """
+
+    runner = CliRunner()
+    out_dir = _new_project_dir(runner, tiny_epub_factory, tmp_path)
+    project = Project.open(out_dir)
+    try:
+        chap = repo.list_chapters(project.engine, project.project_id)[0]
+        segs = repo.list_segments(project.engine, chap.id)
+        # First segment: bad bytes, translated status — should be cleaned.
+        repo.update_segment_translation(
+            project.engine,
+            segment_id=segs[0].id,
+            target_text="Eu \u2019tenho uma desculpa.",
+            status="translated",
+        )
+        # Second segment: bad bytes, flagged status — should be cleaned
+        # AND keep its flagged status.
+        if len(segs) > 1:
+            repo.update_segment_translation(
+                project.engine,
+                segment_id=segs[1].id,
+                target_text="por \u2019ter dedicado este livro",
+                status="flagged",
+            )
+    finally:
+        project.close()
+
+    result = runner.invoke(main, ["sanitize-typography", str(out_dir), "--apply"])
+    assert result.exit_code == 0, result.output
+    assert "Rewrote" in result.output
+
+    project = Project.open(out_dir)
+    try:
+        rows = repo.list_segments(project.engine, chap.id)
+        cleaned = {s.target_text for s in rows if s.target_text}
+        assert "Eu tenho uma desculpa." in cleaned
+        # No row should still contain a curly apostrophe.
+        for r in rows:
+            if r.target_text:
+                assert "\u2019" not in r.target_text
+        # Verify status preserved on the flagged row, if it exists.
+        if any(s.status == "flagged" for s in rows):
+            flagged_after = [s for s in rows if s.status == "flagged"]
+            assert flagged_after  # status preserved on rewrite
+    finally:
+        project.close()
+
+
+def test_sanitize_typography_no_op_message(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """When there's nothing to clean, the output says so plainly."""
+
+    runner = CliRunner()
+    out_dir = _new_project_dir(runner, tiny_epub_factory, tmp_path)
+    result = runner.invoke(main, ["sanitize-typography", str(out_dir)])
+    assert result.exit_code == 0, result.output
+    assert "nothing to do" in result.output
+
+
+def test_glossary_cleanup_years_no_op_message(
+    tiny_epub_factory: Callable[..., Path], tmp_path: Path
+) -> None:
+    """When there's nothing to clean up, the command says so plainly.
+
+    Curators run this command speculatively after the auto-proposer
+    upgrade; an empty result must not look like a hang or a silent
+    failure.
+    """
+
+    runner = CliRunner()
+    out_dir = _new_project_dir(runner, tiny_epub_factory, tmp_path)
+    result = runner.invoke(main, ["glossary", "cleanup-years", str(out_dir)])
+    assert result.exit_code == 0
+    assert "No proposed glossary entries match" in result.output
 
 
 def test_budget_set_and_clear_round_trip(

@@ -13,6 +13,7 @@ repository stay free of filesystem layout concerns.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import shutil
 import uuid
@@ -25,10 +26,11 @@ from sqlalchemy import update
 from sqlalchemy.engine import Engine
 
 from epublate.core.extractor import IntakeOptions, IntakeSummary, run_book_intake
+from epublate.core.segmentation import expand_text_entity_placeholders
 from epublate.core.style import DEFAULT_STYLE_PROFILE, resolve_style_guide
 from epublate.db import connect, repo, schema
 from epublate.errors import ConfigurationError
-from epublate.formats.base import ChapterDoc, Segment
+from epublate.formats.base import ChapterDoc, InlineToken, Segment
 from epublate.formats.epub import EpubAdapter, toc_title_map
 from epublate.formats.epubcheck import EpubCheckReport, run_epubcheck
 from epublate.glossary import io as glossary_io
@@ -371,8 +373,292 @@ class Project:
 
         return out_path
 
+    def repair_segmentation(self) -> RepairSegmentationSummary:
+        """Bring the segment table in line with the current segmenter.
+
+        Older runs of the segmenter missed orphaned inline content
+        inside mixed-content blocks (Calibre's
+        ``<div><span>prose</span><div>nested block</div></div>``
+        pattern), which silently surfaced as untranslated source-language
+        paragraphs in the exported ePub. The current segmenter hoists
+        those orphans into their own ``<div>`` hosts, but two follow-on
+        problems remain for projects segmented before this fix:
+
+        * Orphan content has no segment row, so the LLM never sees it.
+        * The hoist also shifts the XPath of any block-host that sits
+          next to an orphan run (a new ``<div>`` wrapper sibling
+          appears in front of it), so existing rows' ``host_path``
+          stops resolving on export.
+
+        This method walks every chapter, re-runs segmentation against
+        the freshly-loaded original ePub, and:
+
+        * For each new segment whose ``source_hash`` matches an
+          existing row, **updates** the row's ``host_path`` /
+          inline-skeleton envelope so the saved translation lines up
+          with the post-hoist DOM. The translation itself is preserved.
+        * For each new segment whose ``source_hash`` is new, **inserts**
+          a fresh row at the end of the chapter's idx range so the
+          curator can translate it on the next batch run.
+
+        Existing translations are never discarded. The method is safe to
+        re-run; if the project is already up to date, it's a no-op.
+
+        Returns a :class:`RepairSegmentationSummary` describing the
+        per-chapter breakdown so the CLI can surface what changed.
+        """
+
+        adapter = EpubAdapter(target_lang=self.target_lang)
+        book = adapter.load(self.original_epub_path)
+
+        chapter_rows = repo.list_chapters(self.engine, self.project_id)
+        chapter_by_spine: dict[int, repo.ChapterRow] = {
+            r.spine_idx: r for r in chapter_rows
+        }
+
+        added_total = 0
+        rehosted_total = 0
+        per_chapter: list[ChapterRepairOutcome] = []
+
+        for doc in adapter.iter_chapters(book):
+            chapter_row = chapter_by_spine.get(doc.spine_idx)
+            if chapter_row is None or doc.tree is None:
+                continue
+
+            new_segs = adapter.segment(doc, chapter_id=chapter_row.id)
+            if not new_segs:
+                continue
+
+            existing_rows = repo.list_segments(self.engine, chapter_row.id)
+            existing_by_hash: dict[str, repo.SegmentRow] = {}
+            # source_hash is "almost" unique per chapter — collisions
+            # are theoretically possible (two paragraphs with identical
+            # text), so prefer the first-seen row for stable behavior.
+            for r in existing_rows:
+                existing_by_hash.setdefault(r.source_hash, r)
+
+            rows_to_insert: list[repo.SegmentRow] = []
+            host_path_updates: list[tuple[repo.SegmentRow, Segment]] = []
+            for seg in new_segs:
+                existing = existing_by_hash.get(seg.source_hash)
+                if existing is None:
+                    rows_to_insert.append(repo.segment_row_from(seg))
+                    continue
+                if (
+                    existing.host_path != seg.host_path
+                    or existing.host_part != seg.host_part
+                    or existing.host_total_parts != seg.host_total_parts
+                ):
+                    host_path_updates.append((existing, seg))
+
+            if not rows_to_insert and not host_path_updates:
+                continue
+
+            next_idx = max((r.idx for r in existing_rows), default=-1) + 1
+            for r in rows_to_insert:
+                r.idx = next_idx
+                next_idx += 1
+
+            with self.engine.begin() as conn:
+                if host_path_updates:
+                    for existing_row, seg in host_path_updates:
+                        repo.update_segment_skeleton(
+                            conn,
+                            segment_id=existing_row.id,
+                            skeleton=list(seg.inline_skeleton),
+                            host_path=seg.host_path,
+                            host_part=seg.host_part,
+                            host_total_parts=seg.host_total_parts,
+                        )
+                if rows_to_insert:
+                    repo.bulk_insert_segments(conn, rows_to_insert)
+                repo.append_event(
+                    conn,
+                    project_id=self.project_id,
+                    kind="chapter.segments_repaired",
+                    payload={
+                        "chapter_id": chapter_row.id,
+                        "added": len(rows_to_insert),
+                        "rehosted": len(host_path_updates),
+                    },
+                )
+
+            added_total += len(rows_to_insert)
+            rehosted_total += len(host_path_updates)
+            per_chapter.append(
+                ChapterRepairOutcome(
+                    chapter_id=chapter_row.id,
+                    chapter_title=chapter_row.title,
+                    added=len(rows_to_insert),
+                    rehosted=len(host_path_updates),
+                )
+            )
+
+        return RepairSegmentationSummary(
+            added=added_total,
+            rehosted=rehosted_total,
+            chapters=per_chapter,
+        )
+
+    def expand_typographic_entities(self) -> ExpandEntitiesSummary:
+        """Migrate stored segments to the text-entity expansion behavior.
+
+        Projects segmented before the typographic-entity-expansion fix
+        carry an ``entity`` token + ``[[Tk]]`` placeholder for every
+        ``&rsquo;`` / ``&nbsp;`` / ``&hellip;`` / curly-quote / dash
+        in the source. The translator prompt then asks the LLM to
+        drop the underlying character as part of target-language
+        typography normalization (French elision apostrophes do not
+        survive into Portuguese / Spanish / German), the model
+        legitimately drops the ``[[Tk]]`` along with the character,
+        and the structural validator hard-fails
+        ``"entity placeholder [[Tk]] missing or duplicated"``.
+
+        This migration walks every segment in the project and
+        rewrites just the affected rows in place via
+        :func:`epublate.core.segmentation.expand_text_entity_placeholders`:
+
+        * ``source_text`` gets the entity placeholders replaced with
+          their literal Unicode characters; ``source_hash`` is
+          recomputed.
+        * ``target_text`` gets the same substitution so any
+          translation that preserved the placeholder reads cleanly
+          afterwards.
+        * ``inline_skeleton`` drops the entity tokens; surviving
+          placeholders are renumbered so indices stay contiguous
+          from 0.
+        * ``status`` is intentionally untouched. A previously
+          ``flagged`` segment whose only failure was the
+          missing-entity-placeholder error stays ``flagged`` until
+          the curator re-runs translation; the migration is a
+          pure-text rewrite and curator decisions must not silently
+          revert.
+
+        Idempotent: a row whose skeleton has no expandable entities
+        is skipped (no DB write, no event row). Re-running the
+        migration on an already-migrated project is a no-op.
+
+        Returns an :class:`ExpandEntitiesSummary` describing how many
+        segments were rewritten, broken down by chapter so the CLI
+        can surface what changed.
+        """
+
+        chapter_rows = repo.list_chapters(self.engine, self.project_id)
+
+        per_chapter: list[ChapterEntityExpansionOutcome] = []
+        rewritten_total = 0
+
+        for chapter in chapter_rows:
+            seg_rows = repo.list_segments(self.engine, chapter.id)
+            updates: list[
+                tuple[repo.SegmentRow, str, str | None, list[InlineToken]]
+            ] = []
+            for seg in seg_rows:
+                new_source, new_target, new_skeleton, changed = (
+                    expand_text_entity_placeholders(
+                        source_text=seg.source_text,
+                        target_text=seg.target_text,
+                        skeleton=seg.inline_skeleton,
+                    )
+                )
+                if not changed:
+                    continue
+                updates.append((seg, new_source, new_target, new_skeleton))
+
+            if not updates:
+                continue
+
+            with self.engine.begin() as conn:
+                for seg, new_source, new_target, new_skeleton in updates:
+                    new_hash = hashlib.sha256(new_source.encode("utf-8")).hexdigest()
+                    repo.rewrite_segment_source(
+                        conn,
+                        segment_id=seg.id,
+                        source_text=new_source,
+                        source_hash=new_hash,
+                        target_text=new_target,
+                        skeleton=new_skeleton,
+                        host_path=seg.host_path,
+                        host_part=seg.host_part,
+                        host_total_parts=seg.host_total_parts,
+                    )
+                repo.append_event(
+                    conn,
+                    project_id=self.project_id,
+                    kind="chapter.entities_expanded",
+                    payload={
+                        "chapter_id": chapter.id,
+                        "rewritten": len(updates),
+                    },
+                )
+
+            rewritten_total += len(updates)
+            per_chapter.append(
+                ChapterEntityExpansionOutcome(
+                    chapter_id=chapter.id,
+                    chapter_title=chapter.title,
+                    rewritten=len(updates),
+                )
+            )
+
+        return ExpandEntitiesSummary(
+            rewritten=rewritten_total,
+            chapters=per_chapter,
+        )
+
     def close(self) -> None:
         self.engine.dispose()
+
+
+@dataclass(slots=True, frozen=True)
+class ChapterRepairOutcome:
+    """Per-chapter breakdown of what the repair pass changed (PRD §4.7)."""
+
+    chapter_id: str
+    chapter_title: str | None
+    added: int
+    rehosted: int
+
+
+@dataclass(slots=True, frozen=True)
+class RepairSegmentationSummary:
+    """Summary of a :meth:`Project.repair_segmentation` run.
+
+    ``added`` is the number of brand-new segments inserted (orphan
+    inline runs the older segmenter missed). ``rehosted`` is the count
+    of existing segments whose ``host_path`` got updated to match the
+    hoist-shifted DOM — translations preserved, paths refreshed.
+    """
+
+    added: int
+    rehosted: int
+    chapters: list[ChapterRepairOutcome]
+
+
+@dataclass(slots=True, frozen=True)
+class ChapterEntityExpansionOutcome:
+    """Per-chapter breakdown for :meth:`Project.expand_typographic_entities`."""
+
+    chapter_id: str
+    chapter_title: str | None
+    rewritten: int
+
+
+@dataclass(slots=True, frozen=True)
+class ExpandEntitiesSummary:
+    """Summary of an in-place ``Project.expand_typographic_entities`` migration.
+
+    ``rewritten`` is the total number of segments whose stored
+    ``source_text`` / ``target_text`` / ``inline_skeleton`` got
+    rewritten to expand typographic entity placeholders (``[[Tk]]``
+    standing in for ``&rsquo;`` / ``&nbsp;`` / ``&hellip;`` / curly
+    quotes / dashes) into their literal Unicode characters. A
+    project that's already migrated returns ``rewritten=0`` and an
+    empty ``chapters`` list.
+    """
+
+    rewritten: int
+    chapters: list[ChapterEntityExpansionOutcome]
 
 
 @contextmanager

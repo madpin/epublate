@@ -251,12 +251,21 @@ def _parse_entity_paragraph(inner: str) -> etree._Element:
 
 
 def test_placeholderize_handles_entity_reference_round_trip() -> None:
-    original = _parse_entity_paragraph("hello&nbsp;world")
+    """Symbol entities outside the expansion whitelist still round-trip.
+
+    ``&copy;`` is intentionally kept as an entity placeholder (vs.
+    apostrophes / dashes / NBSP, which the segmenter expands to their
+    Unicode chars — see :data:`_TEXT_ENTITY_EXPANSIONS`). The legacy
+    "cyfunction Entity" Save-ePub bug was about these symbol entities
+    too, so the round-trip guard stays meaningful.
+    """
+
+    original = _parse_entity_paragraph("hello &copy; world")
     text, skeleton = placeholderize(original)
 
     assert len(skeleton) == 1
     assert skeleton[0].kind == "entity"
-    assert skeleton[0].attrs.get("name") == "nbsp"
+    assert skeleton[0].attrs.get("name") == "copy"
     assert "[[T0]]" in text and "[[/T0]]" not in text
 
     target = _parse_entity_paragraph("")
@@ -265,24 +274,87 @@ def test_placeholderize_handles_entity_reference_round_trip() -> None:
 
 
 def test_placeholderize_preserves_entity_alongside_inline_tags() -> None:
-    """Mixing pair tags with entity refs round-trips both cleanly.
+    """Mixing pair tags with symbol entity refs round-trips both cleanly.
 
     Calibre-converted ePubs commonly produce ``<p>The
-    <em>old</em>&nbsp;man saw &copy;Author.</p>`` shapes; the
+    <em>old</em> man saw &copy;Author &reg;.</p>`` shapes; the
     pre-fix code was crashing the Save ePub path on these.
     """
 
-    original = _parse_entity_paragraph("The <em>old</em>&nbsp;man saw &copy;Author.")
+    original = _parse_entity_paragraph("The <em>old</em> man saw &copy;Author &reg;.")
     text, skeleton = placeholderize(original)
 
     kinds = [tok.kind for tok in skeleton]
     assert kinds == ["pair", "entity", "entity"]
-    assert skeleton[1].attrs.get("name") == "nbsp"
-    assert skeleton[2].attrs.get("name") == "copy"
+    assert skeleton[1].attrs.get("name") == "copy"
+    assert skeleton[2].attrs.get("name") == "reg"
 
     target = _parse_entity_paragraph("")
     apply_parts_to_host(target, [(text, skeleton)])
     assert _serialize(target) == _serialize(original)
+
+
+def test_placeholderize_expands_typographic_entities_inline() -> None:
+    """Apostrophes / dashes / NBSP get expanded to literal Unicode chars.
+
+    The pre-fix segmenter emitted an ``entity`` placeholder for every
+    ``&rsquo;`` / ``&hellip;`` / ``&nbsp;`` it saw, which forced the
+    LLM to preserve a ``[[Tn]]`` placeholder even when the
+    target-language typography rules legitimately drop the underlying
+    character (French-style elision apostrophe → no apostrophe in
+    Portuguese; French narrow space before ``:`` → no space in
+    Portuguese). Expanding inline lets the LLM render natural
+    target-language prose without tripping the structural placeholder
+    validator.
+    """
+
+    original = _parse_entity_paragraph(
+        "j&rsquo;ai dit\u00a0: &laquo;&nbsp;hello&nbsp;&raquo;&hellip;"
+    )
+    text, skeleton = placeholderize(original)
+
+    assert skeleton == []
+    assert "[[T" not in text
+    # Every entity should have been replaced by its canonical Unicode
+    # character (right single quote, NBSP, guillemets, ellipsis).
+    assert text == "j\u2019ai dit\u00a0: \u00ab\u00a0hello\u00a0\u00bb\u2026"
+
+
+def test_placeholderize_petit_prince_dedication_is_translatable() -> None:
+    """The Petit Prince dedication shape no longer issues placeholders.
+
+    Real-world failure mode (segment 33e2609427fb47ceb752977e93765778
+    in the ``petitprince`` fixture project) before this fix:
+
+    * 11 ``&rsquo;`` + 4 ``&nbsp;`` entities turned into 15
+      ``[[Tn]]`` placeholders the LLM was asked to preserve.
+    * The translator prompt's French→Portuguese typography note
+      correctly told the model to drop the elision apostrophes
+      (``j&rsquo;ai`` → ``Tenho``, NOT ``Eu&#x202F;'tenho``), so the
+      model dropped the placeholders along with them.
+    * The structural validator hard-failed
+      ``"entity placeholder [[T1]] missing or duplicated"`` and the
+      curator could not retry the segment.
+
+    With the entity expansion, the same source segment now feeds the
+    LLM as plain prose with literal U+2019 / U+00A0 characters; the
+    skeleton is empty and the validator has nothing to enforce.
+    """
+
+    fragment = (
+        "Je demande pardon aux enfants d&rsquo;avoir d\u00e9di\u00e9 ce "
+        "livre \u00e0 une grande personne. J&rsquo;ai une excuse "
+        "s\u00e9rieuse&nbsp;: cette grande personne est le meilleur "
+        "ami que j&rsquo;ai au monde."
+    )
+    original = _parse_entity_paragraph(fragment)
+    text, skeleton = placeholderize(original)
+
+    assert skeleton == []
+    assert "[[T" not in text
+    assert "j\u2019ai" in text
+    assert "d\u2019avoir" in text
+    assert "s\u00e9rieuse\u00a0:" in text
 
 
 def test_apply_parts_skips_legacy_cyfunction_tag() -> None:

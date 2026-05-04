@@ -226,3 +226,138 @@ def test_parser_rejects_all_unbalanced_bracket_shapes(bad_source: str) -> None:
     payload = _wrap([{"source": bad_source}])
     trace = parse_extractor_response(payload)
     assert trace.entities == []
+
+
+# ---------------------------------------------------------------------------
+# Year filter — raw year references must not pollute the lore bible
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "year_like_source",
+    [
+        # Pure 4-digit years, the curator-reported case.
+        "1066",
+        "1905",
+        "2024",
+        # 1-3 digit years (early CE / BCE history).
+        "44",
+        "476",
+        # Year ranges with hyphen, en-dash, em-dash.
+        "1939-1945",
+        "1939\u20131945",
+        "1939\u20141945",
+        "1939-45",
+        # Decades.
+        "1990s",
+        "1990S",
+        # Era markers.
+        "1066 AD",
+        "44 BC",
+        "44 BCE",
+        "476 CE",
+        # Era markers in other languages (PT/ES/FR a.C./d.C.; DE n./v.Chr.).
+        "44 a.C.",
+        "1066 d.C.",
+        "44 v. Chr.",
+        # Circa / approximate qualifiers.
+        "c. 1066",
+        "ca. 1905",
+        "circa 1905",
+        "approx. 2024",
+        # Parenthesised year notation.
+        "(1066)",
+        "(1939-1945)",
+        # Trailing punctuation (parser strips before checking).
+        "1066.",
+        "1066,",
+    ],
+)
+def test_parser_drops_raw_year_source(year_like_source: str) -> None:
+    """Years are date references, not entities — drop them at the parser.
+
+    The helper LLM occasionally proposes a recurring year as a
+    ``date_or_time`` entity, but the lore bible only tracks *named*
+    eras (``the Long Night``, ``Yule``). Plain dates are handled
+    inline by the translator and bloat the curator's review queue.
+    Both the source-language and target-language extractors share
+    :func:`_violates_extractor_caps` so the same predicate runs on
+    every channel.
+    """
+
+    payload = _wrap(
+        [
+            {
+                "type": "date_or_time",
+                "source": year_like_source,
+                "target": year_like_source,
+            }
+        ]
+    )
+    trace = parse_extractor_response(payload)
+    assert trace.entities == [], (
+        f"expected year-like source {year_like_source!r} to be dropped"
+    )
+
+
+@pytest.mark.parametrize(
+    "kept_source",
+    [
+        # Year embedded in a phrase: kept (the textual prefix carries
+        # entity meaning the curator may want tracked).
+        "Year of the Four Emperors",
+        "Battle of 1066",
+        "World War 1939",
+        "Apollo 11",
+        "Order 66",
+        # Single non-year number in a name.
+        "Section 9",
+        # Non-year number that happens to look small.
+        "Catch-22",
+    ],
+)
+def test_parser_keeps_year_alongside_text(kept_source: str) -> None:
+    """A year prefixed or suffixed by entity text survives the filter.
+
+    The year filter is conservative on purpose: only PURE year
+    references (year, range, decade, with optional era / circa /
+    paren wrappers) are dropped. Anything with non-numeric text in
+    it stays so we don't accidentally strip ``Apollo 11`` or
+    ``Year of the Four Emperors`` from the lore bible.
+    """
+
+    payload = _wrap([{"type": "event", "source": kept_source}])
+    trace = parse_extractor_response(payload)
+    assert len(trace.entities) == 1
+    assert trace.entities[0].source == kept_source
+
+
+def test_parser_drops_year_target_keeps_source() -> None:
+    """A year-shaped ``target`` doesn't kill the entity.
+
+    Mirrors the existing "long-target" path: a bad target is
+    cleared (so the curator can fill it in by hand), but the
+    source-side proposal still surfaces in the Inbox.
+    """
+
+    payload = _wrap(
+        [
+            {
+                "type": "event",
+                "source": "World War II",
+                "target": "1939-1945",
+            }
+        ]
+    )
+    trace = parse_extractor_response(payload)
+    assert len(trace.entities) == 1
+    assert trace.entities[0].source == "World War II"
+    assert trace.entities[0].target is None
+
+
+def test_target_parser_drops_year_target() -> None:
+    """The target-language extractor inherits the same filter."""
+
+    payload = _wrap_target([{"type": "date_or_time", "target": "1939-1945"}])
+    trace = parse_target_extractor_response(payload)
+    assert trace.entities == []

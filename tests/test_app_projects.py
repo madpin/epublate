@@ -26,6 +26,64 @@ async def test_app_boots_into_projects_and_quits(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_app_quit_cancels_running_batch_first(tmp_path: Path) -> None:
+    """Quitting while a batch is in flight signals the worker's cancel event.
+
+    Curators who exit the app expect the translation to stop rather
+    than burn tokens on a process that no longer has a UI. The
+    contract is "graceful shutdown": already-committed segments stay
+    durable (WAL + per-segment transactions), but no new LLM calls
+    are submitted past the quit. We verify by parking a fake batch
+    handle on the App and confirming ``action_quit`` flips its
+    cancel event.
+    """
+
+    import threading
+
+    from epublate.app.main import (
+        BatchProgress as RealBatchProgress,
+    )
+    from epublate.app.main import (
+        _BatchHandle,
+    )
+
+    class _FakeProject:
+        project_id = "proj-x"
+
+    cancel_event = threading.Event()
+    handle = _BatchHandle(
+        project=_FakeProject(),  # type: ignore[arg-type]
+        cancel_event=cancel_event,
+        chapter_count=1,
+        total_segments=10,
+        started_at=0.0,
+    )
+
+    recents = tmp_path / "recents.json"
+    app = EpublateApp(initial_screen=ProjectsScreen(recents_path=recents))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # Manually park the fake handle + active progress so action_quit
+        # sees a "live" batch without us needing to spin up a real
+        # worker thread (which would race the test loop).
+        pilot.app._batch_handle = handle  # type: ignore[attr-defined]
+        pilot.app.batch_progress = RealBatchProgress(  # type: ignore[attr-defined]
+            active=True,
+            project_id="proj-x",
+            summary=None,
+            total=10,
+            chapter_count=1,
+        )
+        assert not cancel_event.is_set()
+        await pilot.press("q")
+    assert cancel_event.is_set(), (
+        "action_quit must flip the batch's cancel event so the worker "
+        "stops submitting new LLM calls before the app exits."
+    )
+    assert app.return_value is None
+
+
+@pytest.mark.asyncio
 async def test_default_model_plumbs_to_default_projects_screen() -> None:
     """``EpublateApp(default_model=...)`` reaches the auto-built screen.
 

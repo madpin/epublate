@@ -663,6 +663,120 @@ def update_segment_translation(
         conn.execute(stmt)
 
 
+def update_segment_target_text(
+    engine_or_conn: Engine | Connection,
+    *,
+    segment_id: str,
+    target_text: str,
+) -> None:
+    """Rewrite ``segment.target_text`` without touching ``status``.
+
+    Used by retroactive cleanup flows (``epublate
+    sanitize-typography``) that need to repair stored target text
+    without bumping the segment's ``flagged`` / ``translated``
+    status — those flags reflect human-curated decisions and a
+    pure-text rewrite must not silently re-mark them.
+    """
+
+    stmt = (
+        update(schema.segment)
+        .where(schema.segment.c.id == segment_id)
+        .values(target_text=target_text)
+    )
+    with _begin(engine_or_conn) as conn:
+        conn.execute(stmt)
+
+
+def rewrite_segment_source(
+    engine_or_conn: Engine | Connection,
+    *,
+    segment_id: str,
+    source_text: str,
+    source_hash: str,
+    target_text: str | None,
+    skeleton: list[InlineToken],
+    host_path: str,
+    host_part: int,
+    host_total_parts: int,
+) -> None:
+    """Rewrite a segment's source / target / skeleton in one statement.
+
+    Used by the in-place ``Project.expand_typographic_entities``
+    migration: when typographic entity placeholders (``[[T0]]`` for
+    ``&rsquo;`` etc.) are expanded inline to literal Unicode chars,
+    the row's ``source_text`` (and therefore ``source_hash``) and
+    ``inline_skeleton`` change together. ``target_text`` is rewritten
+    in lockstep so any translation that preserved the placeholder
+    reads cleanly afterwards. ``status`` is intentionally untouched
+    — the migration is a pure-text rewrite and curator decisions
+    (``flagged`` / ``approved``) must survive it.
+    """
+
+    stub = SegmentRow(
+        id=segment_id,
+        chapter_id="",
+        idx=0,
+        source_text="",
+        source_hash="",
+        inline_skeleton=skeleton,
+        host_path=host_path,
+        host_part=host_part,
+        host_total_parts=host_total_parts,
+    )
+    blob = _encode_inline_skeleton(stub)
+    stmt = (
+        update(schema.segment)
+        .where(schema.segment.c.id == segment_id)
+        .values(
+            source_text=source_text,
+            source_hash=source_hash,
+            target_text=target_text,
+            inline_skeleton=blob,
+        )
+    )
+    with _begin(engine_or_conn) as conn:
+        conn.execute(stmt)
+
+
+def update_segment_skeleton(
+    engine_or_conn: Engine | Connection,
+    *,
+    segment_id: str,
+    skeleton: list[InlineToken],
+    host_path: str,
+    host_part: int,
+    host_total_parts: int,
+) -> None:
+    """Rewrite ``segment.inline_skeleton`` for an existing row.
+
+    Used by the ``repair`` flow when a segmenter change shifts host
+    XPaths in the original ePub (e.g. the orphan-hoist pass adds new
+    sibling wrappers): we keep the row's translation but update the
+    skeleton blob so the export-side XPath lookup resolves to the
+    correct DOM node again.
+    """
+
+    stub = SegmentRow(
+        id=segment_id,
+        chapter_id="",
+        idx=0,
+        source_text="",
+        source_hash="",
+        inline_skeleton=skeleton,
+        host_path=host_path,
+        host_part=host_part,
+        host_total_parts=host_total_parts,
+    )
+    blob = _encode_inline_skeleton(stub)
+    stmt = (
+        update(schema.segment)
+        .where(schema.segment.c.id == segment_id)
+        .values(inline_skeleton=blob)
+    )
+    with _begin(engine_or_conn) as conn:
+        conn.execute(stmt)
+
+
 def update_segment_status(
     engine_or_conn: Engine | Connection,
     *,
@@ -2113,6 +2227,7 @@ __all__ = [
     "list_segments_for_project",
     "merge_glossary_entries",
     "record_mentions",
+    "rewrite_segment_source",
     "segment_row_from",
     "segment_row_to",
     "set_aliases",

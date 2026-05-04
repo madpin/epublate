@@ -36,6 +36,27 @@ def test_target_prompt_uses_target_language_and_target_field() -> None:
     assert '"aliases":' in system.content
 
 
+def test_target_prompt_warns_against_raw_year_proposals() -> None:
+    """Same year guard travels in the target-extractor prompt.
+
+    Mirror of
+    :func:`test_extractor_prompt_warns_against_raw_year_proposals`
+    in the source-language suite. Lore Book ingest of an already
+    translated edition is just as likely to surface raw years as the
+    book intake pass.
+    """
+
+    [system, _] = build_target_extractor_messages(
+        target_lang="pt-BR",
+        target_text="A Batalha de 1066 mudou tudo.",
+    )
+    body = " ".join(system.content.split())
+    assert "Never propose a raw year reference" in body
+    assert "1066" in body
+    assert "1939-1945" in body
+    assert "named" in body
+
+
 def test_target_prompt_omits_glossary_when_empty() -> None:
     [system, _] = build_target_extractor_messages(
         target_lang="pt",

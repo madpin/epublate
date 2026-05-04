@@ -137,6 +137,93 @@ def _is_void(tag: str) -> bool:
 _ENTITY_TAG_PREFIX: str = "&"
 
 
+# Named XHTML entities the segmenter expands inline to their literal
+# Unicode characters instead of emitting a placeholder + entity token.
+#
+# Why expand at all: an entity placeholder forces the LLM to preserve
+# ``[[T0]]`` exactly once in the target, but several of these entities
+# encode typography the *target* language renders differently:
+#
+# * French elision apostrophes (``j&rsquo;ai``, ``d&rsquo;avoir``,
+#   ``qu&rsquo;a``) become ``[[T0]]`` placeholders that the
+#   translator prompt then asks the model to drop entirely when going
+#   to Portuguese / Spanish / German (cf. ``_SOURCE_LANG_NOTES['fr']``
+#   in :mod:`epublate.llm.prompts.translator`). The model honors the
+#   typography rule, drops ``[[T0]]``, and the structural validator
+#   hard-fails ``"entity placeholder [[T0]] missing or duplicated"``.
+# * The French narrow non-breaking space before ``:`` / ``!`` / ``?``
+#   (``&nbsp;`` in older converters, U+202F in modern ones) becomes
+#   a ``[[Tn]]`` the LLM legitimately drops when the target language
+#   does not insert a space before the colon.
+# * Curly quotes, em/en dashes, and ellipses are pure punctuation:
+#   forcing the model to "preserve" a placeholder for them in a
+#   re-translation often loses the placeholder and trips the validator.
+#
+# Expanding these to their Unicode chars puts them in the same plane
+# as the rest of the prose: the LLM sees ``j'ai`` (or ``J'ai``) and
+# translates to ``Tenho``, the typography sanitiser cleans up any
+# stranded leading apostrophes (``core/typography.py``), and there is
+# no placeholder to enforce. Reassembly emits the literal U+2019
+# character instead of ``&rsquo;`` for unmodified segments — visually
+# identical in any reader, and the format-handling round-trip
+# property still holds at the *character* level (it only weakens the
+# byte-identical-with-named-entity invariant for these specific
+# characters).
+#
+# The whitelist is intentionally narrow:
+#
+# * Only entities whose target Unicode code point is **text content**
+#   (apostrophes, quotes, dashes, ellipsis, whitespace, plus the XML
+#   ``&amp;``). Symbols like ``&copy;`` / ``&trade;`` / ``&deg;`` /
+#   ``&reg;`` / ``&para;`` / ``&sect;`` / ``&shy;`` keep the entity
+#   placeholder treatment because (a) the LLM does not drop them as
+#   part of typography normalization and (b) they're rare enough in
+#   prose that round-trip identity is the more useful contract.
+# * ``&lt;`` and ``&gt;`` are kept as entities so a literal ``<`` or
+#   ``>`` never reaches the LLM as bare text — the model would read
+#   them as malformed tag markup and could mis-translate around them.
+#
+# Adding an entity to this set is a one-key change. Keep the
+# Unicode chars literal in the source (escaped via ``\u`` for the
+# truly invisible ones) so a quick scan of the dict is enough to
+# audit what's in scope.
+_TEXT_ENTITY_EXPANSIONS: dict[str, str] = {
+    # Apostrophes and quotes.
+    "apos": "'",
+    "quot": '"',
+    "lsquo": "\u2018",
+    "rsquo": "\u2019",
+    "ldquo": "\u201c",
+    "rdquo": "\u201d",
+    "sbquo": "\u201a",
+    "bdquo": "\u201e",
+    "laquo": "\u00ab",
+    "raquo": "\u00bb",
+    "prime": "\u2032",
+    "Prime": "\u2033",
+    # Dashes and ellipsis.
+    "ndash": "\u2013",
+    "mdash": "\u2014",
+    "horbar": "\u2015",
+    "hellip": "\u2026",
+    # Whitespace variants. Expanding ``&nbsp;`` is the load-bearing
+    # case for French source ePubs that put a narrow space before
+    # colons / semi-colons / question marks; the LLM will legitimately
+    # drop the space when translating to a language that doesn't use
+    # the convention, and the validator must not fail on that.
+    "nbsp": "\u00a0",
+    "ensp": "\u2002",
+    "emsp": "\u2003",
+    "thinsp": "\u2009",
+    "hairsp": "\u200a",
+    "numsp": "\u2007",
+    "puncsp": "\u2008",
+    # Standard XML predefined. ``&lt;`` / ``&gt;`` are intentionally
+    # excluded — see the docstring above.
+    "amp": "&",
+}
+
+
 def _is_real_element(child: object) -> bool:
     """True iff ``child`` is a parsed Element node we can splice as an inline tag.
 
@@ -238,15 +325,24 @@ def _emit_non_element_child(
     tag = child.tag
     if tag is etree.Entity:
         name = _entity_name_from_node(child)
-        my_idx = len(skeleton)
-        skeleton.append(
-            InlineToken(
-                tag=f"{_ENTITY_TAG_PREFIX}{name};",
-                kind="entity",
-                attrs={"name": name},
+        # Typographic entities (apostrophes, dashes, ellipsis, NBSP,
+        # …) get expanded to their literal Unicode characters here so
+        # the LLM never sees a ``[[Tn]]`` placeholder it would
+        # legitimately drop as part of target-language typography
+        # normalization — see :data:`_TEXT_ENTITY_EXPANSIONS`.
+        expansion = _TEXT_ENTITY_EXPANSIONS.get(name)
+        if expansion is not None:
+            parts.append(expansion)
+        else:
+            my_idx = len(skeleton)
+            skeleton.append(
+                InlineToken(
+                    tag=f"{_ENTITY_TAG_PREFIX}{name};",
+                    kind="entity",
+                    attrs={"name": name},
+                )
             )
-        )
-        parts.append(f"[[T{my_idx}]]")
+            parts.append(f"[[T{my_idx}]]")
     if child.tail:
         parts.append(child.tail)
 
@@ -368,6 +464,85 @@ def _looks_like_legacy_cyfunction_tag(tag: str) -> bool:
     return tag.startswith("<cyfunction ")
 
 
+def expand_text_entity_placeholders(
+    *,
+    source_text: str,
+    target_text: str | None,
+    skeleton: Sequence[InlineToken],
+) -> tuple[str, str | None, list[InlineToken], bool]:
+    """Migrate a stored segment to the new text-entity expansion behavior.
+
+    Pure function (no I/O, no DB) used by the
+    ``Project.expand_typographic_entities`` migration to bring projects
+    segmented before the entity-expansion fix into line with the new
+    segmenter without losing translations or curator edits.
+
+    Behavior:
+
+    * Each entity token in ``skeleton`` whose name is in
+      :data:`_TEXT_ENTITY_EXPANSIONS` is removed from the skeleton.
+      Its ``[[Tk]]`` placeholder in ``source_text`` is replaced with
+      the literal Unicode character; the same substitution is applied
+      to ``target_text`` (where present) so any translation that
+      preserved the placeholder reads cleanly afterwards.
+    * Surviving placeholders are renumbered so indices are
+      contiguous from 0 again. Closing placeholders ``[[/Tk]]`` are
+      renumbered alongside their openers.
+    * Placeholders pointing at indices that don't exist in the
+      passed-in skeleton (malformed rows, hallucinated indices in a
+      target_text) are left intact so the validator can flag them
+      downstream.
+
+    Returns ``(new_source, new_target, new_skeleton, changed)``.
+    ``changed`` is ``False`` when the skeleton has no expandable
+    entity tokens — caller should skip the DB write to keep the
+    audit trail quiet.
+    """
+
+    expansion_for_idx: dict[int, str] = {}
+    new_skeleton: list[InlineToken] = []
+    old_to_new_idx: dict[int, int] = {}
+    for old_idx, tok in enumerate(skeleton):
+        if tok.kind == "entity":
+            name = (tok.attrs.get("name") or "").strip().lower()
+            if not name:
+                name = _strip_entity_brackets(tok.tag).lower()
+            expansion = _TEXT_ENTITY_EXPANSIONS.get(name)
+            if expansion is not None:
+                expansion_for_idx[old_idx] = expansion
+                continue
+        old_to_new_idx[old_idx] = len(new_skeleton)
+        new_skeleton.append(tok)
+
+    if not expansion_for_idx:
+        return source_text, target_text, list(skeleton), False
+
+    def _rewrite(text: str) -> str:
+        def _sub(m: re.Match[str]) -> str:
+            slash = m.group(1)
+            old_idx = int(m.group(2))
+            if slash:
+                # Closing tag — only valid for ``pair`` tokens, never
+                # for an entity, so a closer always belongs to a
+                # surviving (renumbered) skeleton entry.
+                new_idx = old_to_new_idx.get(old_idx)
+                if new_idx is None:
+                    return m.group(0)
+                return f"[[/T{new_idx}]]"
+            if old_idx in expansion_for_idx:
+                return expansion_for_idx[old_idx]
+            new_idx = old_to_new_idx.get(old_idx)
+            if new_idx is None:
+                return m.group(0)
+            return f"[[T{new_idx}]]"
+
+        return PLACEHOLDER_RE.sub(_sub, text)
+
+    new_source = _rewrite(source_text)
+    new_target = _rewrite(target_text) if target_text is not None else None
+    return new_source, new_target, new_skeleton, True
+
+
 def split_by_sentences(
     source_text: str,
     skeleton: Sequence[InlineToken],
@@ -482,6 +657,7 @@ __all__ = [
     "VOID_LOCAL_NAMES",
     "apply_parts_to_host",
     "count_tokens",
+    "expand_text_entity_placeholders",
     "is_trivially_empty",
     "placeholderize",
     "split_by_sentences",

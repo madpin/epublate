@@ -34,6 +34,7 @@ All long operations run in Textual workers so the UI never blocks
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
@@ -52,6 +53,7 @@ from textual.widgets import Button, Footer, Header, Label, Static, TextArea
 from epublate.app.preview import has_translatable_text, render_preview
 from epublate.app.widgets import BatchProgressMeter, BatchSnapshot, BatchStatusBar
 from epublate.core.batch import (
+    BatchCancelled,
     BatchOptions,
     BatchPaused,
     BatchProgressEvent,
@@ -177,12 +179,28 @@ class ChapterBatchTick(Message):
 
 
 class ChapterBatchFinished(Message):
-    """The chapter-batch worker drained the chapter (clean or paused)."""
+    """The chapter-batch worker drained the chapter.
 
-    def __init__(self, summary: BatchSummary, *, paused: bool, chapter_id: str) -> None:
+    ``paused`` is set when the run hit the project budget cap or a
+    rate-limit pause; ``cancelled`` is set when the curator pressed
+    the Cancel binding (or the screen unmounted while the worker was
+    still draining). Both are surfaced separately so the status bar
+    can label the run accurately — "paused" implies "resume after
+    raising the cap" while "cancelled" means "the run is over".
+    """
+
+    def __init__(
+        self,
+        summary: BatchSummary,
+        *,
+        paused: bool,
+        chapter_id: str,
+        cancelled: bool = False,
+    ) -> None:
         super().__init__()
         self.summary = summary
         self.paused = paused
+        self.cancelled = cancelled
         self.chapter_id = chapter_id
 
 
@@ -403,6 +421,7 @@ class ReaderScreen(Screen[None]):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("t", "translate_next", "Translate", show=True),
         Binding("b", "translate_chapter", "Translate chapter", show=True),
+        Binding("c", "cancel_chapter_batch", "Cancel batch", show=True),
         Binding("r", "retry", "Retry", show=True),
         Binding("a", "accept", "Accept", show=True),
         Binding("A", "approve_chapter", "Approve chapter", show=True),
@@ -519,6 +538,13 @@ class ReaderScreen(Screen[None]):
         self._chapter_queue: list[str] = []
         self._active_batch_chapter_id: str | None = None
         self._active_batch_total: int = 0
+        # Cancel handle for the live chapter-batch worker. Set when a
+        # batch starts; the curator's ``c`` binding flips it (the
+        # worker drains in-flight calls then raises ``BatchCancelled``).
+        # Also flipped on screen unmount so a graceful app shutdown
+        # doesn't leave the worker driving more LLM calls behind a
+        # popped screen.
+        self._chapter_batch_cancel_event: threading.Event | None = None
         # Set while we drive a programmatic scroll on either pane so the
         # source<->target sync watcher doesn't recurse on itself.
         # ``_render_segment_panes`` and ``_highlight_current_segment``
@@ -600,10 +626,18 @@ class ReaderScreen(Screen[None]):
 
     def on_unmount(self) -> None:
         self._provider = None
-        # If a chapter batch was still active when the screen pops, the
-        # worker thread keeps draining its current LLM call but no further
-        # ticks reach the (now-unmounted) screen. Clear the shared slot
-        # so other screens don't see a stale "active" flag.
+        # If a chapter batch was still active when the screen pops we
+        # signal the worker to stop submitting new LLM calls. In-flight
+        # calls finish in the daemon thread (we can't kill a blocked
+        # ``post`` mid-call), but the next iteration of ``run_batch``'s
+        # drain loop sees the cancel event and exits cleanly. This is
+        # the "graceful shutdown" contract: nothing the worker has
+        # already committed gets rolled back, but the worker won't
+        # spend any more cycles on a screen that no longer exists.
+        if self._chapter_batch_cancel_event is not None:
+            self._chapter_batch_cancel_event.set()
+        # Clear the shared slot so other screens don't see a stale
+        # "active" flag from the popped Reader's chapter batch.
         if self._active_batch_chapter_id is not None:
             self._publish_batch_progress(
                 active=False, summary=None, total=0, paused=False
@@ -1289,6 +1323,9 @@ class ReaderScreen(Screen[None]):
         total = len(pending)
         self._active_batch_chapter_id = chapter_id
         self._active_batch_total = total
+        # Fresh cancel event per chapter run so a previously cancelled
+        # event from an earlier chapter doesn't leak into the new one.
+        self._chapter_batch_cancel_event = threading.Event()
         # Publish the slot up-front (with summary=None) so the live meter
         # snaps to "0/total" immediately instead of waiting for the first
         # tick to land — matches the Dashboard's UX (PRD §4.6).
@@ -1307,6 +1344,47 @@ class ReaderScreen(Screen[None]):
             )
         self._chapter_batch_worker(chapter_id=chapter_id)
 
+    def action_cancel_chapter_batch(self) -> None:
+        """Ask the active chapter batch to stop after the current call.
+
+        No-op when no chapter batch is running. The worker drains any
+        in-flight LLM call (we can't preempt a blocking HTTP post), so
+        the meter shows a "cancelling…" suffix until ``BatchCancelled``
+        bubbles back up through :meth:`_chapter_batch_worker`.
+        """
+
+        if (
+            self._chapter_batch_cancel_event is None
+            or self._active_batch_chapter_id is None
+        ):
+            self._set_status("No chapter batch running to cancel.")
+            return
+        if self._chapter_batch_cancel_event.is_set():
+            self._set_status("Chapter batch already cancelling…")
+            return
+        self._chapter_batch_cancel_event.set()
+        # Drop the queued chapters too — a cancel means "stop the run",
+        # not "skip this chapter and start the next one".
+        self._chapter_queue.clear()
+        chapter_label = self._chapter_label_by_id(self._active_batch_chapter_id)
+        self._set_status(
+            f"Cancelling chapter batch for [b]{escape(chapter_label)}[/b]…"
+        )
+        self._publish_batch_progress(
+            active=True,
+            summary=self.batch_progress_summary(),
+            total=self._active_batch_total,
+            paused=False,
+            cancelling=True,
+        )
+        self._sync_batch_meter()
+
+    def batch_progress_summary(self) -> BatchSummary | None:
+        """Return the current snapshot from the App's batch slot, if any."""
+
+        progress = self._app_batch_progress()
+        return progress.summary if progress is not None else None
+
     def _other_batch_active(self) -> bool:
         """True when *some other* component reports an active batch.
 
@@ -1324,6 +1402,7 @@ class ReaderScreen(Screen[None]):
         summary: BatchSummary | None,
         total: int,
         paused: bool,
+        cancelling: bool = False,
     ) -> None:
         """Mirror the Reader's batch state on the app slot.
 
@@ -1343,6 +1422,7 @@ class ReaderScreen(Screen[None]):
             summary=summary,
             total=total,
             paused=paused,
+            cancelling=cancelling,
         )
 
     def _chapter_label_by_id(self, chapter_id: str) -> str:
@@ -1565,6 +1645,12 @@ class ReaderScreen(Screen[None]):
     @work(exclusive=False, group="reader-chapter-batch", thread=True)
     def _chapter_batch_worker(self, *, chapter_id: str) -> None:
         provider = self._provider_factory()
+        # Snapshot the cancel event up-front: the Reader's main thread
+        # may swap ``self._chapter_batch_cancel_event`` for the next
+        # chapter run while this worker is still draining the current
+        # one, and we want this worker to keep watching the event it
+        # was actually started with.
+        cancel_event = self._chapter_batch_cancel_event
         # Chapter translate from the Reader is a "batch of one chapter".
         # We turn the helper-LLM pre-pass on by default so the curator's
         # iterative per-chapter workflow grows the lore bible the same
@@ -1602,10 +1688,21 @@ class ReaderScreen(Screen[None]):
                 provider=provider,
                 options=options,
                 on_progress=self._post_chapter_batch_tick,
+                cancel_event=cancel_event,
             )
         except BatchPaused as paused:
             self.post_message(
                 ChapterBatchFinished(paused.summary, paused=True, chapter_id=chapter_id)
+            )
+            return
+        except BatchCancelled as cancelled:
+            self.post_message(
+                ChapterBatchFinished(
+                    cancelled.summary,
+                    paused=False,
+                    chapter_id=chapter_id,
+                    cancelled=True,
+                )
             )
             return
         except Exception as exc:
@@ -1655,8 +1752,14 @@ class ReaderScreen(Screen[None]):
     def _handle_chapter_batch_finished(self, message: ChapterBatchFinished) -> None:
         s = message.summary
         chap_label = self._chapter_label_by_id(message.chapter_id)
-        kind = "paused" if message.paused else "complete"
+        if message.cancelled:
+            kind = "cancelled"
+        elif message.paused:
+            kind = "paused"
+        else:
+            kind = "complete"
         self._active_batch_chapter_id = None
+        self._chapter_batch_cancel_event = None
         self._refresh_state()
         self._render_segment_panes()
         self._refresh_chapter_cards()
@@ -1675,16 +1778,20 @@ class ReaderScreen(Screen[None]):
                 f"flagged={s.flagged}, failed={s.failed}, "
                 f"cost=${s.cost_usd:.4f}"
             )
-        if message.paused:
+        if message.paused or message.cancelled:
             # A pause means the next chapter would hit the same wall
-            # (budget cap, rate limit, ...). Clear the queue so we don't
-            # silently fail-and-pause-again across the rest of the run.
+            # (budget cap, rate limit, ...); a cancellation is a
+            # curator decision to stop the run. Either way the queued
+            # chapters get dropped — silently marching on after a
+            # pause-and-pause loops the curator into the same wall,
+            # and silently moving past a cancel violates the user's
+            # explicit "stop" signal.
             self._chapter_queue.clear()
             self._publish_batch_progress(
                 active=False,
                 summary=s,
                 total=self._active_batch_total,
-                paused=True,
+                paused=message.paused,
             )
             self._sync_batch_meter()
             return

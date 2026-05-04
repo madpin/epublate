@@ -57,6 +57,7 @@ from epublate.app.widgets import (
 )
 from epublate.core.batch import (
     BatchOptions,
+    ContextOptions,
 )
 from epublate.core.book_metadata import (
     BookMetadata,
@@ -120,6 +121,15 @@ class BatchRequest:
     # chain (project override → env → translator) stays centralized.
     pre_pass: bool = True
     helper_model: str | None = None
+    # Preceding-segment context (PRD §8.1 follow-up): surface the
+    # last N segments from the same chapter to the translator's
+    # prompt so a chatty / dialogue-heavy chapter can keep its turns
+    # in flow. Defaults disabled; long-paragraph narrative typically
+    # wants 0-1 segment, dense conversation 3-4. ``context_max_chars``
+    # caps the cumulative source-text length (0 = no cap); a single
+    # segment is never split to fit.
+    context_max_segments: int = 0
+    context_max_chars: int = 0
 
 
 class BatchModal(ModalScreen[BatchRequest | None]):
@@ -228,6 +238,12 @@ class BatchModal(ModalScreen[BatchRequest | None]):
             with Horizontal(classes="row"):
                 yield Label("Helper pre-pass [y/n]:")
                 yield Input(value="y", id="batch-pre-pass")
+            with Horizontal(classes="row"):
+                yield Label("Context segments (0 = off):")
+                yield Input(value="0", id="batch-context-segments")
+            with Horizontal(classes="row"):
+                yield Label("Context char cap (0 = none):")
+                yield Input(value="0", id="batch-context-chars")
             yield Static(
                 "Press [b]Enter[/b] or [b]Ctrl+S[/b] to start, "
                 "[b]Escape[/b] to cancel. "
@@ -244,8 +260,13 @@ class BatchModal(ModalScreen[BatchRequest | None]):
                 "sees them before it fires (PRD \u00a74.2 phase 3). The helper "
                 "model is resolved from the project override, then "
                 "$EPUBLATE_LLM_HELPER_MODEL, then the translator model. "
+                "[b]Context segments[/b] surfaces N preceding segments from the "
+                "same chapter in the translator prompt; useful for "
+                "conversational chapters (try 3-4) and usually 0-1 for long "
+                "paragraphs. The char cap drops the oldest segments that "
+                "exceed it (a segment is never split to fit). "
                 "Open the [b]Reader[/b] (key [b]o[/b]) once the batch starts "
-                "to watch segments translate live.",
+                "to watch segments translate live; press [b]c[/b] to cancel.",
                 id="batch-help",
                 markup=True,
             )
@@ -330,6 +351,10 @@ class BatchModal(ModalScreen[BatchRequest | None]):
         group_size_raw = self.query_one("#batch-group-size", Input).value.strip()
         bypass_raw = self.query_one("#batch-bypass-cache", Input).value.strip().lower()
         pre_pass_raw = self.query_one("#batch-pre-pass", Input).value.strip().lower()
+        ctx_segments_raw = self.query_one(
+            "#batch-context-segments", Input
+        ).value.strip()
+        ctx_chars_raw = self.query_one("#batch-context-chars", Input).value.strip()
 
         try:
             concurrency = max(1, int(concurrency_raw or "1"))
@@ -369,6 +394,17 @@ class BatchModal(ModalScreen[BatchRequest | None]):
             return
         group_size = max(1, min(500, group_size))
 
+        try:
+            ctx_segments = max(0, int(ctx_segments_raw or "0"))
+        except ValueError:
+            self.app.bell()
+            return
+        try:
+            ctx_chars = max(0, int(ctx_chars_raw or "0"))
+        except ValueError:
+            self.app.bell()
+            return
+
         self.dismiss(
             BatchRequest(
                 chapters=chapters,
@@ -379,6 +415,8 @@ class BatchModal(ModalScreen[BatchRequest | None]):
                 group_small_segments=group_enabled,
                 group_max_items=group_size,
                 pre_pass=pre_pass,
+                context_max_segments=ctx_segments,
+                context_max_chars=ctx_chars,
             )
         )
 
@@ -1856,6 +1894,10 @@ class DashboardScreen(Screen[None]):
             group_max_items=result.group_max_items,
             pre_pass=result.pre_pass,
             helper_model=helper_model,
+            context=ContextOptions(
+                max_segments=result.context_max_segments,
+                max_chars=result.context_max_chars,
+            ),
         )
         app = self.app
         if not isinstance(app, EpublateApp):
