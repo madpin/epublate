@@ -1259,3 +1259,116 @@ async def test_reader_action_cancel_noop_without_active_batch(
             assert "No chapter batch running" in content
     finally:
         project.close()
+
+
+@pytest.mark.asyncio
+async def test_reader_single_translate_inherits_project_context_defaults(
+    tiny_epub_factory: Callable[..., Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pressing ``t`` plumbs the project's saved context defaults into
+    ``TranslateOptions`` so the curator's per-project preceding-segment
+    knob actually reaches the pipeline (PRD §4.6 / §7.2)."""
+
+    from epublate.app.screens import reader as reader_module
+    from epublate.core.pipeline import (
+        ContextOptions,
+        TranslateOptions,
+        TranslateOutcome,
+    )
+    from epublate.llm.prompts.translator import TranslatorTrace
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    try:
+        repo.update_project_context_defaults(
+            project.engine,
+            project_id=project.project_id,
+            max_segments=3,
+            max_chars=400,
+        )
+
+        provider = MockLLMProvider()
+        provider.set_responder(_placeholder_safe_responder())
+        screen = ReaderScreen(project, provider_factory=lambda: provider)
+
+        captured: list[TranslateOptions] = []
+
+        def _capture_translate(**kwargs: object) -> TranslateOutcome:
+            options = kwargs["options"]
+            assert isinstance(options, TranslateOptions)
+            captured.append(options)
+            segment = kwargs["segment"]
+            return TranslateOutcome(
+                segment_id=segment.id,
+                target_text="PT::stub",
+                trace=TranslatorTrace(target="PT::stub"),
+                cache_hit=False,
+                prompt_tokens=0,
+                completion_tokens=0,
+                cost_usd=0.0,
+                llm_call_id="stub-call",
+                cache_key="stub-key",
+            )
+
+        monkeypatch.setattr(reader_module, "translate_segment", _capture_translate)
+
+        app = EpublateApp(initial_screen=screen)
+        async with app.run_test() as pilot:
+            await pilot.press("t")
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert len(captured) == 1
+            assert captured[0].context == ContextOptions(max_segments=3, max_chars=400)
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
+async def test_reader_chapter_batch_inherits_project_context_defaults(
+    tiny_epub_factory: Callable[..., Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pressing ``b`` for a chapter batch plumbs the project's saved
+    context defaults into ``BatchOptions`` (PRD §4.6 / §7.2)."""
+
+    from epublate.app.screens import reader as reader_module
+    from epublate.core.batch import BatchOptions
+    from epublate.core.pipeline import ContextOptions
+
+    project = _make_two_chapter_project(tiny_epub_factory, tmp_path)
+    try:
+        repo.update_project_context_defaults(
+            project.engine,
+            project_id=project.project_id,
+            max_segments=2,
+            max_chars=250,
+        )
+
+        provider = MockLLMProvider()
+        provider.set_responder(_placeholder_safe_responder())
+        screen = ReaderScreen(project, provider_factory=lambda: provider)
+
+        captured: list[BatchOptions] = []
+
+        def _capture_run_batch(**kwargs: object) -> BatchSummary:
+            options = kwargs["options"]
+            assert isinstance(options, BatchOptions)
+            captured.append(options)
+            return BatchSummary()
+
+        monkeypatch.setattr(reader_module, "run_batch", _capture_run_batch)
+
+        app = EpublateApp(initial_screen=screen)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("b")
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert len(captured) == 1
+            assert captured[0].context == ContextOptions(max_segments=2, max_chars=250)
+    finally:
+        project.close()

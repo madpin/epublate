@@ -450,6 +450,29 @@ class SettingsScreen(Screen[None]):
                     placeholder="e.g. 5.00",
                     id="settings-project-budget",
                 )
+            yield Label(
+                "Preceding-segment context (default for batch + Reader; "
+                "0 disables). Surfaces N preceding source/target pairs "
+                "in the translator's prompt so a chatty chapter can keep "
+                "its turns in flow. The char cap drops the oldest "
+                "segments that exceed it (a segment is never split).",
+                classes="panel-subtitle",
+            )
+            ctx_seg, ctx_chars = self._initial_context_text()
+            with Horizontal(classes="field-row"):
+                yield Label("Context segments:")
+                yield Input(
+                    value=ctx_seg,
+                    placeholder="0",
+                    id="settings-project-context-segments",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("Context char cap:")
+                yield Input(
+                    value=ctx_chars,
+                    placeholder="0",
+                    id="settings-project-context-chars",
+                )
             with Horizontal(classes="panel-actions"):
                 yield Button(
                     "Save project",
@@ -821,6 +844,8 @@ class SettingsScreen(Screen[None]):
     def _save_project_panel(self) -> None:
         name_input = self.query_one("#settings-project-name", Input)
         budget_input = self.query_one("#settings-project-budget", Input)
+        ctx_seg_input = self.query_one("#settings-project-context-segments", Input)
+        ctx_chars_input = self.query_one("#settings-project-context-chars", Input)
 
         new_name = name_input.value.strip()
         if not new_name:
@@ -828,6 +853,12 @@ class SettingsScreen(Screen[None]):
             return
 
         budget = self._parse_budget(budget_input.value.strip())
+        ctx_segments = self._parse_non_negative_int(
+            ctx_seg_input.value.strip(), label="Context segments"
+        )
+        ctx_chars = self._parse_non_negative_int(
+            ctx_chars_input.value.strip(), label="Context char cap"
+        )
         repo.update_project_name(
             self._project.engine, project_id=self._project.project_id, name=new_name
         )
@@ -839,10 +870,17 @@ class SettingsScreen(Screen[None]):
             project_id=self._project.project_id,
             budget_usd=budget,
         )
+        repo.update_project_context_defaults(
+            self._project.engine,
+            project_id=self._project.project_id,
+            max_segments=ctx_segments,
+            max_chars=ctx_chars,
+        )
         self._refresh()
         self._set_status(
             f"Project saved: {new_name!r}; budget = "
             + ("(none)" if budget is None else f"${budget:.4f}")
+            + f"; context = {ctx_segments} seg / {ctx_chars} chars"
         )
 
     def _save_llm_panel(self) -> None:
@@ -1133,13 +1171,19 @@ class SettingsScreen(Screen[None]):
         budget = (
             f"${row.budget_usd:.4f}" if row and row.budget_usd is not None else "(none)"
         )
+        ctx_segments = row.context_max_segments if row is not None else 0
+        ctx_chars = row.context_max_chars if row is not None else 0
+        ctx_segments_label = f"{ctx_segments}" if ctx_segments > 0 else "0 (off)"
+        ctx_chars_label = f"{ctx_chars}" if ctx_chars > 0 else "0 (no cap)"
         return (
-            f"  name        : {self._project.name}\n"
-            f"  source lang : {self._project.source_lang}\n"
-            f"  target lang : {self._project.target_lang}\n"
-            f"  source epub : {self._project.original_epub_path}\n"
-            f"  database    : {self._project.db_path}\n"
-            f"  budget cap  : {budget}"
+            f"  name             : {self._project.name}\n"
+            f"  source lang      : {self._project.source_lang}\n"
+            f"  target lang      : {self._project.target_lang}\n"
+            f"  source epub      : {self._project.original_epub_path}\n"
+            f"  database         : {self._project.db_path}\n"
+            f"  budget cap       : {budget}\n"
+            f"  context segments : {ctx_segments_label}\n"
+            f"  context char cap : {ctx_chars_label}"
         )
 
     def _style_block(self) -> str:
@@ -1264,6 +1308,14 @@ class SettingsScreen(Screen[None]):
             return ""
         return f"{row.budget_usd:.4f}"
 
+    def _initial_context_text(self) -> tuple[str, str]:
+        """Pre-fill values for the per-project preceding-segment context."""
+
+        row = repo.get_project(self._project.engine, self._project.project_id)
+        if row is None:
+            return ("0", "0")
+        return (str(row.context_max_segments), str(row.context_max_chars))
+
     def _current_theme(self) -> str:
         try:
             return str(self.app.theme)
@@ -1283,6 +1335,24 @@ class SettingsScreen(Screen[None]):
         return value
 
     @staticmethod
+    def _parse_non_negative_int(raw: str, *, label: str) -> int:
+        """Parse a non-negative integer field; blank means ``0``.
+
+        ``label`` shapes the error message so the curator gets the
+        right field name (mirroring the budget parser's behaviour).
+        """
+
+        if not raw:
+            return 0
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError(f"{label} must be an integer.") from exc
+        if value < 0:
+            raise ValueError(f"{label} cannot be negative.")
+        return value
+
+    @staticmethod
     def _help_block() -> str:
         # Wrap the multi-line block as several string literals; ruff E501
         # gets unhappy when long phrases like "Theme: dropdown / [b]T[/b]"
@@ -1296,6 +1366,8 @@ class SettingsScreen(Screen[None]):
             "  - Project name     : Project tab → edit field → Save.",
             "  - Budget cap       : Project tab → set USD → Save",
             "                       (or B on Dashboard).",
+            "  - Context defaults : Project tab → preceding-segment",
+            "                       max segments / chars → Save.",
             "  - LLM overrides    : LLM tab → optional per-project",
             "                       model / base URL.",
             "  - Theme            : UI tab dropdown, or press [b]T[/b]",

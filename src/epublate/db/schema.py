@@ -90,6 +90,23 @@ project = Table(
         nullable=False,
         server_default="book",
     ),
+    # Per-project defaults for the translator's preceding-segment
+    # context (PRD §8.1 follow-up): the BatchModal pre-fills from
+    # these and the Reader's chapter/single-segment translate paths
+    # honor them automatically. ``0`` means "no context", so legacy
+    # rows backfilled to the default behave exactly like before.
+    Column(
+        "context_max_segments",
+        Integer,
+        nullable=False,
+        server_default="0",
+    ),
+    Column(
+        "context_max_chars",
+        Integer,
+        nullable=False,
+        server_default="0",
+    ),
 )
 
 chapter = Table(
@@ -395,6 +412,117 @@ class ProjectKind:
     LORE = "lore"
 
 
+# Persistent record of every helper-LLM intake/pre-pass invocation
+# (PRD §4.3 / §7.1). The append-only ``event`` table keeps a terse
+# audit trail; this table is the *editable* surface — curators read
+# and annotate the rich payload (POV, tense, helper notes, suggested
+# style profile, link back to the proposed glossary entries) from
+# the Intake history screen.
+intake_run = Table(
+    "intake_run",
+    metadata,
+    Column("id", Text, primary_key=True),
+    Column(
+        "project_id",
+        Text,
+        ForeignKey("project.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    # ``book_intake`` for the one-shot ``run_book_intake`` path
+    # (Dashboard ``e``); ``chapter_pre_pass`` for the per-chapter
+    # ``run_pre_pass`` invocations the batch worker fires.
+    Column("kind", Text, nullable=False),
+    # Only set for ``chapter_pre_pass`` runs; ``book_intake`` spans
+    # the whole spine and leaves this NULL.
+    Column(
+        "chapter_id",
+        Text,
+        ForeignKey("chapter.id", ondelete="SET NULL"),
+        nullable=True,
+    ),
+    Column("helper_model", Text, nullable=False),
+    Column("started_at", Integer, nullable=False),
+    Column("finished_at", Integer, nullable=False),
+    # ``completed`` / ``cancelled`` / ``aborted`` / ``rate_limited`` /
+    # ``failed`` — keeps the status clean from the audit-event kind.
+    Column("status", Text, nullable=False),
+    Column("chunks", Integer, nullable=False, server_default="0"),
+    Column("cached_chunks", Integer, nullable=False, server_default="0"),
+    Column("proposed_count", Integer, nullable=False, server_default="0"),
+    Column("failed_chunks", Integer, nullable=False, server_default="0"),
+    Column("prompt_tokens", Integer, nullable=False, server_default="0"),
+    Column("completion_tokens", Integer, nullable=False, server_default="0"),
+    Column("cost_usd", Float, nullable=False, server_default="0"),
+    Column("pov", Text, nullable=True),
+    Column("tense", Text, nullable=True),
+    Column("register", Text, nullable=True),
+    Column("audience", Text, nullable=True),
+    Column("suggested_style_profile", Text, nullable=True),
+    # Helper-LLM notes captured verbatim (JSON-serialized list of
+    # strings) so the curator sees exactly what the helper wrote.
+    Column("notes", Text, nullable=True),
+    # Free-form curator annotation. The screen lets the curator
+    # record "rejected this run's POV", "ignore: chapter is metadata",
+    # etc., without modifying the helper-emitted payload.
+    Column("curator_notes", Text, nullable=True),
+    Column("error", Text, nullable=True),
+)
+
+
+Index(
+    "ix_intake_run_project_id",
+    intake_run.c.project_id,
+)
+
+
+# Join table linking a single ``intake_run`` to the proposed glossary
+# entries it surfaced. Composite PK keeps duplicates impossible; the
+# ON DELETE CASCADE clauses mean the link disappears as soon as
+# either parent is deleted (the entry might be merged away during
+# curation).
+intake_run_entry = Table(
+    "intake_run_entry",
+    metadata,
+    Column(
+        "intake_run_id",
+        Text,
+        ForeignKey("intake_run.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column(
+        "entry_id",
+        Text,
+        ForeignKey("glossary_entry.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("created_at", Integer, nullable=False),
+)
+
+
+class IntakeRunKind:
+    """``intake_run.kind`` enum."""
+
+    BOOK_INTAKE = "book_intake"
+    CHAPTER_PRE_PASS = "chapter_pre_pass"
+
+
+class IntakeRunStatus:
+    """``intake_run.status`` enum.
+
+    Mirrors the terminal-event vocabulary already emitted by
+    :func:`epublate.core.extractor.run_book_intake` /
+    :func:`run_pre_pass` so the screen can map "events feed says
+    aborted" to "intake_run row says aborted" without a translation
+    table.
+    """
+
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    ABORTED = "aborted"
+    RATE_LIMITED = "rate_limited"
+    FAILED = "failed"
+
+
 ALL_TABLES: tuple[Table, ...] = (
     project,
     chapter,
@@ -409,6 +537,8 @@ ALL_TABLES: tuple[Table, ...] = (
     lore_meta,
     lore_source,
     attached_lore,
+    intake_run,
+    intake_run_entry,
 )
 
 
@@ -418,6 +548,8 @@ __all__ = [
     "AttachedLoreMode",
     "ChapterStatus",
     "GlossaryStatus",
+    "IntakeRunKind",
+    "IntakeRunStatus",
     "LoreSourceKind",
     "LoreSourceStatus",
     "ProjectKind",
@@ -430,6 +562,8 @@ __all__ = [
     "glossary_alias",
     "glossary_entry",
     "glossary_revision",
+    "intake_run",
+    "intake_run_entry",
     "llm_call",
     "lore_meta",
     "lore_source",

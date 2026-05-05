@@ -40,6 +40,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 import uuid
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
@@ -50,6 +51,7 @@ from sqlalchemy.engine import Engine
 from epublate.core.cache import cache_key_for_messages
 from epublate.core.style import suggest_style_profile
 from epublate.db import repo
+from epublate.db.schema import IntakeRunKind, IntakeRunStatus
 from epublate.errors import EpublateError, LLMRateLimitError, LLMResponseError
 from epublate.glossary import io as glossary_io
 from epublate.glossary.enforcer import build_constraints, glossary_hash
@@ -668,6 +670,7 @@ def run_book_intake(
         engine, project_id=project_id, max_segments=options.max_segments
     )
     summary = IntakeSummary()
+    started_at = int(time.time())
     repo.append_event(
         engine,
         project_id=project_id,
@@ -685,6 +688,15 @@ def run_book_intake(
             project_id=project_id,
             kind="intake.completed",
             payload=_intake_payload(summary),
+        )
+        _persist_intake_run(
+            engine,
+            project_id=project_id,
+            summary=summary,
+            kind=IntakeRunKind.BOOK_INTAKE,
+            helper_model=options.model,
+            started_at=started_at,
+            status=IntakeRunStatus.COMPLETED,
         )
         return summary
 
@@ -764,12 +776,31 @@ def run_book_intake(
                 "last_error": last_error,
             },
         )
+        _persist_intake_run(
+            engine,
+            project_id=project_id,
+            summary=summary,
+            kind=IntakeRunKind.BOOK_INTAKE,
+            helper_model=options.model,
+            started_at=started_at,
+            status=IntakeRunStatus.ABORTED,
+            error=last_error,
+        )
     else:
         repo.append_event(
             engine,
             project_id=project_id,
             kind="intake.completed",
             payload=_intake_payload(summary),
+        )
+        _persist_intake_run(
+            engine,
+            project_id=project_id,
+            summary=summary,
+            kind=IntakeRunKind.BOOK_INTAKE,
+            helper_model=options.model,
+            started_at=started_at,
+            status=IntakeRunStatus.COMPLETED,
         )
     return summary
 
@@ -804,12 +835,24 @@ def run_pre_pass(
     """
 
     summary = IntakeSummary()
+    started_at = int(time.time())
+    chapter_id = _segments_chapter_id(segments)
     if not segments:
         repo.append_event(
             engine,
             project_id=project_id,
             kind="batch.pre_pass_completed",
             payload=_intake_payload(summary),
+        )
+        _persist_intake_run(
+            engine,
+            project_id=project_id,
+            summary=summary,
+            kind=IntakeRunKind.CHAPTER_PRE_PASS,
+            helper_model=options.model,
+            started_at=started_at,
+            status=IntakeRunStatus.COMPLETED,
+            chapter_id=chapter_id,
         )
         return summary
 
@@ -891,6 +934,17 @@ def run_pre_pass(
                 kind="batch.pre_pass_rate_limited",
                 payload=payload,
             )
+            _persist_intake_run(
+                engine,
+                project_id=project_id,
+                summary=summary,
+                kind=IntakeRunKind.CHAPTER_PRE_PASS,
+                helper_model=options.model,
+                started_at=started_at,
+                status=IntakeRunStatus.RATE_LIMITED,
+                chapter_id=chapter_id,
+                error=exc.provider_message or str(exc),
+            )
             raise
         except Exception as exc:
             _logger.warning("pre-pass chunk failed: %s", exc)
@@ -951,6 +1005,16 @@ def run_pre_pass(
             kind="batch.pre_pass_cancelled",
             payload=_intake_payload(summary),
         )
+        _persist_intake_run(
+            engine,
+            project_id=project_id,
+            summary=summary,
+            kind=IntakeRunKind.CHAPTER_PRE_PASS,
+            helper_model=options.model,
+            started_at=started_at,
+            status=IntakeRunStatus.CANCELLED,
+            chapter_id=chapter_id,
+        )
     elif aborted:
         repo.append_event(
             engine,
@@ -962,12 +1026,33 @@ def run_pre_pass(
                 "last_error": last_error,
             },
         )
+        _persist_intake_run(
+            engine,
+            project_id=project_id,
+            summary=summary,
+            kind=IntakeRunKind.CHAPTER_PRE_PASS,
+            helper_model=options.model,
+            started_at=started_at,
+            status=IntakeRunStatus.ABORTED,
+            chapter_id=chapter_id,
+            error=last_error,
+        )
     else:
         repo.append_event(
             engine,
             project_id=project_id,
             kind="batch.pre_pass_completed",
             payload=_intake_payload(summary),
+        )
+        _persist_intake_run(
+            engine,
+            project_id=project_id,
+            summary=summary,
+            kind=IntakeRunKind.CHAPTER_PRE_PASS,
+            helper_model=options.model,
+            started_at=started_at,
+            status=IntakeRunStatus.COMPLETED,
+            chapter_id=chapter_id,
         )
     return summary
 
@@ -1152,6 +1237,88 @@ def _intake_payload(summary: IntakeSummary) -> dict[str, object]:
         "audience": summary.audience,
         "suggested_style_profile": summary.suggested_style_profile,
     }
+
+
+def _persist_intake_run(
+    engine: Engine,
+    *,
+    project_id: str,
+    summary: IntakeSummary,
+    kind: str,
+    helper_model: str,
+    started_at: int,
+    status: str,
+    chapter_id: str | None = None,
+    error: str | None = None,
+) -> str | None:
+    """Land one ``intake_run`` row + its proposed-entry links.
+
+    Best-effort by design: a write failure here must not turn a
+    successful intake / pre-pass into a curator-visible failure
+    (the audit ``event`` row is the source of truth for "the helper
+    finished cleanly"). On failure we log + return ``None`` so the
+    caller can keep going.
+
+    Returns the freshly-minted ``intake_run.id`` on success so tests
+    and downstream callers can correlate it to the audit event.
+    """
+
+    finished_at = int(time.time())
+    try:
+        row = repo.record_intake_run(
+            engine,
+            project_id=project_id,
+            kind=kind,
+            chapter_id=chapter_id,
+            helper_model=helper_model,
+            started_at=int(started_at),
+            finished_at=finished_at,
+            status=status,
+            chunks=summary.chunks,
+            cached_chunks=summary.cached_chunks,
+            proposed_count=summary.proposed_count,
+            failed_chunks=summary.failed_chunks,
+            prompt_tokens=summary.prompt_tokens,
+            completion_tokens=summary.completion_tokens,
+            cost_usd=summary.cost_usd,
+            pov=summary.pov,
+            tense=summary.tense,
+            narrative_register=summary.register,
+            audience=summary.audience,
+            suggested_style_profile=summary.suggested_style_profile,
+            notes=summary.notes,
+            error=error,
+        )
+        if summary.proposed_entry_ids:
+            repo.attach_intake_run_entries(
+                engine,
+                intake_run_id=row.id,
+                entry_ids=summary.proposed_entry_ids,
+            )
+        return row.id
+    except Exception as exc:  # never crash the helper loop on bookkeeping
+        _logger.warning(
+            "could not persist intake_run (kind=%s, project=%s): %s",
+            kind,
+            project_id,
+            exc,
+        )
+        return None
+
+
+def _segments_chapter_id(segments: Sequence[repo.SegmentRow]) -> str | None:
+    """Resolve the chapter for a pre-pass segment list.
+
+    All members of one ``run_pre_pass`` invocation share a chapter
+    by construction (the batch worker fans out per chapter), so
+    picking the first segment's parent is correct. Returns ``None``
+    when the input is empty so the empty-segments terminal branch
+    can still call us without a guard.
+    """
+
+    if not segments:
+        return None
+    return segments[0].chapter_id
 
 
 __all__ = [

@@ -726,3 +726,75 @@ async def test_dashboard_propagates_ui_config_to_settings(
             assert dashboard._ui_config.batch_concurrency == 5  # type: ignore[attr-defined]
     finally:
         project.close()
+
+
+@pytest.mark.asyncio
+async def test_settings_project_panel_saves_context_defaults(
+    tiny_epub_factory: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """The Project tab persists the per-project preceding-segment
+    context defaults so the Reader and Dashboard pre-fills inherit
+    them on the next translate (PRD §4.6 / §5)."""
+
+    from textual.widgets import Button, Input
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    try:
+        screen = SettingsScreen(project, config_path=tmp_path / "ui.toml")
+        app = EpublateApp(initial_screen=screen, config_path=tmp_path / "ui.toml")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            current = pilot.app.screen
+            assert isinstance(current, SettingsScreen)
+
+            current.query_one("#settings-project-context-segments", Input).value = "4"
+            current.query_one("#settings-project-context-chars", Input).value = "750"
+            current.query_one("#settings-project-save", Button).press()
+            await pilot.pause()
+
+            row = repo.get_project(project.engine, project.project_id)
+            assert row is not None
+            assert row.context_max_segments == 4
+            assert row.context_max_chars == 750
+
+            body = str(current.query_one("#settings-project-body").render())
+            assert "4" in body and "750" in body
+    finally:
+        project.close()
+
+
+@pytest.mark.asyncio
+async def test_settings_project_panel_blank_context_clears_defaults(
+    tiny_epub_factory: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Clearing both context inputs zeroes the defaults (off / no cap)."""
+
+    from textual.widgets import Button, Input
+
+    project = _make_project(tiny_epub_factory, tmp_path)
+    try:
+        repo.update_project_context_defaults(
+            project.engine,
+            project_id=project.project_id,
+            max_segments=4,
+            max_chars=600,
+        )
+
+        screen = SettingsScreen(project, config_path=tmp_path / "ui.toml")
+        app = EpublateApp(initial_screen=screen, config_path=tmp_path / "ui.toml")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            current = pilot.app.screen
+            assert isinstance(current, SettingsScreen)
+            current.query_one("#settings-project-context-segments", Input).value = ""
+            current.query_one("#settings-project-context-chars", Input).value = ""
+            current.query_one("#settings-project-save", Button).press()
+            await pilot.pause()
+            row = repo.get_project(project.engine, project.project_id)
+            assert row is not None
+            assert row.context_max_segments == 0
+            assert row.context_max_chars == 0
+    finally:
+        project.close()

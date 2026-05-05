@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Persistent intake records + per-project context defaults
+
+The helper-LLM intake pipeline (``run_book_intake`` and
+``run_pre_pass``) now lands a first-class, editable record per run,
+and the preceding-segment context options have a per-project default
+that the Reader, Dashboard, and CLI all inherit.
+
+Before this change, ``run_book_intake`` wrote an ``intake.completed``
+event with chunks/cost/POV/tense and a ``suggested_style_profile``
+but lost the helper notes, register, audience, and proposed-entry
+list once the worker exited; ``run_pre_pass`` wrote
+``batch.pre_pass_*`` events that didn't even carry the chapter id.
+Curators could only set the preceding-segment context per-batch from
+the Dashboard ``BatchModal`` or via CLI flags — the Reader's ``b``
+and ``t`` paths skipped the feature entirely.
+
+* New ``intake_run`` table (one row per intake / pre-pass run) and
+  ``intake_run_entry`` join table (links the run to the proposed
+  glossary entries it surfaced). Columns capture the rich
+  ``IntakeSummary``: status, helper model, chapter id (nullable for
+  book-intake), chunks, cached/failed chunks, proposed count, token
+  totals, cost, POV, tense, register, audience,
+  ``suggested_style_profile``, helper notes (JSON list), free-form
+  ``curator_notes``, and an optional terminal ``error`` string.
+  Migrations ``0008_intake_run.py`` and ``0009_project_context_defaults.py``
+  add the tables and the new ``project.context_max_segments`` /
+  ``project.context_max_chars`` columns.
+* New ``IntakeRunRow`` pydantic model and
+  ``record_intake_run`` / ``attach_intake_run_entries`` /
+  ``list_intake_runs`` / ``get_intake_run`` /
+  ``update_intake_run_curator_notes`` repo helpers in
+  ``epublate/db/repo.py``. ``narrative_register`` aliases to the
+  ``register`` column to dodge the Pydantic ``BaseModel`` shadow.
+* ``run_book_intake`` and ``run_pre_pass`` now persist a row on every
+  terminal branch (completed / cancelled / aborted / rate-limited /
+  zero-segment short-circuit) via the best-effort
+  ``_persist_intake_run`` helper. Existing ``event`` payloads stay
+  unchanged for backward compatibility.
+* New ``IntakeRunsScreen`` + ``IntakeRunDetailModal`` in
+  ``epublate/app/screens/intake_runs.py``. The list shows every run
+  newest-first; the detail modal renders POV / tense / register /
+  audience / suggested tone, helper notes, and the proposed entries
+  (with each entry's *current* status). ``Ctrl+S`` saves the
+  curator-authored note, ``S`` applies the helper's suggested tone,
+  ``G`` jumps to the Glossary screen. Open from the Dashboard with
+  the new ``I`` (Intake history) binding.
+* ``Settings → Project`` adds two new inputs (Context segments,
+  Context char cap) plumbed through a new
+  ``repo.update_project_context_defaults`` that emits a
+  ``project.context_defaults_changed`` event for the audit log.
+* ``BatchModal`` pre-fills its context inputs from the project row;
+  the Reader's chapter-batch (``b``) and single-segment (``t`` /
+  ``r``) paths now read the same project defaults via a new
+  ``_project_context_options`` helper, so the Reader finally honors
+  the curator's preceding-segment knob.
+* CLI: ``epublate batch`` ``--context-segments`` / ``--context-chars``
+  default to ``None``; when omitted, they inherit from the project
+  row so a "Save project" persists across headless runs.
+* New TUI keybindings rule entry: Dashboard ``I`` opens Intake
+  history, with detail-modal ``S`` (apply tone) and ``G`` (Glossary).
+
 ### Added — Human-readable language names in translator prompts
 
 The translator's "Translate from X to Y" sentence now renders the

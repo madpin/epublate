@@ -15,7 +15,7 @@ of cognitive load each — fast enough to ruin the workflow. These
 rules codify what's been observed to work and what's been seen to
 break.
 
-## View screens (Dashboard, Inbox, Glossary, LLM Activity, Logs, Lore Books, …)
+## View screens (Dashboard, Inbox, Glossary, LLM Activity, Logs, Lore Books, Intake history, …)
 
 Read-only or list-style surfaces where the curator scans, picks, and
 opens detail screens.
@@ -29,6 +29,11 @@ opens detail screens.
 | `Esc`    | Back    | Mirror of `q`, hidden from footer to keep it short |
 | `?` / `F1` | Help  | App-level binding, always available                |
 | `T`      | Cycle theme | App-level binding                              |
+
+The Dashboard exposes uppercase `I` for the Intake history screen
+(lowercase `i` already routes to the Inbox); the
+`IntakeRunDetailModal` uses `s` to apply the helper-suggested tone
+and `g` to jump to the Glossary screen.
 
 ## Form modals (`BatchModal`, `BudgetModal`, `IntakeModal`, `EntryEditScreen`, `LoreIngestModal`, `NewProjectModal`, `OpenProjectModal`, `ExportModal`, `LoreImportProjectModal`, `NewLoreBookModal`, `OpenLoreBookModal`, …)
 

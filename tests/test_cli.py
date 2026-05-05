@@ -1040,3 +1040,116 @@ def test_batch_command_extract_flag_runs_pre_pass(
         assert any(p.source_term == "Vale Verde" for p in proposed)
     finally:
         project.close()
+
+
+def test_batch_command_inherits_project_context_defaults(
+    tiny_epub_factory: Callable[..., Path],
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    """Without ``--context-segments`` / ``--context-chars`` the batch
+    inherits the project's persisted defaults so a "Save project" in
+    Settings → Project applies to subsequent headless runs without
+    having to re-pass the flag (PRD §4.6 / §5)."""
+
+    from epublate.core.batch import BatchOptions, BatchSummary
+    from epublate.core.pipeline import ContextOptions
+
+    runner = CliRunner()
+    out_dir = _new_project_dir(runner, tiny_epub_factory, tmp_path)
+
+    project = Project.open(out_dir)
+    try:
+        repo.update_project_context_defaults(
+            project.engine,
+            project_id=project.project_id,
+            max_segments=5,
+            max_chars=900,
+        )
+    finally:
+        project.close()
+
+    captured: list[BatchOptions] = []
+
+    def _capture_run_batch(**kwargs: object) -> BatchSummary:
+        options = kwargs["options"]
+        assert isinstance(options, BatchOptions)
+        captured.append(options)
+        return BatchSummary()
+
+    import epublate.core.batch as batch_module
+
+    monkeypatch.setattr(batch_module, "run_batch", _capture_run_batch)  # type: ignore[attr-defined]
+
+    provider = MockLLMProvider()
+    provider.set_responder(lambda msgs, _m: json.dumps({"target": "PT::stub"}))
+    _patched_build_provider(monkeypatch, provider)
+
+    result = runner.invoke(
+        main, ["--mock-llm", "batch", str(out_dir), "--model", "gpt-mock"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(captured) == 1
+    assert captured[0].context == ContextOptions(max_segments=5, max_chars=900)
+
+
+def test_batch_command_explicit_context_flags_override_project_defaults(
+    tiny_epub_factory: Callable[..., Path],
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    """Explicit ``--context-segments`` / ``--context-chars`` win over
+    the project's persisted defaults (PRD §4.6 precedence)."""
+
+    from epublate.core.batch import BatchOptions, BatchSummary
+    from epublate.core.pipeline import ContextOptions
+
+    runner = CliRunner()
+    out_dir = _new_project_dir(runner, tiny_epub_factory, tmp_path)
+
+    project = Project.open(out_dir)
+    try:
+        repo.update_project_context_defaults(
+            project.engine,
+            project_id=project.project_id,
+            max_segments=5,
+            max_chars=900,
+        )
+    finally:
+        project.close()
+
+    captured: list[BatchOptions] = []
+
+    def _capture_run_batch(**kwargs: object) -> BatchSummary:
+        options = kwargs["options"]
+        assert isinstance(options, BatchOptions)
+        captured.append(options)
+        return BatchSummary()
+
+    import epublate.core.batch as batch_module
+
+    monkeypatch.setattr(batch_module, "run_batch", _capture_run_batch)  # type: ignore[attr-defined]
+
+    provider = MockLLMProvider()
+    provider.set_responder(lambda msgs, _m: json.dumps({"target": "PT::stub"}))
+    _patched_build_provider(monkeypatch, provider)
+
+    result = runner.invoke(
+        main,
+        [
+            "--mock-llm",
+            "batch",
+            str(out_dir),
+            "--model",
+            "gpt-mock",
+            "--context-segments",
+            "1",
+            "--context-chars",
+            "200",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(captured) == 1
+    assert captured[0].context == ContextOptions(max_segments=1, max_chars=200)

@@ -188,6 +188,8 @@ class BatchModal(ModalScreen[BatchRequest | None]):
         default_budget: float | None = None,
         chapter_shape_summary: ChapterShapeSummary | None = None,
         project_stats: ProjectStats | None = None,
+        default_context_max_segments: int = 0,
+        default_context_max_chars: int = 0,
     ) -> None:
         super().__init__()
         self._default_model = default_model
@@ -195,6 +197,8 @@ class BatchModal(ModalScreen[BatchRequest | None]):
         self._default_budget = default_budget
         self._chapter_shape_summary = chapter_shape_summary
         self._project_stats = project_stats
+        self._default_context_max_segments = max(0, int(default_context_max_segments))
+        self._default_context_max_chars = max(0, int(default_context_max_chars))
 
     def compose(self) -> ComposeResult:
         with Vertical(id="batch-box"):
@@ -240,10 +244,16 @@ class BatchModal(ModalScreen[BatchRequest | None]):
                 yield Input(value="y", id="batch-pre-pass")
             with Horizontal(classes="row"):
                 yield Label("Context segments (0 = off):")
-                yield Input(value="0", id="batch-context-segments")
+                yield Input(
+                    value=str(self._default_context_max_segments),
+                    id="batch-context-segments",
+                )
             with Horizontal(classes="row"):
                 yield Label("Context char cap (0 = none):")
-                yield Input(value="0", id="batch-context-chars")
+                yield Input(
+                    value=str(self._default_context_max_chars),
+                    id="batch-context-chars",
+                )
             yield Static(
                 "Press [b]Enter[/b] or [b]Ctrl+S[/b] to start, "
                 "[b]Escape[/b] to cancel. "
@@ -982,6 +992,10 @@ class DashboardScreen(Screen[None]):
         Binding("x", "export", "Save ePub", show=True),
         Binding("B", "set_budget", "Budget", show=True),
         Binding("e", "intake", "Intake", show=True),
+        # Capital ``I`` opens the Intake history screen; lowercase
+        # ``i`` already routes to the Inbox so we use the shifted
+        # variant to keep the verb adjacent without colliding.
+        Binding("I", "open_intake_runs", "Intake history", show=True),
         Binding("L", "open_llm_activity", "LLM activity", show=True),
         # Lowercase ``l`` opens the unified Logs screen (events +
         # Python logger + LLM call stream). Distinct from ``L`` so
@@ -1784,6 +1798,16 @@ class DashboardScreen(Screen[None]):
             LLMActivityScreen(self._project), self._on_child_screen_closed
         )
 
+    def action_open_intake_runs(self) -> None:
+        # Lazy import keeps the IntakeRunsScreen out of the Dashboard's
+        # import path until the curator actually presses ``I`` —
+        # mirrors the LLM-activity / Logs / Settings flows above.
+        from epublate.app.screens.intake_runs import IntakeRunsScreen
+
+        self.app.push_screen(
+            IntakeRunsScreen(self._project), self._on_child_screen_closed
+        )
+
     def action_open_logs(self) -> None:
         # Lazy import keeps the LogsScreen out of the Dashboard's
         # import path until the curator actually presses ``l`` —
@@ -1846,12 +1870,23 @@ class DashboardScreen(Screen[None]):
             shape_summary = summarize_chapter_shapes(shapes)
         except Exception:
             shape_summary = None
+        # Pre-fill the context inputs from the project row's persisted
+        # defaults (Settings → Project tab). The curator can still
+        # override per-batch from the modal — we treat the project row
+        # as a default, not a hard floor.
+        project_row = repo.get_project(self._project.engine, self._project.project_id)
+        ctx_segments = (
+            project_row.context_max_segments if project_row is not None else 0
+        )
+        ctx_chars = project_row.context_max_chars if project_row is not None else 0
         modal = BatchModal(
             default_model=self._default_model,
             default_concurrency=self._ui_config.batch_concurrency,
             default_budget=self._stats.budget_usd if self._stats else None,
             chapter_shape_summary=shape_summary,
             project_stats=self._stats,
+            default_context_max_segments=ctx_segments,
+            default_context_max_chars=ctx_chars,
         )
         self.app.push_screen(modal, self._on_batch_chosen)
 

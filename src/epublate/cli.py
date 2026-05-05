@@ -781,26 +781,28 @@ def sanitize_typography(project_dir: Path, apply_changes: bool) -> None:
     "--context-segments",
     "context_segments",
     type=click.IntRange(min=0),
-    default=0,
-    show_default=True,
+    default=None,
     help=(
         "Surface up to N preceding segments from the same chapter in the "
         "translator's prompt as context. 0 disables. Useful for "
         "conversational chapters where short turns benefit from prior "
-        "context (try 3-4); long-paragraph narratives usually want 0-1."
+        "context (try 3-4); long-paragraph narratives usually want 0-1. "
+        "Omit to inherit the project row's saved default "
+        "(Settings → Project tab)."
     ),
 )
 @click.option(
     "--context-chars",
     "context_chars",
     type=click.IntRange(min=0),
-    default=0,
-    show_default=True,
+    default=None,
     help=(
         "Cap on the cumulative source-text length of the preceding "
         "segments shown to the translator. 0 means no cap. A segment "
         "is never split to fit — when a single segment exceeds the cap "
-        "it's skipped entirely, keeping the next-most-recent ones."
+        "it's skipped entirely, keeping the next-most-recent ones. "
+        "Omit to inherit the project row's saved default "
+        "(Settings → Project tab)."
     ),
 )
 @click.pass_context
@@ -816,8 +818,8 @@ def batch(
     helper_model: str | None,
     group_small: bool,
     group_max_items: int | None,
-    context_segments: int,
-    context_chars: int,
+    context_segments: int | None,
+    context_chars: int | None,
 ) -> None:
     """Headless batch translation (PRD §7.3 / M4).
 
@@ -851,6 +853,21 @@ def batch(
                 f"Could not parse --chapters {chapters!r}. Use '*', 'N' or 'A-B'."
             )
         provider = build_provider(mock=use_mock)
+        # The CLI flag wins when set; otherwise we inherit the
+        # project's persisted default so a curator's "Save project"
+        # in Settings → Project applies to subsequent headless runs
+        # without having to re-pass the flag.
+        project_row = repo_mod.get_project(project.engine, project.project_id)
+        resolved_ctx_segments = (
+            context_segments
+            if context_segments is not None
+            else (project_row.context_max_segments if project_row else 0)
+        )
+        resolved_ctx_chars = (
+            context_chars
+            if context_chars is not None
+            else (project_row.context_max_chars if project_row else 0)
+        )
         options = BatchOptions(
             model=chosen_model,
             concurrency=concurrency,
@@ -862,8 +879,8 @@ def batch(
             group_small_segments=group_small,
             group_max_items=group_max_items or GROUP_DEFAULT_MAX_ITEMS,
             context=ContextOptions(
-                max_segments=context_segments,
-                max_chars=context_chars,
+                max_segments=resolved_ctx_segments,
+                max_chars=resolved_ctx_chars,
             ),
         )
         paused = False
@@ -882,8 +899,6 @@ def batch(
             paused = True
 
         click.echo(_format_batch_summary(summary, paused=paused))
-        # Emit a stats summary so the curator sees the project state.
-        del repo_mod  # reserved for future stats wiring
     if paused:
         ctx.exit(2)
 

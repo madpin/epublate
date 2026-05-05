@@ -61,6 +61,7 @@ from epublate.core.batch import (
     run_batch,
 )
 from epublate.core.pipeline import (
+    ContextOptions,
     TranslateOptions,
     TranslateOutcome,
     translate_segment,
@@ -1604,7 +1605,11 @@ class ReaderScreen(Screen[None]):
                 style_guide=self._project.style_guide,
                 segment=segment,
                 provider=provider,
-                options=TranslateOptions(model=self._model, bypass_cache=bypass_cache),
+                options=TranslateOptions(
+                    model=self._model,
+                    bypass_cache=bypass_cache,
+                    context=self._project_context_options(),
+                ),
             )
         except Exception as exc:
             # Worker boundary: surface every failure as a typed UI message
@@ -1678,6 +1683,7 @@ class ReaderScreen(Screen[None]):
             bypass_cache=False,
             pre_pass=True,
             helper_model=helper_model,
+            context=self._project_context_options(),
         )
         try:
             summary = run_batch(
@@ -1715,6 +1721,27 @@ class ReaderScreen(Screen[None]):
     def _post_chapter_batch_tick(self, event: BatchProgressEvent) -> None:
         # Called from the worker thread; ``post_message`` is thread-safe.
         self.post_message(ChapterBatchTick(event))
+
+    def _project_context_options(self) -> ContextOptions:
+        """Resolve the project's persisted preceding-segment context.
+
+        Reads the live ``project`` row so an edit on the Settings
+        screen (Project tab) takes effect on the next translate
+        without restarting the Reader. A read failure falls back to
+        the disabled defaults — the curator should never see the
+        Reader crash on a transient DB hiccup.
+        """
+
+        try:
+            row = repo.get_project(self._project.engine, self._project.project_id)
+        except Exception:
+            return ContextOptions()
+        if row is None:
+            return ContextOptions()
+        return ContextOptions(
+            max_segments=int(row.context_max_segments or 0),
+            max_chars=int(row.context_max_chars or 0),
+        )
 
     @on(ChapterBatchTick)
     def _handle_chapter_batch_tick(self, message: ChapterBatchTick) -> None:

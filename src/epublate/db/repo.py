@@ -38,6 +38,11 @@ class ProjectRow(BaseModel):
     ``kind`` discriminates regular translation projects (``"book"``)
     from Lore Book projects (``"lore"``). Defaults to ``"book"`` so
     legacy DBs (where the column is implicit) keep behaving identically.
+
+    ``context_max_segments`` / ``context_max_chars`` are the per-project
+    defaults for the translator's preceding-segment context window
+    (PRD §8.1). Both default to ``0`` so projects created before
+    migration 0009 land at the historical "no context" behaviour.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -53,6 +58,8 @@ class ProjectRow(BaseModel):
     llm_overrides: str | None = None
     created_at: int
     kind: str = "book"
+    context_max_segments: int = 0
+    context_max_chars: int = 0
 
 
 class EventRow(BaseModel):
@@ -243,11 +250,19 @@ def _project_row_from_mapping(row: dict[str, Any]) -> ProjectRow:
     Pre-migration DBs may not have ``kind``; we default it to
     ``"book"`` so an upgrade-in-place doesn't fail in the (brief)
     window between the column being added and the row being backfilled.
+    The same logic applies to ``context_max_segments`` /
+    ``context_max_chars`` (added in migration 0009): default to ``0``
+    so the in-memory model stays valid even when the column is absent
+    or NULL.
     """
 
     payload = dict(row)
     if "kind" not in payload or payload["kind"] is None:
         payload["kind"] = schema.ProjectKind.BOOK
+    if "context_max_segments" not in payload or payload["context_max_segments"] is None:
+        payload["context_max_segments"] = 0
+    if "context_max_chars" not in payload or payload["context_max_chars"] is None:
+        payload["context_max_chars"] = 0
     return ProjectRow(**payload)
 
 
@@ -307,7 +322,7 @@ def update_project_style(
             .first()
         )
     assert refreshed is not None
-    return ProjectRow(**dict(refreshed))
+    return _project_row_from_mapping(dict(refreshed))
 
 
 def get_llm_overrides(
@@ -385,7 +400,7 @@ def set_llm_overrides(
             .first()
         )
     assert refreshed is not None
-    return ProjectRow(**dict(refreshed))
+    return _project_row_from_mapping(dict(refreshed))
 
 
 def update_project_name(
@@ -418,7 +433,7 @@ def update_project_name(
             raise ValueError(f"project not found: {project_id}")
         prev = str(existing["name"])
         if prev == new_name:
-            return ProjectRow(**dict(existing))
+            return _project_row_from_mapping(dict(existing))
         conn.execute(
             update(schema.project)
             .where(schema.project.c.id == project_id)
@@ -438,7 +453,7 @@ def update_project_name(
             .first()
         )
     assert refreshed is not None
-    return ProjectRow(**dict(refreshed))
+    return _project_row_from_mapping(dict(refreshed))
 
 
 def update_project_budget(
@@ -493,7 +508,72 @@ def update_project_budget(
             .first()
         )
     assert refreshed is not None
-    return ProjectRow(**dict(refreshed))
+    return _project_row_from_mapping(dict(refreshed))
+
+
+def update_project_context_defaults(
+    engine_or_conn: Engine | Connection,
+    *,
+    project_id: str,
+    max_segments: int,
+    max_chars: int,
+) -> ProjectRow:
+    """Set the per-project preceding-segment context defaults (PRD §8.1).
+
+    Mirrors :func:`update_project_budget`: validates inputs, writes the
+    new values atomically, records ``project.context_defaults_changed``
+    so the activity feed can surface the change, and returns the
+    refreshed row. Both knobs are non-negative integers; ``max_segments=0``
+    means "no preceding context" (the historical default), and
+    ``max_chars=0`` means "no character cap" so the segments-cap alone
+    decides what fits.
+    """
+
+    if max_segments < 0:
+        raise ValueError("max_segments must be non-negative")
+    if max_chars < 0:
+        raise ValueError("max_chars must be non-negative")
+
+    with _begin(engine_or_conn) as conn:
+        existing = (
+            conn.execute(
+                select(schema.project).where(schema.project.c.id == project_id)
+            )
+            .mappings()
+            .first()
+        )
+        if existing is None:
+            raise ValueError(f"project not found: {project_id}")
+        prev_segments = int(existing.get("context_max_segments") or 0)
+        prev_chars = int(existing.get("context_max_chars") or 0)
+        conn.execute(
+            update(schema.project)
+            .where(schema.project.c.id == project_id)
+            .values(
+                context_max_segments=int(max_segments),
+                context_max_chars=int(max_chars),
+            )
+        )
+        append_event(
+            conn,
+            project_id=project_id,
+            kind="project.context_defaults_changed",
+            payload={
+                "prev_max_segments": prev_segments,
+                "new_max_segments": int(max_segments),
+                "prev_max_chars": prev_chars,
+                "new_max_chars": int(max_chars),
+            },
+        )
+        refreshed = (
+            conn.execute(
+                select(schema.project).where(schema.project.c.id == project_id)
+            )
+            .mappings()
+            .first()
+        )
+    assert refreshed is not None
+    return _project_row_from_mapping(dict(refreshed))
 
 
 def append_event(
@@ -2163,6 +2243,347 @@ def update_attached_lore(
         return AttachedLoreRow(**dict(refreshed))
 
 
+class IntakeRunRow(BaseModel):
+    """Plain projection of a row in ``intake_run`` (PRD §4.3 / §7.1).
+
+    Persistent record of one helper-LLM intake (Dashboard ``e``) or
+    chapter pre-pass (batch ``b``) invocation. The append-only
+    ``event`` table still owns the audit trail; this row is the
+    *editable* surface — curators read POV/tense/notes and write
+    ``curator_notes`` from the Intake history screen.
+
+    ``proposed_entry_ids`` is loaded by :func:`get_intake_run` and
+    :func:`list_intake_runs` from the join table; callers shouldn't
+    populate it directly.
+
+    The DB column ``register`` is exposed as ``narrative_register``
+    on the model because plain ``register`` shadows a method on
+    Pydantic's ``BaseModel`` (Pydantic v2 emits a UserWarning that
+    our tests treat as fatal). The Field alias keeps the on-disk
+    column name unchanged.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    id: str
+    project_id: str
+    kind: str
+    chapter_id: str | None = None
+    helper_model: str
+    started_at: int
+    finished_at: int
+    status: str
+    chunks: int = 0
+    cached_chunks: int = 0
+    proposed_count: int = 0
+    failed_chunks: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cost_usd: float = 0.0
+    pov: str | None = None
+    tense: str | None = None
+    narrative_register: str | None = Field(default=None, alias="register")
+    audience: str | None = None
+    suggested_style_profile: str | None = None
+    notes: list[str] = Field(default_factory=list)
+    curator_notes: str | None = None
+    error: str | None = None
+    proposed_entry_ids: list[str] = Field(default_factory=list)
+
+
+def _intake_run_from_mapping(
+    row: dict[str, Any],
+    *,
+    proposed_entry_ids: Sequence[str] = (),
+) -> IntakeRunRow:
+    """Build an :class:`IntakeRunRow`, decoding the JSON ``notes`` blob.
+
+    ``notes`` is stored as a JSON-serialized list of strings; an
+    empty / missing column maps to ``[]`` so callers always see a
+    list. Anything that isn't a list of strings (corrupted row,
+    schema drift) collapses to ``[]`` rather than raising — the
+    Intake screen renders zero notes more gracefully than a
+    crash.
+
+    The DB column ``register`` is exposed on the model as
+    ``narrative_register`` (Pydantic v2 won't let us name a field
+    ``register``); :class:`IntakeRunRow` is configured with
+    ``populate_by_name=True`` so passing the column key through
+    works without an explicit rename here.
+    """
+
+    payload = dict(row)
+    raw_notes = payload.pop("notes", None)
+    decoded_notes: list[str] = []
+    if raw_notes:
+        try:
+            parsed = json.loads(raw_notes)
+        except (TypeError, json.JSONDecodeError):
+            parsed = None
+        if isinstance(parsed, list):
+            decoded_notes = [str(n) for n in parsed if isinstance(n, str)]
+    payload["notes"] = decoded_notes
+    payload["proposed_entry_ids"] = list(proposed_entry_ids)
+    return IntakeRunRow(**payload)
+
+
+def record_intake_run(
+    engine_or_conn: Engine | Connection,
+    *,
+    project_id: str,
+    kind: str,
+    helper_model: str,
+    started_at: int,
+    finished_at: int,
+    status: str,
+    chunks: int = 0,
+    cached_chunks: int = 0,
+    proposed_count: int = 0,
+    failed_chunks: int = 0,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    cost_usd: float = 0.0,
+    chapter_id: str | None = None,
+    pov: str | None = None,
+    tense: str | None = None,
+    narrative_register: str | None = None,
+    audience: str | None = None,
+    suggested_style_profile: str | None = None,
+    notes: Sequence[str] | None = None,
+    curator_notes: str | None = None,
+    error: str | None = None,
+    run_id: str | None = None,
+) -> IntakeRunRow:
+    """Persist one intake / pre-pass run into ``intake_run``.
+
+    ``kind`` must be one of :class:`schema.IntakeRunKind`; ``status``
+    one of :class:`schema.IntakeRunStatus`. ``notes`` is JSON-encoded
+    so the column stays a single ``Text`` cell. The caller wires
+    ``record_intake_run`` and :func:`attach_intake_run_entries` into
+    one transaction so a row only lands when the helper run finished
+    cleanly (the batch worker reuses :func:`_begin`).
+    """
+
+    if kind not in (
+        schema.IntakeRunKind.BOOK_INTAKE,
+        schema.IntakeRunKind.CHAPTER_PRE_PASS,
+    ):
+        raise ValueError(f"unknown intake_run kind: {kind!r}")
+    if status not in (
+        schema.IntakeRunStatus.COMPLETED,
+        schema.IntakeRunStatus.CANCELLED,
+        schema.IntakeRunStatus.ABORTED,
+        schema.IntakeRunStatus.RATE_LIMITED,
+        schema.IntakeRunStatus.FAILED,
+    ):
+        raise ValueError(f"unknown intake_run status: {status!r}")
+
+    notes_payload = (
+        json.dumps([str(n) for n in notes], ensure_ascii=False, sort_keys=False)
+        if notes
+        else None
+    )
+    row_id = run_id or _new_id()
+    # Use ``model_validate`` so we can pass the alias key (``register``)
+    # rather than the renamed field (``narrative_register``); without
+    # the pydantic.mypy plugin, mypy treats the static-kwargs path as
+    # alias-only and rejects ``narrative_register=...``. See the
+    # mirror pattern in epublate.llm.prompts.extractor.parse_response.
+    row = IntakeRunRow.model_validate(
+        {
+            "id": row_id,
+            "project_id": project_id,
+            "kind": kind,
+            "chapter_id": chapter_id,
+            "helper_model": helper_model,
+            "started_at": int(started_at),
+            "finished_at": int(finished_at),
+            "status": status,
+            "chunks": int(chunks),
+            "cached_chunks": int(cached_chunks),
+            "proposed_count": int(proposed_count),
+            "failed_chunks": int(failed_chunks),
+            "prompt_tokens": int(prompt_tokens),
+            "completion_tokens": int(completion_tokens),
+            "cost_usd": float(cost_usd),
+            "pov": pov,
+            "tense": tense,
+            "register": narrative_register,
+            "audience": audience,
+            "suggested_style_profile": suggested_style_profile,
+            "notes": list(notes or ()),
+            "curator_notes": curator_notes,
+            "error": error,
+        }
+    )
+    payload = row.model_dump(exclude={"proposed_entry_ids"}, by_alias=True)
+    payload["notes"] = notes_payload
+    with _begin(engine_or_conn) as conn:
+        conn.execute(insert(schema.intake_run).values(**payload))
+    return row
+
+
+def attach_intake_run_entries(
+    engine_or_conn: Engine | Connection,
+    *,
+    intake_run_id: str,
+    entry_ids: Sequence[str],
+) -> int:
+    """Link an intake run to the proposed glossary entries it surfaced.
+
+    Idempotent: ``ON CONFLICT DO NOTHING`` would be ideal, but SQLite
+    needs an explicit ``INSERT OR IGNORE``; we work around this by
+    pre-filtering to entries that aren't already linked. Returns the
+    number of *new* rows inserted so the caller can sanity-check the
+    write.
+    """
+
+    if not entry_ids:
+        return 0
+    created_at = _now_unix()
+    inserted = 0
+    with _begin(engine_or_conn) as conn:
+        existing = (
+            conn.execute(
+                select(schema.intake_run_entry.c.entry_id).where(
+                    schema.intake_run_entry.c.intake_run_id == intake_run_id
+                )
+            )
+            .scalars()
+            .all()
+        )
+        already = {str(eid) for eid in existing}
+        new_ids = [eid for eid in entry_ids if eid not in already]
+        if not new_ids:
+            return 0
+        conn.execute(
+            insert(schema.intake_run_entry),
+            [
+                {
+                    "intake_run_id": intake_run_id,
+                    "entry_id": eid,
+                    "created_at": created_at,
+                }
+                for eid in new_ids
+            ],
+        )
+        inserted = len(new_ids)
+    return inserted
+
+
+def list_intake_runs(
+    engine_or_conn: Engine | Connection,
+    *,
+    project_id: str,
+    kind: str | None = None,
+) -> list[IntakeRunRow]:
+    """Return intake runs for ``project_id`` newest-first.
+
+    ``kind`` filters to one flavour (book intake vs chapter pre-pass);
+    ``None`` returns the merged list. Each row carries its
+    ``proposed_entry_ids`` from the join table so the screen doesn't
+    need a second round-trip per row.
+    """
+
+    stmt = (
+        select(schema.intake_run)
+        .where(schema.intake_run.c.project_id == project_id)
+        .order_by(schema.intake_run.c.started_at.desc())
+    )
+    if kind is not None:
+        stmt = stmt.where(schema.intake_run.c.kind == kind)
+    with _begin(engine_or_conn) as conn:
+        rows = conn.execute(stmt).mappings().all()
+        if not rows:
+            return []
+        ids = [str(r["id"]) for r in rows]
+        link_rows = (
+            conn.execute(
+                select(
+                    schema.intake_run_entry.c.intake_run_id,
+                    schema.intake_run_entry.c.entry_id,
+                ).where(schema.intake_run_entry.c.intake_run_id.in_(ids))
+            )
+            .mappings()
+            .all()
+        )
+    grouped: dict[str, list[str]] = {rid: [] for rid in ids}
+    for link in link_rows:
+        grouped[str(link["intake_run_id"])].append(str(link["entry_id"]))
+    return [
+        _intake_run_from_mapping(
+            dict(r), proposed_entry_ids=grouped.get(str(r["id"]), [])
+        )
+        for r in rows
+    ]
+
+
+def get_intake_run(
+    engine_or_conn: Engine | Connection,
+    intake_run_id: str,
+) -> IntakeRunRow | None:
+    """Fetch one intake run plus the entries it proposed."""
+
+    with _begin(engine_or_conn) as conn:
+        row = (
+            conn.execute(
+                select(schema.intake_run).where(schema.intake_run.c.id == intake_run_id)
+            )
+            .mappings()
+            .first()
+        )
+        if row is None:
+            return None
+        link_rows = (
+            conn.execute(
+                select(schema.intake_run_entry.c.entry_id).where(
+                    schema.intake_run_entry.c.intake_run_id == intake_run_id
+                )
+            )
+            .scalars()
+            .all()
+        )
+    return _intake_run_from_mapping(
+        dict(row), proposed_entry_ids=[str(eid) for eid in link_rows]
+    )
+
+
+def update_intake_run_curator_notes(
+    engine_or_conn: Engine | Connection,
+    *,
+    intake_run_id: str,
+    curator_notes: str | None,
+) -> IntakeRunRow:
+    """Replace an intake run's curator-authored note (Intake screen Save).
+
+    A blank string collapses to ``NULL`` so the empty state is
+    consistent with rows that were never annotated. Raises
+    :class:`ValueError` when the run does not exist (the screen
+    handles the typed exception by surfacing it on its status line
+    rather than crashing).
+    """
+
+    cleaned = (curator_notes or "").strip() or None
+    with _begin(engine_or_conn) as conn:
+        existing = (
+            conn.execute(
+                select(schema.intake_run).where(schema.intake_run.c.id == intake_run_id)
+            )
+            .mappings()
+            .first()
+        )
+        if existing is None:
+            raise ValueError(f"intake_run not found: {intake_run_id}")
+        conn.execute(
+            update(schema.intake_run)
+            .where(schema.intake_run.c.id == intake_run_id)
+            .values(curator_notes=cleaned)
+        )
+    refreshed = get_intake_run(engine_or_conn, intake_run_id)
+    assert refreshed is not None
+    return refreshed
+
+
 class _Begin:
     """Context manager that yields a connection with an active transaction.
 
@@ -2193,12 +2614,14 @@ def _begin(engine_or_conn: Engine | Connection) -> _Begin:
 __all__ = [
     "ChapterRow",
     "EventRow",
+    "IntakeRunRow",
     "LLMCallRow",
     "MentionCounts",
     "OccurrenceRow",
     "ProjectRow",
     "SegmentRow",
     "append_event",
+    "attach_intake_run_entries",
     "bulk_insert_chapters",
     "bulk_insert_segments",
     "count_mentions_per_entry",
@@ -2209,6 +2632,7 @@ __all__ = [
     "find_glossary_entry_by_source_term",
     "find_llm_call_by_cache_key",
     "get_glossary_entry",
+    "get_intake_run",
     "get_llm_overrides",
     "get_project",
     "get_segment",
@@ -2218,6 +2642,7 @@ __all__ = [
     "list_events",
     "list_glossary_entries",
     "list_glossary_revisions",
+    "list_intake_runs",
     "list_llm_calls",
     "list_mentions",
     "list_occurrences",
@@ -2226,6 +2651,7 @@ __all__ = [
     "list_segments_by_status",
     "list_segments_for_project",
     "merge_glossary_entries",
+    "record_intake_run",
     "record_mentions",
     "rewrite_segment_source",
     "segment_row_from",
@@ -2233,7 +2659,9 @@ __all__ = [
     "set_aliases",
     "set_llm_overrides",
     "update_glossary_entry",
+    "update_intake_run_curator_notes",
     "update_project_budget",
+    "update_project_context_defaults",
     "update_project_name",
     "update_project_style",
     "update_segment_status",
